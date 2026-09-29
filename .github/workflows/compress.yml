@@ -564,11 +564,16 @@ jobs:
           fi
           DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
           test -n "$DURATION"
+          # -map 0 كانت تأخذ كل المسارات كما هي، بما فيها أي مسار "Data" غير
+          # قياسي (مثل مسار فصول HandBrake المصنَّف bin_data رغم اسمه الداخلي
+          # SubtitleHandler). حاوية Matroska ترفض أي مسار Data صراحةً، فيفشل
+          # التقطيع بالكامل. نحدد الفيديو والصوت الأولين فقط — وهو نفس ما
+          # تستخدمه خطوة الترميز لاحقاً أصلاً (الترجمة كانت ستُسقَط هناك بأي حال).
           if [ "$DURATION" -gt 1200 ]; then
-            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0 -c copy -f segment -segment_time 300 \
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -f segment -segment_time 300 \
               -reset_timestamps 1 -avoid_negative_ts make_zero 'chunks_raw/chunk_%03d.mkv'
           else
-            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0 -c copy -avoid_negative_ts make_zero chunks_raw/chunk_000.mkv
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -avoid_negative_ts make_zero chunks_raw/chunk_000.mkv
           fi
           find chunks_raw -maxdepth 1 -type f -name 'chunk_*.mkv' -size +0c | sort >/tmp/chunks.txt
           test -s /tmp/chunks.txt
