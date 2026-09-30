@@ -637,18 +637,13 @@ function formatEpisode(value) {
   return String(Number.parseInt(value, 10)).padStart(2, "0");
 }
 
-// نفس درجات جودة الصوت المُطبَّقة فعلياً في compress.yml لمسار AV1 (راجع
-// "جودة الصوت كانت ثابتة عند 32k" هناك). قبل هذا التحسين كان صوت AV1 يُشفَّر
-// دوماً عند 32k مهما كانت دقة/جودة الفيديو المختارة — صوت غير واضح خصوصاً مع
-// موسيقى أو مؤثرات، ولم يكن المستخدم يرى هذه القيمة أصلاً قبل الإرسال.
-function estimateAudioBitrateLabel(resolution) {
-  if (resolution === "auto") return "128k";
-  const height = Number.parseInt(resolution, 10);
-  if (!Number.isFinite(height)) return "64k";
-  if (height >= 1000) return "128k";
-  if (height >= 720) return "96k";
-  if (height >= 480) return "80k";
-  return "64k";
+// صوت مسار AV1 ثابت: Opus بمعدل 16k أحادي (قرار المستخدم: أصغر حجم وأهدأ صوت).
+// يطابق ما يُطبَّقه compress.yml (-b:a 16k -ac 1).
+const VIDEO_AUDIO_LABEL = "Opus 16k أحادي";
+
+// الدقة المختارة لا ترفع دقة مصدر أقل منها (يطبّق compress.yml: min(ارتفاع المصدر, المختارة)).
+function resolutionText(resolution) {
+  return resolution === "auto" ? "نفس جودة الفيديو الأصلية" : `${resolution}p (بلا رفع إن كان المصدر أقل)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -864,8 +859,7 @@ function buildSummaryMessage(session) {
       : session.encode_method === "twopass"
         ? "Two-Pass"
         : "استخراج صوت";
-  const resolutionLabel =
-    session.resolution === "auto" ? "نفس جودة الفيديو الأصلية" : `${session.resolution}p`;
+  const resolutionLabel = resolutionText(session.resolution);
 
   const lines = [
     `📁 اسم الملف: ${session.filename || "غير محدد"}`,
@@ -878,7 +872,7 @@ function buildSummaryMessage(session) {
 
   if (session.codec !== "audio") {
     lines.push(`🎯 الدقة: ${resolutionLabel}`);
-    lines.push(`🔊 جودة الصوت: ${estimateAudioBitrateLabel(session.resolution)} (Opus، تلقائي حسب الدقة)`);
+    lines.push(`🔊 الصوت: ${VIDEO_AUDIO_LABEL}`);
   }
 
   return lines.join("\n");
@@ -902,7 +896,7 @@ function presetStatusText(preset) {
       : preset.encode_method === "twopass"
         ? "Two-Pass"
         : "استخراج صوت";
-  const resolutionLabel = preset.resolution === "auto" ? "نفس جودة الفيديو الأصلية" : `${preset.resolution}p`;
+  const resolutionLabel = resolutionText(preset.resolution);
 
   const lines = [
     `المرمّز: ${codecLabel}`,
@@ -913,7 +907,7 @@ function presetStatusText(preset) {
   ];
   if (preset.codec !== "audio") {
     lines.push(`الدقة: ${resolutionLabel}`);
-    lines.push(`جودة الصوت: ${estimateAudioBitrateLabel(preset.resolution)} (Opus، تلقائي حسب الدقة)`);
+    lines.push(`الصوت: ${VIDEO_AUDIO_LABEL}`);
   }
   if (preset.auto_naming === "series" && preset.series_title && preset.next_episode) {
     lines.push(`التسمية: ${preset.series_title} - E${formatEpisode(preset.next_episode)}`);
