@@ -383,7 +383,7 @@ jobs:
                   cmd = ['yt-dlp', '--no-playlist', '-o', 'ytdlp_output.%(ext)s',
                          '--user-agent', headers['User-Agent'], '--referer', url,
                          '--max-filesize', '10G', url]
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
                   if r.returncode == 0:
                       for f in os.listdir('.'):
                           if f.startswith('ytdlp_output'):
@@ -397,7 +397,7 @@ jobs:
                   headers_str = '\r\n'.join([f'{k}: {v}' for k, v in headers.items()])
                   cmd = ['ffmpeg', '-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
                          '-headers', headers_str, '-i', m3u8_url, '-c', 'copy', 'raw_input.mp4']
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
                   if r.returncode == 0 and os.path.exists('raw_input.mp4') and os.path.getsize('raw_input.mp4') > 1000000:
                       return True
                   # حذف الملف إذا فشل
@@ -569,8 +569,31 @@ jobs:
           # SubtitleHandler). حاوية Matroska ترفض أي مسار Data صراحةً، فيفشل
           # التقطيع بالكامل. نحدد الفيديو والصوت الأولين فقط — وهو نفس ما
           # تستخدمه خطوة الترميز لاحقاً أصلاً (الترجمة كانت ستُسقَط هناك بأي حال).
-          if [ "$DURATION" -gt 1200 ]; then
-            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -f segment -segment_time 300 \
+
+          # عدد القطع متكيّف مع المدة بدل عدد ثابت أو حجم قطعة ثابت:
+          # - تحت SPLIT_THRESHOLD: قطعة واحدة (تكلفة تشغيل job إضافي لا تستحق).
+          # - فوقه: نزيد عدد القطع حتى MAX_PARALLEL (يطابق max-parallel في
+          #   مصفوفة encode-chunks) طالما كل قطعة لا تقل عن MIN_CHUNK_SECONDS
+          #   (يمنع الإفراط في التقطيع لفيديو متوسط الطول ويُبقي تكلفة تشغيل
+          #   كل job الثابتة — apt install، رفع/تنزيل artifact — أصغر نسبياً
+          #   من وقت الترميز الفعلي للقطعة).
+          # - MAX_CHUNK_SECONDS سقف أمان: يمنع أن تكبر القطعة أكثر من اللازم
+          #   لفيديو طويل جداً مع preset بطيء جداً، فتخاطر بتجاوز مهلة الـ6
+          #   ساعات لكل job (لا يُفعَّل عادة إلا لفيديوهات تتجاوز ساعات كثيرة).
+          SPLIT_THRESHOLD=300
+          MIN_CHUNK_SECONDS=90
+          MAX_CHUNK_SECONDS=2400
+          MAX_PARALLEL=10
+
+          if [ "$DURATION" -gt "$SPLIT_THRESHOLD" ]; then
+            N=$(( DURATION / MIN_CHUNK_SECONDS ))
+            (( N > MAX_PARALLEL )) && N=$MAX_PARALLEL
+            (( N < 1 )) && N=1
+            N_SAFETY=$(( (DURATION + MAX_CHUNK_SECONDS - 1) / MAX_CHUNK_SECONDS ))
+            (( N_SAFETY > N )) && N=$N_SAFETY
+            SEGMENT_TIME=$(( (DURATION + N - 1) / N ))
+            echo "🔀 تقسيم إلى ~${N} قطعة (~${SEGMENT_TIME} ثانية لكل قطعة)"
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -f segment -segment_time "$SEGMENT_TIME" \
               -reset_timestamps 1 -avoid_negative_ts make_zero 'chunks_raw/chunk_%03d.mkv'
           else
             "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -avoid_negative_ts make_zero chunks_raw/chunk_000.mkv
@@ -669,6 +692,7 @@ jobs:
             [ "$ENCODE_MODE" = "audio" ] || { echo 'الصوت يتطلب encode_mode=audio' >&2; exit 1; }
             [ "$ENCODE_METHOD" = "audio" ] || { echo 'الصوت يتطلب encode_method=audio' >&2; exit 1; }
             [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+            TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"  # m الصغيرة = milli في ffmpeg
             "$FFMPEG" -hide_banner -nostdin -y -i "$IN" -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 2 "$OUT_FILE"
           else
             [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'AV1 preset غير صحيح' >&2; exit 1; }
@@ -687,7 +711,10 @@ jobs:
 
             FILTERS=("setpts=PTS-STARTPTS")
             if [ "$RESOLUTION" != "auto" ]; then
-              FILTERS+=("scale=-2:${RESOLUTION}:flags=lanczos")
+              # min(ih,RES): إن كان ارتفاع المصدر >= المختارة تُطبَّق المختارة، وإن كان
+              # أقل يبقى ارتفاع المصدر كما هو (لا رفع دقة يزيد الحجم بلا فائدة).
+              # التعبير يُحسب داخل ffmpeg على الإطار الفعلي (بعد أي تدوير تلقائي).
+              FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos")
             fi
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
               FILTERS+=("hqdn3d=1.5:1.0:1.5:1.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
@@ -697,37 +724,25 @@ jobs:
             FILTERS+=("format=yuv420p10le")
             VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
 
-            # جودة الصوت كانت ثابتة عند 32k بغضّ النظر عن دقة/جودة الفيديو المختارة،
-            # وهذا يعطي صوتاً غير واضح (خصوصاً مع موسيقى أو مؤثرات) ولا يتناسق مع
-            # باقي الإعدادات. نربطها الآن بمستوى الدقة المختار، ونحافظ على القناة
-            # الأحادية لو كان المصدر أحادياً أصلاً بدل إهدار البت رايت على تكرار قناة.
-            if [ "$RESOLUTION" = "auto" ] || (( RESOLUTION >= 1000 )); then
-              AUDIO_BITRATE="128k"
-            elif (( RESOLUTION >= 720 )); then
-              AUDIO_BITRATE="96k"
-            elif (( RESOLUTION >= 480 )); then
-              AUDIO_BITRATE="80k"
-            else
-              AUDIO_BITRATE="64k"
-            fi
-            AUDIO_CHANNELS=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$IN" 2>/dev/null || true)
-            if [ "$AUDIO_CHANNELS" = "1" ]; then
-              AC_ARGS=(-ac 1)
-            else
-              AC_ARGS=(-ac 2)
-            fi
+            # الصوت: Opus بمعدل 16k أحادي (قرار المستخدم: أصغر حجم وأهدأ صوت).
+            # الأحادي يمنح الـ16k كاملة لقناة واحدة بدل تقسيمها على قناتين.
+            AUDIO_BITRATE="16k"
+            AC_ARGS=(-ac 1)
 
-            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
             SVT_PARAMS='-svtav1-params tune=0:enable-qm=1:qm-min=0'
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
               SVT_PARAMS='-svtav1-params tune=0:enable-qm=1:qm-min=0:enable-overlays=1:film-grain=6:film-grain-denoise=0'
             fi
             if [ "$ENCODE_METHOD" = "crf" ]; then
+              # التحقق من CRF داخل فرع CRF فقط؛ كان يُطبَّق قبل التفريع فيُفشل Two-Pass
+              # دائماً لأن قيمته معدل بت (مثل 200k) وليست رقم CRF.
+              [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
               "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
                 -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 240 $SVT_PARAMS \
                 -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
             else
               [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+              TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"  # m الصغيرة = milli في ffmpeg
               PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
               "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
                 -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 240 -pass 1 -passlogfile "$PASSLOG" -an -f null /dev/null
@@ -820,13 +835,18 @@ jobs:
             ACTUAL_RES=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
             echo "actual_res=$ACTUAL_RES" >> "$GITHUB_OUTPUT"
           fi
-          # نقيس بت‑ريت الصوت الفعلي من الناتج المدموج (وليس من قيمة مفترضة)
-          # حتى تكون الرسالة النهائية للمستخدم مطابقة لما حدث فعلاً، لا تخميناً.
-          ABR_RAW=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "output.mkv" 2>/dev/null || true)
-          if [[ "$ABR_RAW" =~ ^[0-9]+$ ]]; then
-            echo "actual_abr=$((ABR_RAW / 1000)) kbps" >> "$GITHUB_OUTPUT"
-          else
+          # نقرأ حالة الصوت الفعلية من الناتج المدموج. bit_rate قد يكون N/A في mkv،
+          # فلا نستنتج "بلا صوت" منه؛ وجود مسار الصوت هو المعيار.
+          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+          if [ -z "$A_CODEC" ]; then
             echo "actual_abr=بلا صوت" >> "$GITHUB_OUTPUT"
+          else
+            A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+            A_BR=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+            A_LABEL="$A_CODEC"
+            if [ "$A_CH" = "1" ]; then A_LABEL="$A_LABEL أحادي"; elif [ "$A_CH" = "2" ]; then A_LABEL="$A_LABEL ستيريو"; fi
+            if [[ "$A_BR" =~ ^[0-9]+$ ]]; then A_LABEL="$A_LABEL ~$((A_BR / 1000))k"; fi
+            echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
           fi
 
       - name: إعداد الاسم النهائي
