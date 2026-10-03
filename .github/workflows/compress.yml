@@ -383,7 +383,7 @@ jobs:
                   cmd = ['yt-dlp', '--no-playlist', '-o', 'ytdlp_output.%(ext)s',
                          '--user-agent', headers['User-Agent'], '--referer', url,
                          '--max-filesize', '10G', url]
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
                   if r.returncode == 0:
                       for f in os.listdir('.'):
                           if f.startswith('ytdlp_output'):
@@ -397,7 +397,7 @@ jobs:
                   headers_str = '\r\n'.join([f'{k}: {v}' for k, v in headers.items()])
                   cmd = ['ffmpeg', '-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
                          '-headers', headers_str, '-i', m3u8_url, '-c', 'copy', 'raw_input.mp4']
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
                   if r.returncode == 0 and os.path.exists('raw_input.mp4') and os.path.getsize('raw_input.mp4') > 1000000:
                       return True
                   # حذف الملف إذا فشل
@@ -692,6 +692,7 @@ jobs:
             [ "$ENCODE_MODE" = "audio" ] || { echo 'الصوت يتطلب encode_mode=audio' >&2; exit 1; }
             [ "$ENCODE_METHOD" = "audio" ] || { echo 'الصوت يتطلب encode_method=audio' >&2; exit 1; }
             [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+            TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"  # m الصغيرة = milli في ffmpeg
             "$FFMPEG" -hide_banner -nostdin -y -i "$IN" -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 2 "$OUT_FILE"
           else
             [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'AV1 preset غير صحيح' >&2; exit 1; }
@@ -710,7 +711,16 @@ jobs:
 
             FILTERS=("setpts=PTS-STARTPTS")
             if [ "$RESOLUTION" != "auto" ]; then
-              FILTERS+=("scale=-2:${RESOLUTION}:flags=lanczos")
+              # min(ih,RES): إن كان ارتفاع المصدر >= المختارة تُطبَّق المختارة، وإن كان
+              # أقل يبقى ارتفاع المصدر كما هو (لا رفع دقة يزيد الحجم بلا فائدة).
+              # التعبير يُحسب داخل ffmpeg على الإطار الفعلي (بعد أي تدوير تلقائي).
+              FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
+            fi
+            if [ "$ENCODE_MODE" = "filters" ]; then
+              # نحوّل إلى 10 بت قبل إزالة الضجيج وإزالة التدرجات (hqdn3d/deband) لتعملا
+              # بدقة أعلى بدل 8 بت ثم التحويل في النهاية (يقلّل خشونة التقريب في التدرجات
+              # الهادئة والمشاهد الداكنة بلا أي كلفة في الحجم).
+              FILTERS+=("format=yuv420p10le")
             fi
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
               FILTERS+=("hqdn3d=1.5:1.0:1.5:1.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
@@ -720,42 +730,59 @@ jobs:
             FILTERS+=("format=yuv420p10le")
             VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
 
-            # جودة الصوت كانت ثابتة عند 32k بغضّ النظر عن دقة/جودة الفيديو المختارة،
-            # وهذا يعطي صوتاً غير واضح (خصوصاً مع موسيقى أو مؤثرات) ولا يتناسق مع
-            # باقي الإعدادات. نربطها الآن بمستوى الدقة المختار، ونحافظ على القناة
-            # الأحادية لو كان المصدر أحادياً أصلاً بدل إهدار البت رايت على تكرار قناة.
-            if [ "$RESOLUTION" = "auto" ] || (( RESOLUTION >= 1000 )); then
-              AUDIO_BITRATE="128k"
-            elif (( RESOLUTION >= 720 )); then
-              AUDIO_BITRATE="96k"
-            elif (( RESOLUTION >= 480 )); then
-              AUDIO_BITRATE="80k"
-            else
-              AUDIO_BITRATE="64k"
+            # الصوت: Opus بمعدل 16k أحادي (قرار المستخدم: أصغر حجم وأهدأ صوت).
+            # الأحادي يمنح الـ16k كاملة لقناة واحدة بدل تقسيمها على قناتين.
+            AUDIO_BITRATE="16k"
+            AC_ARGS=(-ac 1)
+
+            # وسوم الألوان وبيانات المصدر.
+            PROBE=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate,color_space,color_primaries,color_transfer -of default=noprint_wrappers=1 "$IN" 2>/dev/null || true)
+            probe_field() { sed -n "s/^$1=//p" <<<"$PROBE" | head -n 1; }
+            SRC_W=$(probe_field width); SRC_H=$(probe_field height)
+            SRC_CSP=$(probe_field color_space); SRC_PRI=$(probe_field color_primaries); SRC_TRC=$(probe_field color_transfer)
+            # مصدر عالي الدقة بلا أي وسم ألوان: المشغلات تفترض BT.709 له، لكن الناتج بعد
+            # التصغير لدقة SD سيُفسَّر غالباً BT.601 فتنزاح الألوان قليلاً. نوسمه BT.709
+            # صراحةً ليبقى مظهره كما كان. المصدر الموسوم أو منخفض الدقة لا يتغير.
+            # معدل الإطارات: كان يُفرض دائماً FRAME_RATE (24) حتى لو كان المصدر 23.976 أو أقل،
+            # فيُكرَّر إطار كل ~40 ثانية (ارتعاش خفيف) أو تُضاف إطارات مكررة بلا فائدة.
+            # نحافظ على معدل المصدر إذا كان لا يزيد عن FRAME_RATE (+0.5)، وإلا نستعمل FRAME_RATE.
+            SRC_FPS=$(probe_field avg_frame_rate)
+            OUT_FPS="$FRAME_RATE"
+            if [[ "$SRC_FPS" =~ ^[0-9]+/[0-9]+$ ]] && awk -v f="$SRC_FPS" -v cap="$FRAME_RATE" 'BEGIN{split(f,a,"/"); if (a[2]>0 && a[1]/a[2]>0 && a[1]/a[2] <= cap+0.5) exit 0; exit 1}'; then
+              OUT_FPS="$SRC_FPS"
             fi
-            AUDIO_CHANNELS=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$IN" 2>/dev/null || true)
-            if [ "$AUDIO_CHANNELS" = "1" ]; then
-              AC_ARGS=(-ac 1)
-            else
-              AC_ARGS=(-ac 2)
+            COLOR_ARGS=()
+            is_unset() { [ -z "$1" ] || [ "$1" = "unknown" ] || [ "$1" = "unspecified" ]; }
+            if is_unset "$SRC_CSP" && is_unset "$SRC_PRI" && is_unset "$SRC_TRC" \
+               && { [ "${SRC_W:-0}" -ge 1280 ] || [ "${SRC_H:-0}" -gt 576 ]; }; then
+              COLOR_ARGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709)
             fi
 
-            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
-            SVT_PARAMS='-svtav1-params tune=0:enable-qm=1:qm-min=0:keyint=2s:enable-variance-boost=1:variance-boost-strength=2:film-grain=6:film-grain-denoise=0'
+            # المشاهد المظلمة والتفاصيل الهادئة: variance-boost و luminance-qp-bias
+            # معطّلان افتراضياً في SVT-AV1 الأساسي (الفروع المعدّلة تفعّل الأول افتراضياً).
+            # luminance-qp-bias يُترك للمصادر ذات PQ (HDR10) لأن مطوره يوصي بتجنبه معها.
+            SVT_BASE="tune=0:enable-qm=1:qm-min=0:enable-variance-boost=1:variance-boost-strength=2"
+            if [ "$SRC_TRC" != "smpte2084" ]; then SVT_BASE="${SVT_BASE}:luminance-qp-bias=20"; fi
+            SVT_PARAMS="-svtav1-params ${SVT_BASE}"
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
-              SVT_PARAMS='-svtav1-params tune=0:enable-qm=1:qm-min=0:enable-overlays=1:film-grain=6:film-grain-denoise=0'
+              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1:film-grain=6:film-grain-denoise=0"
             fi
+            echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
             if [ "$ENCODE_METHOD" = "crf" ]; then
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
-                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 48 $SVT_PARAMS \
+              # التحقق من CRF داخل فرع CRF فقط؛ كان يُطبَّق قبل التفريع فيُفشل Two-Pass
+              # دائماً لأن قيمته معدل بت (مثل 200k) وليست رقم CRF.
+              [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 240 "${COLOR_ARGS[@]}" $SVT_PARAMS \
                 -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
             else
               [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+              TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"  # m الصغيرة = milli في ffmpeg
               PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
-                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 48 -pass 1 -passlogfile "$PASSLOG" -an -f null /dev/null
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
-                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 48 -pass 2 -passlogfile "$PASSLOG" $SVT_PARAMS \
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 240 -pass 1 -passlogfile "$PASSLOG" -an -f null /dev/null
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 240 -pass 2 -passlogfile "$PASSLOG" "${COLOR_ARGS[@]}" $SVT_PARAMS \
                 -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
             fi
           fi
@@ -843,13 +870,18 @@ jobs:
             ACTUAL_RES=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
             echo "actual_res=$ACTUAL_RES" >> "$GITHUB_OUTPUT"
           fi
-          # نقيس بت‑ريت الصوت الفعلي من الناتج المدموج (وليس من قيمة مفترضة)
-          # حتى تكون الرسالة النهائية للمستخدم مطابقة لما حدث فعلاً، لا تخميناً.
-          ABR_RAW=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "output.mkv" 2>/dev/null || true)
-          if [[ "$ABR_RAW" =~ ^[0-9]+$ ]]; then
-            echo "actual_abr=$((ABR_RAW / 1000)) kbps" >> "$GITHUB_OUTPUT"
-          else
+          # نقرأ حالة الصوت الفعلية من الناتج المدموج. bit_rate قد يكون N/A في mkv،
+          # فلا نستنتج "بلا صوت" منه؛ وجود مسار الصوت هو المعيار.
+          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+          if [ -z "$A_CODEC" ]; then
             echo "actual_abr=بلا صوت" >> "$GITHUB_OUTPUT"
+          else
+            A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+            A_BR=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+            A_LABEL="$A_CODEC"
+            if [ "$A_CH" = "1" ]; then A_LABEL="$A_LABEL أحادي"; elif [ "$A_CH" = "2" ]; then A_LABEL="$A_LABEL ستيريو"; fi
+            if [[ "$A_BR" =~ ^[0-9]+$ ]]; then A_LABEL="$A_LABEL ~$((A_BR / 1000))k"; fi
+            echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
           fi
 
       - name: إعداد الاسم النهائي
