@@ -710,11 +710,16 @@ jobs:
             if [ "$INPUT_CODEC" = "av1" ]; then DECODER_ARGS=(-c:v libdav1d); fi
 
             FILTERS=("setpts=PTS-STARTPTS")
+            # خوارزمية التصغير. lanczos (الافتراضي) و bicubic يُنتجان "هالة" خفيفة (تجاوز إضاءة)
+            # حول الخطوط الحادة؛ bilinear أو area لا يُنتجانها (area أنعم). للتجربة أضف في env الخطوة
+            # مثلاً SCALE_ALGO: bilinear
+            : "${SCALE_ALGO:=lanczos}"
+            case "$SCALE_ALGO" in lanczos|bicubic|bilinear|area|spline) ;; *) echo "SCALE_ALGO غير مدعوم" >&2; exit 1 ;; esac
             if [ "$RESOLUTION" != "auto" ]; then
               # min(ih,RES): إن كان ارتفاع المصدر >= المختارة تُطبَّق المختارة، وإن كان
               # أقل يبقى ارتفاع المصدر كما هو (لا رفع دقة يزيد الحجم بلا فائدة).
               # التعبير يُحسب داخل ffmpeg على الإطار الفعلي (بعد أي تدوير تلقائي).
-              FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
+              FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=${SCALE_ALGO}+accurate_rnd+full_chroma_int")
             fi
             if [ "$ENCODE_MODE" = "filters" ]; then
               # نحوّل إلى 10 بت قبل إزالة الضجيج وإزالة التدرجات (hqdn3d/deband) لتعملا
@@ -758,11 +763,22 @@ jobs:
               COLOR_ARGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709)
             fi
 
-            # المشاهد المظلمة والتفاصيل الهادئة: variance-boost و luminance-qp-bias
-            # معطّلان افتراضياً في SVT-AV1 الأساسي (الفروع المعدّلة تفعّل الأول افتراضياً).
-            # luminance-qp-bias يُترك للمصادر ذات PQ (HDR10) لأن مطوره يوصي بتجنبه معها.
-            SVT_BASE="tune=0:enable-qm=1:qm-min=0:enable-variance-boost=1:variance-boost-strength=2"
-            if [ "$SRC_TRC" != "smpte2084" ]; then SVT_BASE="${SVT_BASE}:luminance-qp-bias=20"; fi
+            # تحسينات المشاهد المظلمة والتفاصيل الهادئة (اختيارية ومعطّلة افتراضياً):
+            # variance-boost و luminance-qp-bias يرفعان البت في المناطق المسطحة والمظلمة،
+            # والأنمي مليء بها، فرفعا حجم الحلقة من ~35-50MB إلى ~85-100MB عند CRF 45 / 720p.
+            # القيمة 0 = معطّل (السلوك الأصلي). لتجربتهما أضف في env الخطوة مثلاً:
+            #   VARIANCE_BOOST_STRENGTH: 1   (من 1 إلى 4)
+            #   LUMA_QP_BIAS: 10             (من 1 إلى 100، ويُتخطى تلقائياً لمصادر PQ/HDR10)
+            # وارفع CRF قليلاً لتعويض زيادة الحجم.
+            : "${VARIANCE_BOOST_STRENGTH:=0}"
+            : "${LUMA_QP_BIAS:=0}"
+            SVT_BASE="tune=0:enable-qm=1:qm-min=0"
+            if [ "$VARIANCE_BOOST_STRENGTH" -gt 0 ]; then
+              SVT_BASE="${SVT_BASE}:enable-variance-boost=1:variance-boost-strength=${VARIANCE_BOOST_STRENGTH}"
+            fi
+            if [ "$LUMA_QP_BIAS" -gt 0 ] && [ "$SRC_TRC" != "smpte2084" ]; then
+              SVT_BASE="${SVT_BASE}:luminance-qp-bias=${LUMA_QP_BIAS}"
+            fi
             SVT_PARAMS="-svtav1-params ${SVT_BASE}"
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
               SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1:film-grain=6:film-grain-denoise=0"
