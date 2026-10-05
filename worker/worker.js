@@ -795,12 +795,14 @@ async function triggerGitHub(cfg, session, chatId) {
       chat_id: String(chatId),
       filename: session.filename || "video",
       codec: session.codec || "av1",
-      preset: session.preset || "8",
+      preset: session.preset || "4",
       encode_mode: session.encode_mode || "nofilters",
       filter_profile:
         session.filter_profile || (session.encode_mode === "filters" ? "realistic" : "none"),
       encode_method: session.encode_method || "crf",
       target_value: String(session.target_value || "28"),
+      sharpen: session.sharpen || "yes",
+      max_bitrate_cap: session.max_bitrate_cap || "none",
       resolution: session.resolution || "480",
       frame_rate: "24",
     },
@@ -997,7 +999,7 @@ function isValidResolution(value) {
 }
 
 function presetPrompt() {
-  return "أرسل رقم سرعة AV1 من 0 إلى 13، مثل 4 أو 8.";
+  return "أرسل رقم سرعة AV1 من 0 إلى 13 (الموصى به للتوفير الأقصى: 4، وللسرعة: 8):";
 }
 
 function targetValueHint(codec, method) {
