@@ -25,9 +25,9 @@ on:
         type: choice
         options: ['av1', 'audio']
       preset:
-        description: 'AV1: رقم 0-13 (الأفضل للتوفير الأقصى هو 4، والأسرع 8).'
+        description: 'AV1: رقم 0-13.'
         required: true
-        default: '4'
+        default: '8'
       encode_mode:
         description: 'filters أو nofilters أو audio'
         required: true
@@ -50,16 +50,6 @@ on:
         description: 'CRF أو معدل البت، مثل 28 أو 500k.'
         required: true
         default: '28'
-      sharpen:
-        description: 'شحذ الحواف التكيفي (yes أو no): يبرز خطوط الأنمي ويسمح برفع CRF لتوفير الحجم.'
-        required: false
-        default: 'yes'
-        type: choice
-        options: ['yes', 'no']
-      max_bitrate_cap:
-        description: 'سقف البت في وضع CRF (مثل none أو 400k أو 500k): يمنع قفزات الحجم في مشاهد القتال مع بقاء نمط CRF.'
-        required: false
-        default: 'none'
       resolution:
         description: 'الارتفاع النهائي (مثل 480 أو 720 أو 1080)، أو auto لإبقاء دقة المصدر.'
         required: true
@@ -667,8 +657,6 @@ jobs:
           FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
           ENCODE_METHOD: ${{ github.event.inputs.encode_method }}
           TARGET_VALUE: ${{ github.event.inputs.target_value }}
-          SHARPEN: ${{ github.event.inputs.sharpen }}
-          MAX_BITRATE_CAP: ${{ github.event.inputs.max_bitrate_cap }}
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
           CHUNK_ID: ${{ matrix.chunk }}
@@ -721,41 +709,31 @@ jobs:
             DECODER_ARGS=()
             if [ "$INPUT_CODEC" = "av1" ]; then DECODER_ARGS=(-c:v libdav1d); fi
 
-            # تحديد مسار الفلاتر وعمق الألوان 10-bit
-            # ملاحظة: إذا كان المصدر H.264 (غالباً 8-bit) أو H.265 (غالباً 10-bit)،
-            # فإن الترقية الفورية لـ 10-bit قبل الفلاتر تمنع تراكم خطوط التدرج اللوني (Banding)
-            # وتزيل تشوهات الضغط القديمة حتى لا يستهلك AV1 بتات إضافية في ترميزها كـ تفاصيل.
             FILTERS=("setpts=PTS-STARTPTS")
+            # خوارزمية التصغير. lanczos (الافتراضي) و bicubic يُنتجان "هالة" خفيفة (تجاوز إضاءة)
+            # حول الخطوط الحادة؛ bilinear أو area لا يُنتجانها (area أنعم). للتجربة أضف في env الخطوة
+            # مثلاً SCALE_ALGO: bilinear
             : "${SCALE_ALGO:=lanczos}"
             case "$SCALE_ALGO" in lanczos|bicubic|bilinear|area|spline) ;; *) echo "SCALE_ALGO غير مدعوم" >&2; exit 1 ;; esac
             if [ "$RESOLUTION" != "auto" ]; then
+              # min(ih,RES): إن كان ارتفاع المصدر >= المختارة تُطبَّق المختارة، وإن كان
+              # أقل يبقى ارتفاع المصدر كما هو (لا رفع دقة يزيد الحجم بلا فائدة).
+              # التعبير يُحسب داخل ffmpeg على الإطار الفعلي (بعد أي تدوير تلقائي).
               FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=${SCALE_ALGO}+accurate_rnd+full_chroma_int")
             fi
-
-            # التحويل إلى 10 بت عالي الدقة قبل الفلترة
-            FILTERS+=("format=yuv420p10le")
-
+            if [ "$ENCODE_MODE" = "filters" ]; then
+              # نحوّل إلى 10 بت قبل إزالة الضجيج وإزالة التدرجات (hqdn3d/deband) لتعملا
+              # بدقة أعلى بدل 8 بت ثم التحويل في النهاية (يقلّل خشونة التقريب في التدرجات
+              # الهادئة والمشاهد الداكنة بلا أي كلفة في الحجم).
+              FILTERS+=("format=yuv420p10le")
+            fi
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
-              # أنمي (H.264/H.265): تنعيم مساحات الألوان المسطحة دون تشويه الخطوط الحادة، مع منع تكتل التدرجات
-              FILTERS+=("hqdn3d=2.0:1.5:0.5:0.5")
-              FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=16:blur=true")
+              # إزالة التشويش الحركي والمكاني من المساحات اللونية مع منع التدرجات
+              FILTERS+=("hqdn3d=2.0:1.5:2.5:2.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
             elif [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "realistic" ]; then
-              # مسلسلات وواقعي: إزالة ضجيج الحساس وضبابية الضغط القديم
-              FILTERS+=("hqdn3d=1.0:1.0:1.0:1.0")
+              FILTERS+=("hqdn3d=1.0:0.8:1.0:0.8")
             fi
-
-            # الشحذ التكيفي الذكي (Sharpening): إبراز الخطوط والتفاصيل قبل التشفير
-            # لتعويض رفع الـ CRF درجتين أو ثلاث دون أن تلحظ العين فرقاً
-            if [ "${SHARPEN:-no}" = "yes" ] && [ "$ENCODE_MODE" = "filters" ]; then
-              if [ "$FILTER_PROFILE" = "anime" ]; then
-                # أنمي: شحذ دقيق يبرز خطوط الرسم دون تضخيم التشويش
-                FILTERS+=("cas=0.35")
-              elif [ "$FILTER_PROFILE" = "realistic" ]; then
-                # مسلسلات وواقعي: شحذ خفيف يحافظ على طبيعية الجلد والملامح
-                FILTERS+=("cas=0.20")
-              fi
-            fi
-
+            FILTERS+=("format=yuv420p10le")
             VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
 
             # الصوت: Opus بمعدل 16k أحادي (قرار المستخدم: أصغر حجم وأهدأ صوت).
@@ -784,11 +762,6 @@ jobs:
             if is_unset "$SRC_CSP" && is_unset "$SRC_PRI" && is_unset "$SRC_TRC" \
                && { [ "${SRC_W:-0}" -ge 1280 ] || [ "${SRC_H:-0}" -gt 576 ]; }; then
               COLOR_ARGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709)
-            else
-              # تمرير وسوم الألوان الصريحة من المصدر (H.264/H.265) حتى لا يفسرها المشغل بشكل باهت
-              [ ! -z "$SRC_CSP" ] && [ "$SRC_CSP" != "unknown" ] && COLOR_ARGS+=(-colorspace "$SRC_CSP")
-              [ ! -z "$SRC_PRI" ] && [ "$SRC_PRI" != "unknown" ] && COLOR_ARGS+=(-color_primaries "$SRC_PRI")
-              [ ! -z "$SRC_TRC" ] && [ "$SRC_TRC" != "unknown" ] && COLOR_ARGS+=(-color_trc "$SRC_TRC")
             fi
 
             # تحسينات المشاهد المظلمة والتفاصيل الهادئة (اختيارية ومعطّلة افتراضياً):
@@ -798,76 +771,28 @@ jobs:
             #   VARIANCE_BOOST_STRENGTH: 1   (من 1 إلى 4)
             #   LUMA_QP_BIAS: 10             (من 1 إلى 100، ويُتخطى تلقائياً لمصادر PQ/HDR10)
             # وارفع CRF قليلاً لتعويض زيادة الحجم.
-            # إعدادات التشفير التكيفي حسب المشهد (Scene-Adaptive Encoding)
-            # تفعيل تعزيز التباين التلقائي حسب نوع المحتوى لضغط المشاهد الثابتة والهادئة
-            if [ -z "${VARIANCE_BOOST_STRENGTH:-}" ]; then
-              if [ "$FILTER_PROFILE" = "anime" ]; then
-                VARIANCE_BOOST_STRENGTH=2
-              elif [ "$FILTER_PROFILE" = "realistic" ]; then
-                VARIANCE_BOOST_STRENGTH=1
-              else
-                VARIANCE_BOOST_STRENGTH=0
-              fi
-            fi
+            : "${VARIANCE_BOOST_STRENGTH:=0}"
             : "${LUMA_QP_BIAS:=0}"
-
-            # حساب نافذة الإطارات المفتاحية المتوافقة مع المشاهد (10 ثوانٍ)
-            # يتيح للمرَمّز وضع الـ Keyframe فقط عند تغير المشهد الفعلي وتفادي الإطارات الزائدة
-            KEYINT_FRAMES=240
-            if [[ "$OUT_FPS" =~ ^[0-9]+/[0-9]+$ ]]; then
-              KEYINT_FRAMES=$(awk -v f="$OUT_FPS" 'BEGIN{split(f,a,"/"); fps=(a[2]>0)?a[1]/a[2]:24; printf "%d", int(fps*10)}')
-            elif [[ "$OUT_FPS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-              KEYINT_FRAMES=$(awk -v f="$OUT_FPS" 'BEGIN{printf "%d", int(f*10)}')
-            fi
-            (( KEYINT_FRAMES < 120 )) && KEYINT_FRAMES=120
-            (( KEYINT_FRAMES > 300 )) && KEYINT_FRAMES=300
-
-            # قاعدة SVT-AV1 المتقدمة للتشفير التكيفي وأقصى توفير:
-            # - tune=0: جودة بصرية حقيقية (Visual Quality)
-            # - aq-mode=2: تكميم تكيفي حسب تباين المشهد (ينقل البتات من الخلفيات المسطحة للتفاصيل الحركية)
-            # - scd=1: كشف تغير المشاهد لتحديد اللقطات وتوزيع الميزانية بدقة
-            # - keyint: نافذة مرنة للإطارات المفتاحية لمنع إهدار البتات داخل المشهد الواحد
-            # - enable-qm=1: مصفوفات التكميم الذكية
-            # - enable-restoration=1: مرشح فاينر لاستعادة حدة الحواف بدقة 1080p
-            SVT_BASE="tune=0:aq-mode=2:scd=1:keyint=${KEYINT_FRAMES}:enable-qm=1:qm-min=0:qm-max=15:enable-restoration=1"
+            # الأساس هو التوفير الأقصى: تعطيل تعزيز التباين للمناطق المظلمة لمنع تضخم الحجم في الأنمي
+            SVT_BASE="tune=0:enable-qm=1:qm-min=0"
             if [ "$VARIANCE_BOOST_STRENGTH" -gt 0 ]; then
               SVT_BASE="${SVT_BASE}:enable-variance-boost=1:variance-boost-strength=${VARIANCE_BOOST_STRENGTH}"
             fi
             if [ "$LUMA_QP_BIAS" -gt 0 ] && [ "$SRC_TRC" != "smpte2084" ]; then
               SVT_BASE="${SVT_BASE}:luminance-qp-bias=${LUMA_QP_BIAS}"
             fi
-
+            SVT_PARAMS="-svtav1-params ${SVT_BASE}"
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
-              # أنمي: استغلال الإطارات المكررة بتفعيل الفلترة الزمنية (enable-tf=1) مع حبيبات خفيفة لمنع التكتل
-              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1:enable-tf=1:film-grain=4:film-grain-denoise=0"
-            elif [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "realistic" ]; then
-              # مسلسلات وواقعي: إزالة حبيبات وضوضاء المصدر تلقائياً (film-grain-denoise=1) لتقليص الحجم بنسبة 40%
-              # ثم إعادة توليد حبيبات سنمائية خفيفة (film-grain=12) كبيانات وصفية لتبقى الصورة سينمائية وحادة
-              SVT_PARAMS="-svtav1-params ${SVT_BASE}:film-grain=12:film-grain-denoise=1"
-            else
-              SVT_PARAMS="-svtav1-params ${SVT_BASE}"
+              # إبقاء إعدادات خفيفة تماماً بدون شحذ أو رفع بتات زائد
+              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1"
             fi
             echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
             if [ "$ENCODE_METHOD" = "crf" ]; then
               # التحقق من CRF داخل فرع CRF فقط؛ كان يُطبَّق قبل التفريع فيُفشل Two-Pass
               # دائماً لأن قيمته معدل بت (مثل 200k) وليست رقم CRF.
               [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
-
-              # سقف البت في وضع CRF (Capped CRF): يمنع مشاهد الحركة السريعة
-              # من مضاعفة الحجم فجأة، مع الحفاظ على مرونة CRF في المشاهد الثابتة
-              CRF_EXTRA_ARGS=()
-              if [ -n "${MAX_BITRATE_CAP:-}" ] && [ "$MAX_BITRATE_CAP" != "none" ]; then
-                [[ "$MAX_BITRATE_CAP" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'سقف البت غير صحيح' >&2; exit 1; }
-                CAP_CLEAN="${MAX_BITRATE_CAP/%m/M}"; CAP_CLEAN="${CAP_CLEAN/%K/k}"
-                MBR_VAL=$(echo "$CAP_CLEAN" | tr -dc '0-9')
-                if [[ "$CAP_CLEAN" =~ M$ ]]; then MBR_VAL=$(( MBR_VAL * 1000 )); fi
-                SVT_PARAMS="${SVT_PARAMS}:mbr=${MBR_VAL}"
-                CRF_EXTRA_ARGS=(-maxrate "$CAP_CLEAN" -bufsize "$(( MBR_VAL * 2 ))k")
-                echo "سقف البت المفعّل لـ CRF: $CAP_CLEAN (mbr=$MBR_VAL)"
-              fi
-
               "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
-                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 240 "${COLOR_ARGS[@]}" "${CRF_EXTRA_ARGS[@]}" $SVT_PARAMS \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 240 "${COLOR_ARGS[@]}" $SVT_PARAMS \
                 -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
             else
               [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
