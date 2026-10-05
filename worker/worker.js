@@ -801,8 +801,6 @@ async function triggerGitHub(cfg, session, chatId) {
         session.filter_profile || (session.encode_mode === "filters" ? "realistic" : "none"),
       encode_method: session.encode_method || "crf",
       target_value: String(session.target_value || "28"),
-      sharpen: session.sharpen || "yes",
-      max_bitrate_cap: session.max_bitrate_cap || "none",
       resolution: session.resolution || "480",
       frame_rate: "24",
     },
