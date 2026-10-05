@@ -1,1236 +1,1026 @@
-// ============================================================================
-// بوت تيليجرام لضغط الفيديو (Cloudflare Worker) ← يشغّل GitHub Actions
-//
-// المتغيرات المطلوبة (Secrets):  BOT_TOKEN, GITHUB_TOKEN, BOT_PASSWORD
-// ربط KV مطلوب:                   SESSIONS
-// اختيارية:
-//   WEBHOOK_SECRET   إن وُجد يُرفض أي طلب لا يحمل نفس القيمة في الترويسة
-//                    X-Telegram-Bot-Api-Secret-Token (استعمل secret_token في setWebhook)
-//   GITHUB_REPO      "owner/repo"   (الافتراضي: fox09616-man/fox118)
-//   GITHUB_WORKFLOW  اسم ملف الـ workflow (الافتراضي: compress.yml)
-//   GITHUB_REF       الفرع (الافتراضي: main)
-// ============================================================================
-
-const DEFAULT_REPO = "fox09616-man/fox118";
-const DEFAULT_WORKFLOW = "compress.yml";
-const DEFAULT_REF = "main";
-const RESOLUTIONS = ["240", "360", "480", "720", "1080"];
-
-const MAX_AUTH_FAILURES = 5;
-const AUTH_LOCK_SECONDS = 900;
-const SESSION_TTL_SECONDS = 3600;
-const MAX_NAME_LENGTH = 120;
-
-// امتدادات الوسائط فقط. لا نحذف أي "امتداد" عشوائي حتى لا نخسر أجزاء من الاسم
-// مثل ".E01" في "Show S02.E01" أو ".0" في "Movie 2.0".
-const MEDIA_EXT_RE =
-  /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mts|vob|3gp|3g2|ogv|mpeg|mpg|m3u8|mp3|m4a|aac|opus|ogg|wav|flac)$/i;
-
-export default {
-  async fetch(request, env) {
-    if (request.method !== "POST") {
-      return new Response("OK", { status: 200 });
-    }
-
-    // حماية اختيارية: تأكد أن الطلب قادم فعلاً من تيليجرام.
-    if (env.WEBHOOK_SECRET) {
-      const got = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
-      if (!safeEqual(got, env.WEBHOOK_SECRET)) {
-        return new Response("Forbidden", { status: 403 });
-      }
-    }
-
-    const cfg = {
-      botToken: env.BOT_TOKEN,
-      githubToken: env.GITHUB_TOKEN,
-      repo: env.GITHUB_REPO || DEFAULT_REPO,
-      workflow: env.GITHUB_WORKFLOW || DEFAULT_WORKFLOW,
-      ref: env.GITHUB_REF || DEFAULT_REF,
-    };
-
-    let errorChatId = null;
-    try {
-      const update = await request.json();
-      errorChatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id ?? null;
-
-      if (update.message && isVideoMessage(update.message)) {
-        await handleVideo(env, cfg, update.message);
-      } else if (update.message && update.message.text !== undefined) {
-        await handleText(env, cfg, update.message);
-      } else if (update.callback_query) {
-        await handleCallback(env, cfg, update.callback_query);
-      }
-    } catch (error) {
-      console.error("Worker handler error:", error?.message, error?.stack);
-      if (errorChatId !== null) {
-        try {
-          await sendMessage(cfg.botToken, errorChatId, "⚠️ حدث خطأ داخلي غير متوقع. حاول مرة أخرى، وإن تكرر أرسل /cancel ثم ابدأ من جديد.");
-        } catch {
-          // لا شيء: الإشعار محاولة بأفضل جهد فقط.
-        }
-      }
-    }
-
-    return ok();
-  },
-};
-
-// ---------------------------------------------------------------------------
-// المعالجات الرئيسية
-// ---------------------------------------------------------------------------
-
-function isVideoMessage(message) {
-  return Boolean(
-    message.video ||
-      (message.document && (message.document.mime_type || "").startsWith("video/")),
-  );
-}
-
-async function isAuthorized(env, chatId) {
-  return Boolean(await env.SESSIONS.get(`authorized:${chatId}`));
-}
-
-// هل المستخدم في منتصف إعداد يحتاج إكماله (أو إلغاءه) قبل بدء مهمة جديدة؟
-function isSetupBusy(session) {
-  return Boolean(
-    session.configuring_preset ||
-      session.awaiting_preset ||
-      session.awaiting_target_value ||
-      session.awaiting_res ||
-      session.awaiting_filename ||
-      session.awaiting_series_title ||
-      session.awaiting_episode_start ||
-      session.pending_confirmation,
-  );
-}
-
-function hasActiveSession(session) {
-  return Object.keys(session).length > 0;
-}
-
-const BUSY_MESSAGE = "⚠️ أنت في منتصف عملية إعداد. أكمل الإعداد أولاً أو ألغِ العملية بـ /cancel.";
-
-async function handleVideo(env, cfg, message) {
-  const chatId = message.chat.id;
-
-  if (!(await isAuthorized(env, chatId))) {
-    await sendMessage(cfg.botToken, chatId, "🔒 هذا البوت خاص. أرسل كلمة المرور للمتابعة:");
-    return;
-  }
-
-  const session = (await getSession(env, chatId)) || {};
-  if (isSetupBusy(session)) {
-    await sendMessage(cfg.botToken, chatId, BUSY_MESSAGE);
-    return;
-  }
-
-  const defaultName = extractDefaultName(message);
-  const preset = await getPreset(env, chatId);
-
-  // وضع الإعداد التلقائي: يستعمل الإعداد المحفوظ مباشرة.
-  if (preset && preset.active) {
-    await runAutomatic(
-      env,
-      cfg,
-      chatId,
-      preset,
-      { message_id: message.message_id, url: "" },
-      defaultName,
-      "📤 جارٍ إرسال المهمة تلقائياً",
-    );
-    return;
-  }
-
-  // جلسة يدوية جديدة.
-  await setSession(env, chatId, {
-    message_id: message.message_id,
-    url: "",
-    default_name: defaultName,
-    pending_confirmation: false,
-  });
-  await sendCodecKeyboard(cfg.botToken, chatId);
-}
-
-async function handleText(env, cfg, message) {
-  const chatId = message.chat.id;
-  const rawText = message.text.trim();
-
-  if (!(await isAuthorized(env, chatId))) {
-    await handleUnauthorizedText(env, cfg, message, rawText);
-    return;
-  }
-
-  // "/start@MyBot" ← "/start"
-  const text = rawText.replace(/^(\/[A-Za-z0-9_]+)@\w+/, "$1");
-  const session = (await getSession(env, chatId)) || {};
-
-  // قبول أي رابط.
-  if (isAnyLink(text)) {
-    if (isSetupBusy(session)) {
-      await sendMessage(cfg.botToken, chatId, BUSY_MESSAGE);
-      return;
-    }
-
-    const preset = await getPreset(env, chatId);
-    const linkInfo = extractLinkInfo(text);
-
-    if (preset && preset.active) {
-      await runAutomatic(
-        env,
-        cfg,
-        chatId,
-        preset,
-        { message_id: "", url: text },
-        linkInfo.name || "video",
-        "📤 جارٍ معالجة الرابط تلقائياً",
-      );
-    } else {
-      await setSession(env, chatId, {
-        message_id: "",
-        url: text,
-        default_name: linkInfo.name,
-        pending_confirmation: false,
-      });
-      await sendCodecKeyboard(cfg.botToken, chatId);
-    }
-    return;
-  }
-
-  // رسائل التأكيد.
-  if (session.pending_confirmation) {
-    if (text === "/confirm" || text === "✅ تأكيد") {
-      await confirmAndSend(env, cfg, chatId, session, null);
-    } else if (text === "/cancel" || text === "🚫 إلغاء") {
-      await deleteSession(env, chatId);
-      await sendMessage(cfg.botToken, chatId, "🚫 تم إلغاء العملية.");
-    } else {
-      await sendMessage(cfg.botToken, chatId, "⚠️ الرجاء اختيار تأكيد أو إلغاء العملية:");
-    }
-    return;
-  }
-
-  // الأوامر.
-  if (text === "/start") {
-    await sendMessage(cfg.botToken, chatId, startMessage(await getPreset(env, chatId)));
-    return;
-  }
-
-  if (text === "/setup" || text === "/settings") {
-    await setSession(env, chatId, { configuring_preset: true, pending_confirmation: false });
-    await sendCodecKeyboard(cfg.botToken, chatId);
-    return;
-  }
-
-  if (text === "/preset") {
-    await sendMessage(cfg.botToken, chatId, presetStatusText(await getPreset(env, chatId)));
-    return;
-  }
-
-  if (text === "/auto_off") {
-    const preset = await getPreset(env, chatId);
-    if (!preset) {
-      await sendMessage(cfg.botToken, chatId, "لا يوجد إعداد محفوظ أصلاً.");
-    } else {
-      preset.active = false;
-      await setPreset(env, chatId, preset);
-      await sendMessage(cfg.botToken, chatId, "⏸️ تم إيقاف الوضع التلقائي. أرسل فيديو وستُسأل عن الإعدادات.");
-    }
-    return;
-  }
-
-  if (text === "/auto_on") {
-    const preset = await getPreset(env, chatId);
-    if (!preset) {
-      await sendMessage(cfg.botToken, chatId, "لا يوجد إعداد محفوظ. استخدم /setup أولاً.");
-    } else {
-      preset.active = true;
-      await setPreset(env, chatId, preset);
-      await sendMessage(cfg.botToken, chatId, `▶️ تم تفعيل الوضع التلقائي.\n${presetStatusText(preset)}`);
-    }
-    return;
-  }
-
-  if (text === "/cancel") {
-    await deleteSession(env, chatId);
-    await sendMessage(cfg.botToken, chatId, "🚫 تم إلغاء العملية.");
-    return;
-  }
-
-  // مدخلات الإعداد النصية.
-  if (session.awaiting_series_title) {
-    const seriesTitle = cleanFileName(text);
-    if (!seriesTitle) {
-      await sendMessage(cfg.botToken, chatId, "📝 أرسل اسماً صحيحاً للمسلسل، مثل: Solo Leveling S02\n\nللإلغاء أرسل /cancel");
-      return;
-    }
-    session.series_title = seriesTitle;
-    session.awaiting_series_title = false;
-    session.awaiting_episode_start = true;
-    await setSession(env, chatId, session);
-    await sendMessage(cfg.botToken, chatId, `✅ اسم السلسلة: ${seriesTitle}\n🔢 أرسل رقم الحلقة الأولى، مثل: 1\n\nللإلغاء أرسل /cancel`);
-    return;
-  }
-
-  if (session.awaiting_episode_start) {
-    if (!/^[1-9]\d{0,5}$/.test(text)) {
-      await sendMessage(cfg.botToken, chatId, "🔢 أرسل رقم حلقة موجباً فقط، مثل: 1 أو 12.\n\nللإلغاء أرسل /cancel");
-      return;
-    }
-    session.next_episode = Number.parseInt(text, 10);
-    session.awaiting_episode_start = false;
-    await setSession(env, chatId, session);
-    await savePresetAndConfirm(env, cfg.botToken, chatId, session);
-    return;
-  }
-
-  if (session.awaiting_preset) {
-    const codec = session.codec || "av1";
-    if (!isValidPreset(codec, text)) {
-      await sendMessage(cfg.botToken, chatId, "أرسل رقم سرعة AV1 من 0 إلى 13 فقط:\n\nللإلغاء أرسل /cancel");
-      return;
-    }
-
-    session.preset = text;
-    session.awaiting_preset = false;
-    await setSession(env, chatId, session);
-    await sendMessage(cfg.botToken, chatId, `✅ تم تسجيل AV1 preset: ${text}`);
-    await sendEncodeMethodKeyboard(cfg.botToken, chatId, codec);
-    return;
-  }
-
-  if (session.awaiting_target_value) {
-    const value = normalizeTargetValue(session.codec, session.encode_method, text);
-    if (value === null) {
-      await sendMessage(cfg.botToken, chatId, targetValueHint(session.codec, session.encode_method) + "\n\nللإلغاء أرسل /cancel");
-      return;
-    }
-
-    session.target_value = value;
-    session.awaiting_target_value = false;
-    await setSession(env, chatId, session);
-
-    if (session.codec === "audio") {
-      if (session.configuring_preset) {
-        await sendAutoNamingKeyboard(cfg.botToken, chatId);
-      } else {
-        session.awaiting_filename = true;
-        await setSession(env, chatId, session);
-        await promptFilename(cfg.botToken, chatId, null, session.default_name, false);
-      }
-    } else {
-      await sendMessage(cfg.botToken, chatId, `✅ تم تسجيل القيمة: ${value}`);
-      await sendQualityKeyboard(cfg.botToken, chatId, RESOLUTIONS);
-    }
-    return;
-  }
-
-  if (session.awaiting_res) {
-    if (!isValidResolution(text)) {
-      await sendMessage(cfg.botToken, chatId, "أرسل ارتفاعاً صحيحاً بين 144 و2160، مثل 550:\n\nللإلغاء أرسل /cancel");
-      return;
-    }
-    session.resolution = String(Number.parseInt(text, 10)); // "0480" ← "480"
-    session.awaiting_res = false;
-    await setSession(env, chatId, session);
-    await continueAfterResolution(env, cfg.botToken, chatId, session);
-    return;
-  }
-
-  if (session.awaiting_filename) {
-    session.filename = cleanFileName(text) || cleanFileName(session.default_name) || "video";
-    await askConfirmation(env, cfg, chatId, session);
-    return;
-  }
-
-  await sendMessage(cfg.botToken, chatId, "📤 أرسل فيديو مباشرة أو أي رابط للبدء، أو استخدم /setup لحفظ إعداد تلقائي.");
-}
-
-// كلمة المرور: مقارنة ثابتة الزمن + حذف الرسالة + حد للمحاولات الفاشلة.
-async function handleUnauthorizedText(env, cfg, message, rawText) {
-  const chatId = message.chat.id;
-  const prompt = "🔒 هذا البوت خاص. أرسل كلمة المرور للمتابعة:";
-
-  // الأوامر (مثل /start) ليست محاولات كلمة مرور.
-  if (rawText.startsWith("/")) {
-    await sendMessage(cfg.botToken, chatId, prompt);
-    return;
-  }
-
-  const lockKey = `authfail:${chatId}`;
-  const failures = Number.parseInt((await env.SESSIONS.get(lockKey)) || "0", 10) || 0;
-  if (failures >= MAX_AUTH_FAILURES) {
-    await sendMessage(cfg.botToken, chatId, "⛔ محاولات كثيرة خاطئة. حاول مجدداً بعد 15 دقيقة.");
-    return;
-  }
-
-  if (env.BOT_PASSWORD && safeEqual(rawText, env.BOT_PASSWORD)) {
-    await env.SESSIONS.put(`authorized:${chatId}`, "true");
-    await env.SESSIONS.delete(lockKey);
-    await deleteMessage(cfg.botToken, chatId, message.message_id);
-    await sendMessage(cfg.botToken, chatId, "✅ تم التحقق بنجاح. أرسل /start للبدء.");
-    return;
-  }
-
-  await env.SESSIONS.put(lockKey, String(failures + 1), { expirationTtl: AUTH_LOCK_SECONDS });
-  await deleteMessage(cfg.botToken, chatId, message.message_id);
-  await sendMessage(cfg.botToken, chatId, prompt);
-}
-
-async function handleCallback(env, cfg, query) {
-  const message = query.message;
-  await answerCallback(cfg.botToken, query.id);
-  if (!message) return; // رسالة قديمة جداً لم تعد متاحة لتيليجرام.
-
-  const chatId = message.chat.id;
-  const messageId = message.message_id;
-  const data = query.data || "";
-
-  if (!(await isAuthorized(env, chatId))) return;
-
-  const session = (await getSession(env, chatId)) || {};
-
-  if (data === "confirm_action") {
-    if (!session.pending_confirmation) {
-      await editMessage(cfg.botToken, chatId, messageId, "⚠️ لا توجد عملية معلقة للتأكيد.");
-      return;
-    }
-    await confirmAndSend(env, cfg, chatId, session, messageId);
-    return;
-  }
-
-  if (data === "cancel_action") {
-    if (!session.pending_confirmation) {
-      await editMessage(cfg.botToken, chatId, messageId, "⚠️ لا توجد عملية معلقة للإلغاء.");
-      return;
-    }
-    await deleteSession(env, chatId);
-    await editMessage(cfg.botToken, chatId, messageId, "🚫 تم إلغاء العملية.");
-    return;
-  }
-
-  if (data === "cancel") {
-    await deleteSession(env, chatId);
-    await editMessage(cfg.botToken, chatId, messageId, "🚫 تم إلغاء العملية.");
-    return;
-  }
-
-  // أي زر آخر يحتاج جلسة حيّة؛ أزرار الرسائل القديمة (بعد انتهاء الجلسة) تُرفض.
-  if (!hasActiveSession(session)) {
-    await editMessage(cfg.botToken, chatId, messageId, "⌛ انتهت صلاحية هذه العملية. أرسل الفيديو أو الرابط من جديد.");
-    return;
-  }
-
-  if (data.startsWith("codec_")) {
-    const codec = data.split("_")[1];
-    if (!["av1", "audio"].includes(codec)) return;
-
-    session.codec = codec;
-    if (codec === "audio") {
-      session.encode_mode = "audio";
-      session.filter_profile = "none";
-      session.preset = "none";
-      session.encode_method = "audio";
-      session.awaiting_target_value = true;
-      await setSession(env, chatId, session);
-      await editMessage(cfg.botToken, chatId, messageId, "أرسل معدل بت الصوت (من 6k إلى 510k)، مثال: 32k أو 48k:");
-    } else {
-      await setSession(env, chatId, session);
-      await editMessage(cfg.botToken, chatId, messageId, "🎞️ المرمّز المختار: AV1");
-      await sendEncodeModeKeyboard(cfg.botToken, chatId);
-    }
-    return;
-  }
-
-  if (data.startsWith("mode_")) {
-    const mode = data.split("_")[1];
-    if (!["filters", "nofilters"].includes(mode)) return;
-
-    session.encode_mode = mode;
-    session.filter_profile = mode === "nofilters" ? "none" : undefined;
-    await setSession(env, chatId, session);
-
-    if (mode === "filters") {
-      await editMessage(
-        cfg.botToken,
-        chatId,
-        messageId,
-        "🧩 اختر نوع الفلاتر: الأنمي للرسوم والمساحات اللونية، والواقعي للتصوير الحقيقي:",
-        filterProfileKeyboardMarkup(),
-      );
-    } else {
-      session.awaiting_preset = true;
-      await setSession(env, chatId, session);
-      await editMessage(cfg.botToken, chatId, messageId, presetPrompt());
-    }
-    return;
-  }
-
-  if (data.startsWith("filter_")) {
-    const profile = data.split("_")[1];
-    if (!["anime", "realistic"].includes(profile)) return;
-
-    session.filter_profile = profile;
-    session.awaiting_preset = true;
-    await setSession(env, chatId, session);
-    await editMessage(
-      cfg.botToken,
-      chatId,
-      messageId,
-      `${profile === "anime" ? "🌸 تم اختيار فلاتر الأنمي." : "🎬 تم اختيار فلاتر المحتوى الواقعي."}\n${presetPrompt()}`,
-    );
-    return;
-  }
-
-  if (data.startsWith("encmethod_")) {
-    const method = data.split("_")[1];
-    if (!isValidEncodeMethod(session.codec, method)) return;
-
-    session.encode_method = method;
-    session.awaiting_target_value = true;
-    await setSession(env, chatId, session);
-    await editMessage(cfg.botToken, chatId, messageId, encodeMethodPrompt(session.codec, method));
-    return;
-  }
-
-  if (data === "autoname_keep") {
-    session.auto_naming = "source";
-    delete session.series_title;
-    delete session.next_episode;
-    await setSession(env, chatId, session);
-    await editMessage(cfg.botToken, chatId, messageId, "📄 سيحتفظ كل ملف باسمه المرفق تلقائياً.");
-    await savePresetAndConfirm(env, cfg.botToken, chatId, session);
-    return;
-  }
-
-  if (data === "autoname_series") {
-    session.auto_naming = "series";
-    session.awaiting_series_title = true;
-    await setSession(env, chatId, session);
-    await editMessage(
-      cfg.botToken,
-      chatId,
-      messageId,
-      "📝 أرسل اسم السلسلة كما تريد ظهوره.\nمثال: Solo Leveling S02\n\nسيكون الناتج: Solo Leveling S02 - E01\n\nللإلغاء أرسل /cancel",
-    );
-    return;
-  }
-
-  if (data === "custom_res") {
-    session.awaiting_res = true;
-    await setSession(env, chatId, session);
-    await editMessage(cfg.botToken, chatId, messageId, "📐 أرسل الارتفاع المطلوب رقماً فقط، مثال: 550:\n\nللإلغاء أرسل /cancel");
-    return;
-  }
-
-  if (data === "auto_res") {
-    session.resolution = "auto";
-    await setSession(env, chatId, session);
-    await editMessage(cfg.botToken, chatId, messageId, "🎯 تم اختيار: نفس جودة الفيديو الأصلية");
-    await continueAfterResolution(env, cfg.botToken, chatId, session);
-    return;
-  }
-
-  if (data.startsWith("res_")) {
-    const resolution = data.split("_")[1];
-    if (!isValidResolution(resolution)) return;
-    session.resolution = resolution;
-    await setSession(env, chatId, session);
-    await editMessage(cfg.botToken, chatId, messageId, `🎯 تم اختيار الدقة: ${resolution}p`);
-    await continueAfterResolution(env, cfg.botToken, chatId, session);
-    return;
-  }
-
-  if (data === "name_skip") {
-    session.filename = cleanFileName(session.default_name) || "video";
-    await askConfirmation(env, cfg, chatId, session);
-    return;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// أدوات الأمان
-// ---------------------------------------------------------------------------
-
-function safeEqual(a, b) {
-  const encoder = new TextEncoder();
-  const x = encoder.encode(String(a));
-  const y = encoder.encode(String(b));
-  let diff = x.length ^ y.length;
-  const length = Math.max(x.length, y.length);
-  for (let i = 0; i < length; i += 1) {
-    diff |= (x[i] || 0) ^ (y[i] || 0);
-  }
-  return diff === 0;
-}
-
-// ---------------------------------------------------------------------------
-// الروابط والأسماء
-// ---------------------------------------------------------------------------
-
-function isAnyLink(text) {
-  return /^https?:\/\/\S+$/i.test(text);
-}
-
-function extractLinkInfo(url) {
-  try {
-    const parsed = new URL(url);
-    const hostname = parsed.hostname.replace(/^www\./, "");
-    const pathParts = parsed.pathname.split("/").filter(Boolean);
-    let lastPart = pathParts[pathParts.length - 1] || "";
-    try {
-      lastPart = decodeURIComponent(lastPart);
-    } catch {
-      // نُبقي الاسم كما هو إن كان الترميز غير صالح.
-    }
-
-    const name = MEDIA_EXT_RE.test(lastPart)
-      ? lastPart // cleanFileName يحذف امتداد الوسائط
-      : generateNameFromLink(hostname, parsed, lastPart);
-
-    return {
-      name: cleanFileName(name) || `video_${Date.now()}`,
-      hostname,
-      fullUrl: url,
-    };
-  } catch {
-    return {
-      name: `video_${Date.now()}`,
-      hostname: "unknown",
-      fullUrl: url,
-    };
-  }
-}
-
-function generateNameFromLink(hostname, parsed, lastPart) {
-  const videoId = parsed.searchParams.get("v"); // روابط على نمط watch?v=...
-  if (videoId) return `${hostname}_${videoId}`;
-
-  const cleaned = cleanFileName(lastPart.replace(/\.(php|html?|aspx?|jsp)$/i, ""));
-  if (cleaned && lastPart.length < 100) return `${hostname}_${cleaned}`;
-
-  return `${hostname}_${Date.now()}`;
-}
-
-function cleanFileName(value) {
-  const cleaned = String(value || "")
-    .replace(MEDIA_EXT_RE, "")
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replace(/[\\/:*?"<>|]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  // القطع بالأحرف الكاملة (وليس وحدات UTF-16) حتى لا نكسر الإيموجي.
-  return Array.from(cleaned)
-    .slice(0, MAX_NAME_LENGTH)
-    .join("")
-    .replace(/^\.+/, "")
-    .replace(/[. ]+$/, "")
-    .trim();
-}
-
-function extractDefaultName(message) {
-  const raw = message.caption || message.document?.file_name || message.video?.file_name || null;
-  if (!raw) return null;
-  return cleanFileName(raw) || null;
-}
-
-function formatEpisode(value) {
-  return String(Number.parseInt(value, 10)).padStart(2, "0");
-}
-
-// صوت مسار AV1 ثابت: Opus بمعدل 16k أحادي (قرار المستخدم: أصغر حجم وأهدأ صوت).
-// يطابق ما يُطبَّقه compress.yml (-b:a 16k -ac 1).
-const VIDEO_AUDIO_LABEL = "Opus 16k أحادي";
-
-// الدقة المختارة لا ترفع دقة مصدر أقل منها (يطبّق compress.yml: min(ارتفاع المصدر, المختارة)).
-function resolutionText(resolution) {
-  return resolution === "auto" ? "نفس جودة الفيديو الأصلية" : `${resolution}p (بلا رفع إن كان المصدر أقل)`;
-}
-
-// ---------------------------------------------------------------------------
-// الوضع التلقائي وحجز أرقام الحلقات
-// ---------------------------------------------------------------------------
-
-// نحجز رقم الحلقة (قراءة ثم زيادة فورية) قبل إرسال المهمة، بدل زيادته بعد نجاح
-// الإرسال؛ هذا يقلل كثيراً فرصة أن تأخذ رسالتان متزامنتان الرقم نفسه.
-// (KV ليس ذرّياً؛ للضمان الكامل استعمل Durable Object.)
-async function reserveAutoName(env, chatId, preset, sourceName) {
-  if (
-    preset.auto_naming === "series" &&
-    preset.series_title &&
-    Number.isInteger(preset.next_episode) &&
-    preset.next_episode > 0
-  ) {
-    const fresh = (await getPreset(env, chatId)) || preset;
-    const episode =
-      Number.isInteger(fresh.next_episode) && fresh.next_episode > 0
-        ? fresh.next_episode
-        : preset.next_episode;
-    const title = cleanFileName(fresh.series_title || preset.series_title);
-    fresh.next_episode = episode + 1;
-    await setPreset(env, chatId, fresh);
-    return { name: `${title} - E${formatEpisode(episode)}`, episode };
-  }
-  return { name: cleanFileName(sourceName) || "video", episode: null };
-}
-
-async function releaseEpisode(env, chatId, episode) {
-  if (!Number.isInteger(episode)) return;
-  const preset = await getPreset(env, chatId);
-  if (preset && preset.next_episode === episode + 1) {
-    preset.next_episode = episode;
-    await setPreset(env, chatId, preset);
-  }
-}
-
-async function runAutomatic(env, cfg, chatId, preset, source, sourceName, label) {
-  const { name, episode } = await reserveAutoName(env, chatId, preset, sourceName);
-
-  const autoSession = {
-    message_id: source.message_id,
-    url: source.url,
-    codec: preset.codec || "av1",
-    encode_mode: preset.encode_mode || "nofilters",
-    filter_profile:
-      preset.filter_profile || (preset.encode_mode === "filters" ? "realistic" : "none"),
-    preset: preset.preset || preset.av1_preset || "8",
-    encode_method: preset.encode_method || "crf",
-    target_value: preset.target_value || "28",
-    resolution: preset.resolution || "480",
-    filename: name,
-    reserved_episode: episode,
-    pending_confirmation: false,
-  };
-
-  await sendMessage(cfg.botToken, chatId, `${label}: ${name}`);
-  await finalizeAndTrigger(env, cfg, chatId, autoSession, false);
-}
-
-// ---------------------------------------------------------------------------
-// التأكيد والإرسال
-// ---------------------------------------------------------------------------
-
-function confirmKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [
-        { text: "✅ تأكيد", callback_data: "confirm_action" },
-        { text: "🚫 إلغاء", callback_data: "cancel_action" },
-      ],
-    ],
-  };
-}
-
-async function askConfirmation(env, cfg, chatId, session) {
-  session.awaiting_filename = false;
-  session.pending_confirmation = true;
-  session.confirmation_message_id = null;
-  await setSession(env, chatId, session);
-
-  const summary = buildSummaryMessage(session);
-  const sent = await sendMessageWithReturn(
-    cfg.botToken,
-    chatId,
-    `📋 ملخص العملية:\n${summary}\n\nهل تريد تأكيد الإرسال؟`,
-    confirmKeyboardMarkup(),
-  );
-  session.confirmation_message_id = sent?.result?.message_id ?? null;
-  await setSession(env, chatId, session);
-}
-
-async function confirmAndSend(env, cfg, chatId, session, messageId) {
-  session.pending_confirmation = false;
-  await setSession(env, chatId, session);
-
-  const text = "✅ تم تأكيد العملية. جارٍ الإرسال...";
-  if (messageId) {
-    await editMessage(cfg.botToken, chatId, messageId, text);
-  } else {
-    await sendMessage(cfg.botToken, chatId, text);
-  }
-  await finalizeAndTrigger(env, cfg, chatId, session, true);
-}
-
-async function finalizeAndTrigger(env, cfg, chatId, session, canRetry) {
-  if (!session.message_id && !session.url) {
-    await releaseEpisode(env, chatId, session.reserved_episode);
-    await deleteSession(env, chatId);
-    await sendMessage(cfg.botToken, chatId, "⚠️ لا يوجد فيديو أو رابط في هذه العملية. أرسل الفيديو أو الرابط من جديد.");
-    return;
-  }
-
-  const success = await triggerGitHub(cfg, session, chatId);
-  if (success) {
-    await deleteSession(env, chatId);
-    await sendMessage(cfg.botToken, chatId, "✅ تم إرسال المهمة إلى مصنع الضغط السحابي.");
-    return;
-  }
-
-  await releaseEpisode(env, chatId, session.reserved_episode);
-  if (canRetry) {
-    // نُبقي الجلسة لتعيد المحاولة دون إعادة الإعدادات كلها.
-    session.pending_confirmation = true;
-    await setSession(env, chatId, session);
-    await sendMessage(
-      cfg.botToken,
-      chatId,
-      "❌ فشل إرسال المهمة إلى GitHub. تحقق من سجل العامل ورمز GitHub.\nأرسل /confirm لإعادة المحاولة أو /cancel للإلغاء.",
-    );
-  } else {
-    await deleteSession(env, chatId);
-    await sendMessage(cfg.botToken, chatId, "❌ فشل إرسال المهمة إلى GitHub. تحقق من سجل العامل ورمز GitHub ثم أعد إرسال الفيديو.");
-  }
-}
-
-async function triggerGitHub(cfg, session, chatId) {
-  if (!cfg.githubToken) {
-    console.error("GITHUB_TOKEN is not configured");
-    return false;
-  }
-
-  const body = {
-    ref: cfg.ref,
-    inputs: {
-      message_id: session.message_id ? String(session.message_id) : "",
-      url: session.url || "",
-      chat_id: String(chatId),
-      filename: session.filename || "video",
-      codec: session.codec || "av1",
-      preset: session.preset || "4",
-      encode_mode: session.encode_mode || "nofilters",
+name: ضغط الفيديو الشخصي الموحد (AV1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      message_id:
+        description: 'معرف رسالة الفيديو في تيليجرام؛ يترك فارغاً عند استخدام الرابط.'
+        required: false
+        default: ''
+      url:
+        description: 'رابط مباشر اختياري؛ يترك فارغاً عند استخدام فيديو تيليجرام.'
+        required: false
+        default: ''
+      chat_id:
+        description: 'معرف الدردشة التي أرسلت الفيديو.'
+        required: true
+      filename:
+        description: 'الاسم النهائي، من دون امتداد.'
+        required: false
+        default: ''
+      codec:
+        description: 'av1 أو audio'
+        required: true
+        default: 'av1'
+        type: choice
+        options: ['av1', 'audio']
+      preset:
+        description: 'AV1: رقم 0-13.'
+        required: true
+        default: '8'
+      encode_mode:
+        description: 'filters أو nofilters أو audio'
+        required: true
+        default: 'nofilters'
+        type: choice
+        options: ['filters', 'nofilters', 'audio']
       filter_profile:
-        session.filter_profile || (session.encode_mode === "filters" ? "realistic" : "none"),
-      encode_method: session.encode_method || "crf",
-      target_value: String(session.target_value || "28"),
-      resolution: session.resolution || "480",
-      frame_rate: "24",
-    },
-  };
+        description: 'anime أو realistic أو none'
+        required: true
+        default: 'none'
+        type: choice
+        options: ['anime', 'realistic', 'none']
+      encode_method:
+        description: 'AV1: crf أو twopass. صوت: audio.'
+        required: true
+        default: 'crf'
+        type: choice
+        options: ['crf', 'twopass', 'audio']
+      target_value:
+        description: 'CRF أو معدل البت، مثل 28 أو 500k.'
+        required: true
+        default: '28'
+      resolution:
+        description: 'الارتفاع النهائي (مثل 480 أو 720 أو 1080)، أو auto لإبقاء دقة المصدر.'
+        required: true
+        default: '480'
+      frame_rate:
+        description: 'معدل الإطارات النهائي. القيمة الافتراضية 24 لأقل حجم للمسلسلات والأنمي.'
+        required: true
+        default: '24'
 
-  const response = await fetch(
-    `https://api.github.com/repos/${cfg.repo}/actions/workflows/${cfg.workflow}/dispatches`,
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${cfg.githubToken}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "Cloudflare-Worker",
-      },
-      body: JSON.stringify(body),
-    },
-  );
+concurrency:
+  group: video-compression-${{ github.event.inputs.chat_id }}
+  queue: max
+  cancel-in-progress: false
 
-  const responseText = await response.text();
-  if (!response.ok) {
-    console.error("GitHub workflow dispatch failed:", {
-      status: response.status,
-      repository: cfg.repo,
-      workflow: cfg.workflow,
-      detail: responseText.slice(0, 1500),
-    });
-    return false;
-  }
+permissions:
+  contents: read
 
-  console.log("GitHub workflow dispatched:", {
-    status: response.status,
-    repository: cfg.repo,
-    workflow: cfg.workflow,
-  });
-  return true;
-}
+jobs:
+  prepare-codec-build:
+    name: بناء FFmpeg الموحد
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: استعادة بناء FFmpeg الموحد
+        if: github.event.inputs.codec != 'audio'
+        id: cache-build
+        uses: actions/cache@v4
+        with:
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
 
-// ---------------------------------------------------------------------------
-// النصوص والملخصات
-// ---------------------------------------------------------------------------
+      - name: بناء المرّمّزات والمفكك وFFmpeg
+        if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt update
+          sudo apt install -y build-essential cmake git nasm pkg-config libdav1d-dev libogg-dev libopus-dev
+          rm -rf "$HOME/codec-build" "$HOME/codec-sources"
+          mkdir -p "$HOME/codec-build" "$HOME/codec-sources"
+          cd "$HOME/codec-sources"
+          git clone --depth 1 --branch v4.2.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git
+          cmake -S SVT-AV1 -B SVT-AV1/Build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
+          cmake --build SVT-AV1/Build --parallel "$(nproc)"
+          cmake --install SVT-AV1/Build
+          # libvmaf (اختياري، لقياس جودة VMAF): إن فشل أي جزء من بنائه نكمل بدونه
+          # ويبقى قياس SSIM متاحاً. لا يُفشل هذا الجزء البناء الأساسي.
+          VMAF_FLAG=""
+          if sudo apt install -y meson ninja-build xxd \
+             && git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git \
+             && meson setup vmaf/libvmaf/build vmaf/libvmaf --buildtype release --prefix="$HOME/codec-build" --libdir=lib -Denable_tests=false -Denable_docs=false \
+             && ninja -C vmaf/libvmaf/build \
+             && ninja -C vmaf/libvmaf/build install; then
+            VMAF_FLAG="--enable-libvmaf"
+            echo "✅ تم بناء libvmaf"
+          else
+            echo "⚠️ تعذّر بناء libvmaf؛ سنكمل بدون VMAF (SSIM يبقى متاحاً)"
+          fi
+          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git
+          export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          cd FFmpeg
+          ./configure --prefix="$HOME/codec-build" --enable-gpl --enable-version3 --disable-doc --enable-libopus --enable-libdav1d --enable-libsvtav1 $VMAF_FLAG --extra-cflags="-I$HOME/codec-build/include" --extra-ldflags="-L$HOME/codec-build/lib"
+          make -j"$(nproc)"
+          make install
 
-function buildSummaryMessage(session) {
-  const codecLabel = session.codec === "audio" ? "صوت فقط" : "AV1";
-  const modeLabel =
-    session.encode_mode === "filters"
-      ? session.filter_profile === "anime"
-        ? "مع فلاتر الأنمي"
-        : "مع فلاتر الواقعي"
-      : session.encode_mode === "audio"
-        ? "صوت فقط"
-        : "بدون فلاتر";
-  const methodLabel =
-    session.encode_method === "crf"
-      ? "CRF"
-      : session.encode_method === "twopass"
-        ? "Two-Pass"
-        : "استخراج صوت";
-  const resolutionLabel = resolutionText(session.resolution);
+      - name: فحص البناء الموحد
+        if: github.event.inputs.codec != 'audio'
+        run: |
+          set -euo pipefail
+          sudo apt update
+          sudo apt install -y libdav1d-dev libopus0
+          export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          test -x "$HOME/codec-build/bin/ffmpeg"
+          "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
+          "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
+          if "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf '; then echo "✅ VMAF متاح في البناء"; else echo "⚠️ VMAF غير متاح؛ سيُستعمل SSIM فقط"; fi
 
-  const lines = [
-    `📁 اسم الملف: ${session.filename || "غير محدد"}`,
-    `🎞️ المرمّز: ${codecLabel}`,
-    `🖼️ الوضع: ${modeLabel}`,
-    `🏎️ السرعة: ${session.preset || "-"}`,
-    `🎛️ الطريقة: ${methodLabel}`,
-    `📊 القيمة: ${session.target_value || "-"}`,
-  ];
+  split-video:
+    name: تحميل المصدر وفحصه وتقطيعه
+    needs: prepare-codec-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    outputs:
+      chunks: ${{ steps.segment.outputs.chunks }}
+    steps:
+      - name: تجهيز أدوات التحميل
+        run: |
+          set -euo pipefail
+          sudo apt update
+          sudo apt install -y ffmpeg jq libdav1d-dev libopus0 python3-pip curl
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user telethon requests beautifulsoup4 lxml yt-dlp
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "✅ تم تثبيت جميع الأدوات"
 
-  if (session.codec !== "audio") {
-    lines.push(`🎯 الدقة: ${resolutionLabel}`);
-    lines.push(`🔊 الصوت: ${VIDEO_AUDIO_LABEL}`);
-  }
+      - name: استعادة FFmpeg الموحد عند الحاجة
+        if: github.event.inputs.codec != 'audio'
+        uses: actions/cache@v4
+        with:
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
 
-  return lines.join("\n");
-}
+      - name: تحميل الفيديو المصدر والتحقق منه
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          SOURCE_CHAT_ID: ${{ github.event.inputs.chat_id }}
+          MESSAGE_ID: ${{ github.event.inputs.message_id }}
+          VIDEO_URL: ${{ github.event.inputs.url }}
+        run: |
+          set -euo pipefail
 
-function presetStatusText(preset) {
-  if (!preset) return "لا يوجد إعداد محفوظ.";
+          # 1. تحميل من رسالة تيليجرام
+          if [ -n "$MESSAGE_ID" ]; then
+            echo "📥 تحميل من رسالة تيليجرام..."
+            python3 <<'PYEOF'
+          import asyncio, os, sys
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+          async def main():
+              client = TelegramClient(StringSession(), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              await client.start(bot_token=os.environ["BOT_TOKEN"])
+              async with client:
+                  message = await client.get_messages(int(os.environ["SOURCE_CHAT_ID"]), ids=int(os.environ["MESSAGE_ID"]))
+                  if message is None or not message.media:
+                      sys.exit("لم يتم العثور على فيديو.")
+                  await client.download_media(message, file="raw_input.mp4")
+          asyncio.run(main())
+          PYEOF
 
-  const codecLabel = preset.codec === "audio" ? "صوت فقط" : "AV1";
-  const modeLabel =
-    preset.encode_mode === "filters"
-      ? preset.filter_profile === "anime"
-        ? "مع فلاتر الأنمي"
-        : "مع فلاتر الواقعي"
-      : preset.encode_mode === "audio"
-        ? "صوت فقط"
-        : "بدون فلاتر";
-  const methodLabel =
-    preset.encode_method === "crf"
-      ? "CRF"
-      : preset.encode_method === "twopass"
-        ? "Two-Pass"
-        : "استخراج صوت";
-  const resolutionLabel = resolutionText(preset.resolution);
+          # 2. تحميل من رابط تيليجرام
+          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
+            echo "📥 تحميل من رابط تيليجرام..."
+            python3 <<'PYEOF'
+          import asyncio, os, sys, re
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+          from telethon.tl.types import PeerChannel
+          async def main():
+              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              await client.start()
+              url = os.environ["VIDEO_URL"]
+              async with client:
+                  # أولاً: نمط t.me/c/<id>/<msg_id> (قنوات خاصة)
+                  match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', url)
+                  if match and not match.group(1).startswith('+'):
+                      ident = match.group(1)
+                      msg_id = int(match.group(2))
+                      try:
+                          if ident.isdigit():
+                              entity = await client.get_entity(PeerChannel(int(ident)))
+                          else:
+                              entity = await client.get_entity(ident)
+                          message = await client.get_messages(entity, ids=msg_id)
+                          if message and message.media:
+                              await client.download_media(message, file="raw_input.mp4")
+                              return
+                          else:
+                              sys.exit("لم يتم العثور على فيديو.")
+                      except Exception as e:
+                          sys.exit(f"فشل: {str(e)}")
+                  # ثانياً: رابط مباشر لملف
+                  if re.search(r'\.(mp4|mkv|avi|mov|webm)$', url, re.IGNORECASE):
+                      try:
+                          await client.download_file(url, file="raw_input.mp4")
+                          return
+                      except Exception as e:
+                          sys.exit(f"فشل: {str(e)}")
+                  # ثالثاً: رابط قناة عامة أو منشور
+                  try:
+                      entity = await client.get_entity(url)
+                      async for message in client.iter_messages(entity, limit=10):
+                          if message.media and hasattr(message.media, 'document'):
+                              await client.download_media(message, file="raw_input.mp4")
+                              return
+                      sys.exit("لم يتم العثور على فيديو.")
+                  except Exception as e:
+                      sys.exit(f"فشل: {str(e)}")
+          asyncio.run(main())
+          PYEOF
 
-  const lines = [
-    `المرمّز: ${codecLabel}`,
-    `الوضع: ${modeLabel}`,
-    `السرعة: ${preset.preset || "-"}`,
-    `الطريقة: ${methodLabel}`,
-    `القيمة: ${preset.target_value}`,
-  ];
-  if (preset.codec !== "audio") {
-    lines.push(`الدقة: ${resolutionLabel}`);
-    lines.push(`الصوت: ${VIDEO_AUDIO_LABEL}`);
-  }
-  if (preset.auto_naming === "series" && preset.series_title && preset.next_episode) {
-    lines.push(`التسمية: ${preset.series_title} - E${formatEpisode(preset.next_episode)}`);
-  } else {
-    lines.push("التسمية: الاحتفاظ باسم الفيديو المرفق");
-  }
-  return lines.join("\n");
-}
+          # 3. تحميل من رابط مباشر
+          # ملاحظة: m3u8 مستبعد عمداً هنا — فهو ملف قائمة تشغيل (manifest) نصّي
+          # وليس فيديو، وتحميله بـ curl ينزّل النص فقط لا المقاطع. روابط m3u8
+          # تُترك للمسار الذكي (4) الذي يستعمل yt-dlp أو ffmpeg لتجميع HLS فعلياً.
+          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$ ]]; then
+            echo "📥 تحميل من رابط مباشر..."
+            curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
 
-function startMessage(preset) {
-  return [
-    "🚀 أرسل فيديو مباشرة أو أي رابط للبدء.",
-    "",
-    "📎 يمكنك إرسال:",
-    "- فيديو مباشر من جهازك",
-    "- أي رابط فيديو (يوتيوب، تيليجرام، Google Drive، وغيرها)",
-    "- أي رابط مباشر",
-    "",
-    "الأوامر:",
-    "/setup لحفظ إعداد تلقائي",
-    "/preset لعرض الإعداد المحفوظ",
-    "/auto_on و /auto_off لتشغيل أو إيقاف الوضع التلقائي",
-    "/cancel لإلغاء أي عملية جارية",
-    "",
-    "🎯 خيارات الدقة تشمل:",
-    "- دقة ثابتة (240p إلى 1080p)",
-    "- دقة مخصصة",
-    "- نفس جودة الفيديو الأصلية (auto)",
-    preset?.active ? "" : null,
-    preset?.active ? "▶️ الوضع التلقائي مفعّل حالياً." : null,
-  ]
-    .filter((line) => line !== null && line !== undefined)
-    .join("\n");
-}
+          # 4. تحميل ذكي
+          elif [ -n "$VIDEO_URL" ]; then
+            echo "📥 تحميل ذكي من الرابط..."
+            python3 <<'PYEOF'
+          import os, sys, re, json, base64, subprocess, shutil
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin, urlparse
 
-// ---------------------------------------------------------------------------
-// التحقق من القيم
-// ---------------------------------------------------------------------------
+          url = os.environ["VIDEO_URL"]
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.5',
+              'Referer': url,
+          }
 
-function isValidPreset(codec, value) {
-  if (codec === "av1") return /^(?:[0-9]|1[0-3])$/.test(value);
-  return codec === "audio";
-}
+          def get_video_duration(path):
+              try:
+                  r = subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','csv=p=0',path], capture_output=True, text=True, timeout=30)
+                  if r.returncode == 0 and r.stdout.strip() and r.stdout.strip() != 'N/A':
+                      return int(float(r.stdout.strip()))
+              except: pass
+              return 0
 
-function isValidEncodeMethod(codec, method) {
-  if (codec === "av1") return ["crf", "twopass"].includes(method);
-  if (codec === "audio") return method === "audio";
-  return false;
-}
+          def get_video_size(path):
+              try: return os.path.getsize(path)
+              except: return 0
 
-// ffmpeg يعامل "m" الصغيرة كـ milli (أي 1m = 0.001)! لذلك نوحّد الصيغة:
-// بدون وحدة ← k ، و m/M ← M ، والنتيجة دائماً "48k" أو "2M".
-function parseBitrate(value) {
-  const match = /^([1-9]\d{0,5})([kKmM])?$/.exec(String(value).trim());
-  if (!match) return null;
-  const amount = Number.parseInt(match[1], 10);
-  const unit = (match[2] || "k").toLowerCase();
-  return unit === "m"
-    ? { bps: amount * 1_000_000, text: `${amount}M` }
-    : { bps: amount * 1_000, text: `${amount}k` };
-}
+          def extract_expected_duration(html):
+              # البحث عن duration في JSON
+              for p in [r'"duration"\s*:\s*"?(\d+)"?', r'"durationSeconds"\s*:\s*"?(\d+)"?']:
+                  m = re.findall(p, html, re.IGNORECASE)
+                  if m:
+                      try:
+                          v = int(m[0])
+                          if 30 < v < 7200: return v
+                      except: pass
+              # PT#M#S
+              m = re.findall(r'itemprop="duration"[^>]*content="PT(\d+)M(\d+)S"', html)
+              if m:
+                  try:
+                      v = int(m[0][0])*60 + int(m[0][1])
+                      if 30 < v < 7200: return v
+                  except: pass
+              # تنسيق الوقت HH:MM:SS أو MM:SS
+              for p in [r'"duration"\s*:\s*"(\d+):(\d+)(?::(\d+))?"', r'>(\d+):(\d+)(?::(\d+))?<', r'(\d+):(\d+)(?::(\d+))?\s*(?:min|دقيقة)']:
+                  m = re.findall(p, html)
+                  if m:
+                      parts = [int(x) for x in m[0] if x]
+                      try:
+                          if len(parts)==2: v = parts[0]*60+parts[1]
+                          elif len(parts)==3: v = parts[0]*3600+parts[1]*60+parts[2]
+                          else: continue
+                          if 30 < v < 7200: return v
+                      except: pass
+              return 0
 
-function normalizeBitrate(value, minBps, maxBps) {
-  const parsed = parseBitrate(value);
-  if (!parsed || parsed.bps < minBps || parsed.bps > maxBps) return null;
-  return parsed.text;
-}
+          def extract_expected_size(html):
+              for p in [r'"size"\s*:\s*"?(\d+)"?', r'"filesize"\s*:\s*"?(\d+)"?', r'"fileSize"\s*:\s*"?(\d+)"?']:
+                  m = re.findall(p, html, re.IGNORECASE)
+                  if m:
+                      try:
+                          v = int(m[0])
+                          if v > 5000000: return v  # أكبر من 5MB
+                      except: pass
+              m = re.findall(r'(\d+(?:\.\d+)?)\s*(GB|MB|KB)', html, re.IGNORECASE)
+              if m:
+                  try:
+                      num = float(m[0][0]); unit = m[0][1].upper()
+                      if unit=='GB': v = int(num*1073741824)
+                      elif unit=='KB': v = int(num*1024)
+                      else: v = int(num*1048576)
+                      if v > 5000000: return v
+                  except: pass
+              return 0
 
-const AUDIO_BITRATE_RANGE = [6_000, 510_000];
-const VIDEO_BITRATE_RANGE = [20_000, 50_000_000];
+          def is_valid_video_url(u):
+              if not u or not isinstance(u, str): return False
+              if not u.startswith(('http://','https://')): return False
+              if '.' not in urlparse(u).netloc: return False
+              return bool(re.search(r'\.(mp4|m3u8|webm|flv|ts)(\?.*)?$', u, re.IGNORECASE))
 
-// يعيد القيمة الموحّدة أو null إن كانت غير صالحة.
-function normalizeTargetValue(codec, method, value) {
-  const text = String(value).trim();
-  if (codec === "audio") return normalizeBitrate(text, ...AUDIO_BITRATE_RANGE);
-  if (codec === "av1" && method === "twopass") return normalizeBitrate(text, ...VIDEO_BITRATE_RANGE);
-  if (codec === "av1" && method === "crf") {
-    return /^(?:[0-9]|[1-5][0-9]|6[0-3])$/.test(text) ? text : null;
-  }
-  return null;
-}
+          def get_quality_score(u):
+              ul = u.lower()
+              # البحث عن أنماط الجودة ككلمات منفصلة
+              patterns = [
+                  (r'(?:^|[/_.-])(2160p|4k|uhd)(?:[/_.-]|$)', 10),
+                  (r'(?:^|[/_.-])(1440p|2k|qhd)(?:[/_.-]|$)', 9),
+                  (r'(?:^|[/_.-])(1080p|fhd|fullhd)(?:[/_.-]|$)', 8),
+                  (r'(?:^|[/_.-])(720p|hd)(?:[/_.-]|$)', 7),
+                  (r'(?:^|[/_.-])(480p)(?:[/_.-]|$)', 6),
+                  (r'(?:^|[/_.-])(360p)(?:[/_.-]|$)', 5),
+                  (r'(?:^|[/_.-])(240p)(?:[/_.-]|$)', 4),
+                  (r'(?:^|[/_.-])(180p)(?:[/_.-]|$)', 3),
+                  (r'(?:^|[/_.-])(120p)(?:[/_.-]|$)', 2),
+              ]
+              for pat, sc in patterns:
+                  if re.search(pat, ul, re.IGNORECASE):
+                      return sc
+              return 0
 
-function isValidResolution(value) {
-  if (!/^\d{3,4}$/.test(value)) return false;
-  const height = Number.parseInt(value, 10);
-  return height >= 144 && height <= 2160;
-}
+          def extract_all_video_urls(html, base):
+              urls = []
+              # أنماط البحث
+              patterns = [
+                  r'["\'](https?://[^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
+                  r'videoUrl["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+                  r'video_url["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+                  r'file["\']?\s*[:=]\s*["\']([^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
+                  r'src["\']?\s*[:=]\s*["\']([^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
+                  r'data-(?:video|src|url)["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+              ]
+              for p in patterns:
+                  for m in re.findall(p, html, re.IGNORECASE):
+                      if isinstance(m, tuple): m = m[-1] if m else ''
+                      if not isinstance(m, str): continue
+                      if is_valid_video_url(m): urls.append(m)
+                      elif m.startswith('//'): urls.append('https:'+m)
+                      elif m.startswith('/'): urls.append(urljoin(base, m))
+              # base64
+              for p in [r'base64,([A-Za-z0-9+/=]+)', r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)']:
+                  for m in re.findall(p, html):
+                      try:
+                          d = base64.b64decode(m).decode('utf-8', errors='ignore')
+                          urls.extend(re.findall(r'https?://[^\s"\']+\.(?:mp4|m3u8|webm|flv|ts)[^\s"\']*', d))
+                      except: pass
+              soup = BeautifulSoup(html, 'html.parser')
+              for meta in soup.find_all('meta'):
+                  if meta.get('property') in ['og:video','og:video:url','og:video:secure_url']:
+                      c = meta.get('content')
+                      if c and is_valid_video_url(c): urls.append(c)
+              for v in soup.find_all('video'):
+                  for a in ['src','data-src']:
+                      val = v.get(a)
+                      if val and is_valid_video_url(val): urls.append(val)
+                  for s in v.find_all('source'):
+                      for a in ['src','data-src']:
+                          val = s.get(a)
+                          if val and is_valid_video_url(val): urls.append(val)
+              # iframes
+              for iframe in soup.find_all('iframe'):
+                  src = iframe.get('src', '')
+                  if src and 'http' in src:
+                      try:
+                          ir = requests.get(src, headers=headers, timeout=15)
+                          if ir.status_code == 200:
+                              urls.extend(extract_all_video_urls(ir.text, src))
+                      except: pass
+              return urls
 
-function presetPrompt() {
-  return "أرسل رقم سرعة AV1 من 0 إلى 13 (الموصى به للتوفير الأقصى: 4، وللسرعة: 8):";
-}
+          def download_with_ytdlp(url):
+              try:
+                  cmd = ['yt-dlp', '--no-playlist', '-o', 'ytdlp_output.%(ext)s',
+                         '--user-agent', headers['User-Agent'], '--referer', url,
+                         '--max-filesize', '10G', url]
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                  if r.returncode == 0:
+                      for f in os.listdir('.'):
+                          if f.startswith('ytdlp_output'):
+                              shutil.move(f, 'raw_input.mp4')
+                              return True
+              except: pass
+              return False
 
-function targetValueHint(codec, method) {
-  if (codec === "audio") return "أرسل معدل بت بين 6k و510k، مثل 32k أو 48k (بدون وحدة تُعتبر k).";
-  if (codec === "av1" && method === "crf") return "أرسل قيمة CRF من 0 إلى 63، مثل 28 أو 35.";
-  return "أرسل معدل بت بين 20k و50M، مثل 250k أو 1000k (بدون وحدة تُعتبر k).";
-}
+          def download_m3u8_with_ffmpeg(m3u8_url):
+              try:
+                  headers_str = '\r\n'.join([f'{k}: {v}' for k, v in headers.items()])
+                  cmd = ['ffmpeg', '-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+                         '-headers', headers_str, '-i', m3u8_url, '-c', 'copy', 'raw_input.mp4']
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+                  if r.returncode == 0 and os.path.exists('raw_input.mp4') and os.path.getsize('raw_input.mp4') > 1000000:
+                      return True
+                  # حذف الملف إذا فشل
+                  if os.path.exists('raw_input.mp4'):
+                      os.remove('raw_input.mp4')
+              except: pass
+              return False
 
-function encodeMethodPrompt(codec, method) {
-  if (codec === "av1" && method === "crf") {
-    return "تم اختيار CRF. أرسل قيمة CRF من 0 إلى 63، مثل 28 أو 35:";
-  }
-  if (codec === "av1" && method === "twopass") {
-    return "تم اختيار Two-Pass. أرسل معدل البت المستهدف، مثل 250k أو 1000k:";
-  }
-  return "أرسل معدل البت المستهدف، مثل 250k أو 1000k:";
-}
+          try:
+              print("📄 تحميل الصفحة...")
+              r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+              r.raise_for_status()
+              html = r.text
 
-// ---------------------------------------------------------------------------
-// الجلسات والإعدادات المحفوظة (KV)
-// ---------------------------------------------------------------------------
+              exp_dur = extract_expected_duration(html)
+              exp_size = extract_expected_size(html)
+              print(f"⏱️ المدة المتوقعة: {exp_dur} ثانية")
+              print(f"📦 الحجم المتوقع: {exp_size} بايت")
 
-function ok() {
-  return new Response("OK", { status: 200 });
-}
+              # محاولة yt-dlp أولاً
+              print("🔄 محاولة yt-dlp...")
+              if download_with_ytdlp(url):
+                  fd = get_video_duration("raw_input.mp4")
+                  fs = get_video_size("raw_input.mp4")
+                  print(f"✅ yt-dlp نجح: 📦 {fs} بايت | ⏱️ {fd} ثانية")
+                  if fd > 60:
+                      print("✅ تم العثور على الفيديو الكامل")
+                      sys.exit(0)
+                  else:
+                      os.remove("raw_input.mp4")
+                      print("⚠️ الفيديو قصير، محاولة طرق أخرى...")
 
-async function getSession(env, chatId) {
-  const raw = await env.SESSIONS.get(`session:${chatId}`);
-  return raw ? JSON.parse(raw) : null;
-}
+              urls = list(set(extract_all_video_urls(html, url)))
+              if not urls:
+                  print("❌ لم يتم العثور على روابط فيديو")
+                  sys.exit(1)
 
-async function setSession(env, chatId, session) {
-  await env.SESSIONS.put(`session:${chatId}`, JSON.stringify(session), {
-    expirationTtl: SESSION_TTL_SECONDS,
-  });
-}
+              print(f"🔗 تم العثور على {len(urls)} رابط محتمل")
 
-async function deleteSession(env, chatId) {
-  await env.SESSIONS.delete(`session:${chatId}`);
-}
+              # فصل روابط HLS
+              m3u8_urls = [u for u in urls if 'm3u8' in u.lower()]
+              direct_urls = [u for u in urls if 'm3u8' not in u.lower()]
 
-async function getPreset(env, chatId) {
-  const raw = await env.SESSIONS.get(`preset:${chatId}`);
-  return raw ? JSON.parse(raw) : null;
-}
+              # ترتيب حسب الجودة
+              m3u8_urls.sort(key=get_quality_score, reverse=True)
+              direct_urls.sort(key=get_quality_score, reverse=True)
 
-async function setPreset(env, chatId, preset) {
-  await env.SESSIONS.put(`preset:${chatId}`, JSON.stringify(preset));
-}
+              # محاولة HLS أولاً
+              if m3u8_urls:
+                  print(f"📺 روابط HLS: {len(m3u8_urls)}")
+                  for m3u8_url in m3u8_urls[:5]:
+                      print(f"🔄 محاولة HLS: {m3u8_url[:80]}...")
+                      if download_m3u8_with_ffmpeg(m3u8_url):
+                          fd = get_video_duration("raw_input.mp4")
+                          fs = get_video_size("raw_input.mp4")
+                          print(f"✅ HLS: 📦 {fs} بايت | ⏱️ {fd} ثانية")
+                          if fd > 60:
+                              print("✅ تم العثور على الفيديو الكامل")
+                              sys.exit(0)
+                          else:
+                              os.remove("raw_input.mp4")
 
-async function continueAfterResolution(env, botToken, chatId, session) {
-  if (session.configuring_preset) {
-    await sendAutoNamingKeyboard(botToken, chatId);
-    return;
-  }
+              # محاولة الروابط المباشرة
+              best_duration = 0
+              best_file = None
 
-  session.awaiting_filename = true;
-  await setSession(env, chatId, session);
-  await promptFilename(botToken, chatId, null, session.default_name, false);
-}
+              for i, vu in enumerate(direct_urls[:10]):
+                  if not is_valid_video_url(vu): continue
+                  q = get_quality_score(vu)
+                  print(f"\n🔄 محاولة {i+1}: الجودة {q}/10 | {vu[:80]}...")
+                  tf = f"temp_video_{i}.mp4"
+                  try:
+                      vr = requests.get(vu, headers=headers, timeout=300, stream=True, allow_redirects=True)
+                      if vr.status_code == 200:
+                          ct = vr.headers.get('content-type','')
+                          cl = int(vr.headers.get('content-length',0))
+                          if 'm3u8' in ct:
+                              # HLS stream
+                              print("   📺 HLS stream detected")
+                              if download_m3u8_with_ffmpeg(vu):
+                                  fd = get_video_duration("raw_input.mp4")
+                                  if fd > best_duration and fd > 60:
+                                      best_duration = fd
+                                      print(f"   ✅ HLS: {fd} ثانية")
+                                      break
+                              continue
+                          if 'video' in ct or 'octet-stream' in ct or cl > 5000000:
+                              with open(tf,'wb') as f:
+                                  for ch in vr.iter_content(chunk_size=8192):
+                                      if ch: f.write(ch)
+                              fs = get_video_size(tf)
+                              fd = get_video_duration(tf)
+                              print(f"   📦 {fs} بايت | ⏱️ {fd} ثانية")
+                              
+                              # إذا كانت المدة قريبة من المتوقع، اقبل فوراً
+                              if exp_dur > 0 and fd > 0:
+                                  diff = abs(fd - exp_dur)
+                                  if diff < 60:
+                                      print("   ✅ المدة تطابق المتوقع")
+                                      shutil.copy(tf, "raw_input.mp4")
+                                      if os.path.exists(tf): os.remove(tf)
+                                      sys.exit(0)
+                              
+                              # حفظ أفضل ملف حتى الآن
+                              if fd > best_duration:
+                                  best_duration = fd
+                                  if best_file and os.path.exists(best_file):
+                                      os.remove(best_file)
+                                  best_file = tf
+                                  shutil.copy(tf, "raw_input.mp4")
+                                  if os.path.exists(tf): os.remove(tf)
+                              else:
+                                  if os.path.exists(tf): os.remove(tf)
+                          else:
+                              if os.path.exists(tf): os.remove(tf)
+                      else:
+                          if os.path.exists(tf): os.remove(tf)
+                  except Exception as e:
+                      print(f"   ❌ خطأ: {str(e)[:50]}")
+                      if os.path.exists(tf): os.remove(tf)
 
-async function savePresetAndConfirm(env, botToken, chatId, session) {
-  const preset = {
-    codec: session.codec || "av1",
-    encode_mode: session.encode_mode || "nofilters",
-    filter_profile:
-      session.filter_profile || (session.encode_mode === "filters" ? "realistic" : "none"),
-    preset: session.preset || "8",
-    encode_method: session.encode_method || "crf",
-    target_value: session.target_value || "28",
-    resolution: session.resolution || "480",
-    auto_naming: session.auto_naming || "source",
-    active: true,
-  };
+              # التحقق النهائي
+              if os.path.exists("raw_input.mp4"):
+                  fs = get_video_size("raw_input.mp4")
+                  fd = get_video_duration("raw_input.mp4")
+                  print(f"\n✅ النهائي: 📦 {fs} بايت | ⏱️ {fd} ثانية")
+                  if fd > 60 and fs > 1000000:
+                      sys.exit(0)
+                  else:
+                      print("⚠️ الفيديو قصير جداً")
+                      sys.exit(1)
+              else:
+                  print("❌ لم يتم العثور على فيديو مناسب")
+                  sys.exit(1)
+          except Exception as e:
+              print(f"❌ خطأ: {str(e)}")
+              sys.exit(1)
+          PYEOF
+          else
+            echo '❌ لا توجد رسالة تيليجرام ولا رابط مباشر.' >&2
+            exit 1
+          fi
 
-  if (session.auto_naming === "series") {
-    preset.series_title = cleanFileName(session.series_title);
-    preset.next_episode = Number.parseInt(session.next_episode, 10);
-  }
+          # التحقق النهائي
+          if [ ! -s raw_input.mp4 ]; then
+            echo "❌ فشل التحميل" >&2
+            exit 1
+          fi
+          echo "✅ حجم الملف: $(stat -c%s raw_input.mp4) بايت"
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
+          echo "✅ المدة: $DURATION ثانية"
+          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 raw_input.mp4 >/dev/null
 
-  await setPreset(env, chatId, preset);
-  await deleteSession(env, chatId);
-  await sendMessage(botToken, chatId, `✅ تم حفظ الإعداد وتفعيل الوضع التلقائي.\n${presetStatusText(preset)}\n⏸️ استخدم /auto_off لإيقافه.`);
-}
+      - name: تقسيم المصدر إلى أجزاء MKV مستقلة
+        id: segment
+        run: |
+          set -euo pipefail
+          mkdir -p chunks_raw
+          if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          else
+            FFMPEG=ffmpeg; FFPROBE=ffprobe
+          fi
+          DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
+          test -n "$DURATION"
+          # -map 0 كانت تأخذ كل المسارات كما هي، بما فيها أي مسار "Data" غير
+          # قياسي (مثل مسار فصول HandBrake المصنَّف bin_data رغم اسمه الداخلي
+          # SubtitleHandler). حاوية Matroska ترفض أي مسار Data صراحةً، فيفشل
+          # التقطيع بالكامل. نحدد الفيديو والصوت الأولين فقط — وهو نفس ما
+          # تستخدمه خطوة الترميز لاحقاً أصلاً (الترجمة كانت ستُسقَط هناك بأي حال).
 
-// ---------------------------------------------------------------------------
-// لوحات المفاتيح
-// ---------------------------------------------------------------------------
+          # عدد القطع متكيّف مع المدة بدل عدد ثابت أو حجم قطعة ثابت:
+          # - تحت SPLIT_THRESHOLD: قطعة واحدة (تكلفة تشغيل job إضافي لا تستحق).
+          # - فوقه: نزيد عدد القطع حتى MAX_PARALLEL (يطابق max-parallel في
+          #   مصفوفة encode-chunks) طالما كل قطعة لا تقل عن MIN_CHUNK_SECONDS
+          #   (يمنع الإفراط في التقطيع لفيديو متوسط الطول ويُبقي تكلفة تشغيل
+          #   كل job الثابتة — apt install، رفع/تنزيل artifact — أصغر نسبياً
+          #   من وقت الترميز الفعلي للقطعة).
+          # - MAX_CHUNK_SECONDS سقف أمان: يمنع أن تكبر القطعة أكثر من اللازم
+          #   لفيديو طويل جداً مع preset بطيء جداً، فتخاطر بتجاوز مهلة الـ6
+          #   ساعات لكل job (لا يُفعَّل عادة إلا لفيديوهات تتجاوز ساعات كثيرة).
+          SPLIT_THRESHOLD=300
+          MIN_CHUNK_SECONDS=90
+          MAX_CHUNK_SECONDS=2400
+          MAX_PARALLEL=10
 
-async function promptFilename(botToken, chatId, editMessageId, defaultName, useEdit) {
-  const text = defaultName
-    ? `الاسم المرفق: ${defaultName}\n\nأرسل اسماً جديداً، أو اضغط «✅ استخدام الاسم المرفق».`
-    : "أرسل الاسم النهائي للملف:";
-  const keyboard = defaultName
-    ? {
-        inline_keyboard: [
-          [{ text: "✅ استخدام الاسم المرفق", callback_data: "name_skip" }],
-          [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-        ],
-      }
-    : {
-        inline_keyboard: [[{ text: "🚫 إلغاء", callback_data: "cancel" }]],
-      };
+          if [ "$DURATION" -gt "$SPLIT_THRESHOLD" ]; then
+            N=$(( DURATION / MIN_CHUNK_SECONDS ))
+            (( N > MAX_PARALLEL )) && N=$MAX_PARALLEL
+            (( N < 1 )) && N=1
+            N_SAFETY=$(( (DURATION + MAX_CHUNK_SECONDS - 1) / MAX_CHUNK_SECONDS ))
+            (( N_SAFETY > N )) && N=$N_SAFETY
+            SEGMENT_TIME=$(( (DURATION + N - 1) / N ))
+            echo "🔀 تقسيم إلى ~${N} قطعة (~${SEGMENT_TIME} ثانية لكل قطعة)"
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -f segment -segment_time "$SEGMENT_TIME" \
+              -reset_timestamps 1 -avoid_negative_ts make_zero 'chunks_raw/chunk_%03d.mkv'
+          else
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -avoid_negative_ts make_zero chunks_raw/chunk_000.mkv
+          fi
+          find chunks_raw -maxdepth 1 -type f -name 'chunk_*.mkv' -size +0c | sort >/tmp/chunks.txt
+          test -s /tmp/chunks.txt
+          CHUNKS_JSON=$(sed 's#^.*/chunk_##; s#\.mkv$##' /tmp/chunks.txt | jq -R . | jq -s -c .)
+          echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
 
-  if (useEdit && editMessageId) {
-    await editMessage(botToken, chatId, editMessageId, text, keyboard);
-  } else {
-    await sendMessage(botToken, chatId, text, keyboard);
-  }
-}
+      - name: رفع الأجزاء الخام
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-chunks
+          path: chunks_raw/
+          retention-days: 1
+          if-no-files-found: error
 
-async function sendCodecKeyboard(botToken, chatId) {
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: "⚡ AV1", callback_data: "codec_av1" }],
-      [{ text: "🎵 صوت فقط", callback_data: "codec_audio" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-  await sendMessage(botToken, chatId, "⚙️ اختر المرمّز أو استخراج الصوت:", keyboard);
-}
+  encode-chunks:
+    name: ضغط الأجزاء
+    needs: [prepare-codec-build, split-video]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        chunk: ${{ fromJSON(needs.split-video.outputs.chunks) }}
+    steps:
+      - name: تنزيل الجزء الخام
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-chunks
+          path: chunks_raw
 
-async function sendEncodeModeKeyboard(botToken, chatId) {
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: "🛠️ مع فلاتر", callback_data: "mode_filters" }],
-      [{ text: "✨ بدون فلاتر", callback_data: "mode_nofilters" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-  await sendMessage(botToken, chatId, "🖼️ اختر وضع الصورة:", keyboard);
-}
+      - name: استعادة FFmpeg الموحد
+        if: github.event.inputs.codec != 'audio'
+        uses: actions/cache@v4
+        with:
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
 
-function filterProfileKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [{ text: "🌸 أنمي", callback_data: "filter_anime" }],
-      [{ text: "🎬 محتوى واقعي", callback_data: "filter_realistic" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-}
+      - name: تجهيز الاعتماديات
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+        run: |
+          set -euo pipefail
+          sudo apt update
+          sudo apt install -y ffmpeg libdav1d-dev libopus0
+          if [ "$CODEC" != "audio" ]; then
+            test -x "$HOME/codec-build/bin/ffmpeg"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+            "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
+            "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
+          fi
 
-async function sendEncodeMethodKeyboard(botToken, chatId) {
-  await sendMessage(botToken, chatId, "🎛️ اختر طريقة ترميز AV1:", encodeMethodKeyboardMarkup());
-}
+      - name: ضغط الجزء
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+          PRESET_INPUT: ${{ github.event.inputs.preset }}
+          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
+          FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
+          ENCODE_METHOD: ${{ github.event.inputs.encode_method }}
+          TARGET_VALUE: ${{ github.event.inputs.target_value }}
+          RESOLUTION: ${{ github.event.inputs.resolution }}
+          FRAME_RATE: ${{ github.event.inputs.frame_rate }}
+          CHUNK_ID: ${{ matrix.chunk }}
+        run: |
+          set -euo pipefail
+          IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
+          OUT_DIR="chunks_encoded"
+          OUT_FILE="${OUT_DIR}/encoded_${CHUNK_ID}.mkv"
+          mkdir -p "$OUT_DIR"
+          test -s "$IN"
 
-function encodeMethodKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [{ text: "🎚️ ضغط ذكي (CRF)", callback_data: "encmethod_crf" }],
-      [{ text: "⚖️ حجم مضبوط (Two-Pass)", callback_data: "encmethod_twopass" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-}
+          if [ "$CODEC" = "audio" ]; then
+            FFMPEG=ffmpeg; FFPROBE=ffprobe
+          else
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          fi
 
-async function sendAutoNamingKeyboard(botToken, chatId) {
-  const keyboard = {
-    inline_keyboard: [
-      [{ text: "📄 الاحتفاظ باسم كل فيديو", callback_data: "autoname_keep" }],
-      [{ text: "📺 اسم مسلسل + عداد حلقات", callback_data: "autoname_series" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-  await sendMessage(
-    botToken,
-    chatId,
-    "🏷️ اختر التسمية التلقائية للوضع التلقائي:\n\n📄 الاحتفاظ بالاسم: يستعمل اسم الفيديو المرفق.\n📺 مسلسل: تسمي كل نتيجة مثل: اسم السلسلة - E01 ثم E02.",
-    keyboard,
-  );
-}
+          printf 'INPUTS: codec=%s preset=%s mode=%s filter=%s method=%s target=%s resolution=%s fps=%s chunk=%s\n' \
+            "$CODEC" "$PRESET_INPUT" "$ENCODE_MODE" "$FILTER_PROFILE" "$ENCODE_METHOD" "$TARGET_VALUE" "$RESOLUTION" "$FRAME_RATE" "$CHUNK_ID"
 
-async function sendQualityKeyboard(botToken, chatId, resolutions) {
-  const rows = [];
-  for (let index = 0; index < resolutions.length; index += 2) {
-    rows.push(
-      resolutions.slice(index, index + 2).map((resolution) => ({
-        text: `${resolution}p`,
-        callback_data: `res_${resolution}`,
-      })),
-    );
-  }
-  rows.push([{ text: "✏️ دقة مخصصة", callback_data: "custom_res" }]);
-  rows.push([{ text: "🔄 نفس جودة الفيديو الأصلية", callback_data: "auto_res" }]);
-  rows.push([{ text: "🚫 إلغاء", callback_data: "cancel" }]);
-  await sendMessage(botToken, chatId, "🎯 اختر الدقة النهائية:", { inline_keyboard: rows });
-}
+          case "$CODEC" in av1|audio) ;; *) echo "مرمّز غير مدعوم" >&2; exit 1 ;; esac
+          if [ "$RESOLUTION" != "auto" ]; then
+            [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'الدقة غير صحيحة' >&2; exit 1; }
+            # نفرض الأساس العشري صراحةً: بادئة صفر (مثل 0480) تُفسَّر ثمانياً في bash
+            # فيفشل الحساب أو يُعطي رقماً خاطئاً؛ 10#$RESOLUTION يمنع ذلك.
+            RESOLUTION=$((10#$RESOLUTION))
+            (( RESOLUTION >= 144 && RESOLUTION <= 2160 )) || { echo 'الدقة خارج النطاق' >&2; exit 1; }
+          fi
+          [[ "$FRAME_RATE" =~ ^([1-9]|[1-5][0-9])$ ]] || { echo 'معدل الإطارات غير صحيح' >&2; exit 1; }
 
-// ---------------------------------------------------------------------------
-// تيليجرام
-// ---------------------------------------------------------------------------
+          if [ "$CODEC" = "audio" ]; then
+            [ "$ENCODE_MODE" = "audio" ] || { echo 'الصوت يتطلب encode_mode=audio' >&2; exit 1; }
+            [ "$ENCODE_METHOD" = "audio" ] || { echo 'الصوت يتطلب encode_method=audio' >&2; exit 1; }
+            [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+            TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"  # m الصغيرة = milli في ffmpeg
+            "$FFMPEG" -hide_banner -nostdin -y -i "$IN" -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 2 "$OUT_FILE"
+          else
+            [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'AV1 preset غير صحيح' >&2; exit 1; }
+            [ "$ENCODE_METHOD" = "crf" ] || [ "$ENCODE_METHOD" = "twopass" ] || { echo 'طريقة AV1 غير صحيحة' >&2; exit 1; }
+            VIDEO_CODEC=libsvtav1; VIDEO_PRESET="$PRESET_INPUT"
 
-async function sendTelegram(botToken, method, body) {
-  const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    console.error(`Telegram ${method} failed:`, response.status, await response.text());
-    return { ok: false };
-  }
-  return response.json();
-}
+            case "$ENCODE_MODE" in
+              nofilters) [ "$FILTER_PROFILE" = "none" ] || { echo 'بدون فلاتر يتطلب none' >&2; exit 1; };;
+              filters) [[ "$FILTER_PROFILE" = "anime" || "$FILTER_PROFILE" = "realistic" ]] || { echo 'الفلاتر غير صحيحة' >&2; exit 1; };;
+              *) echo 'encode_mode غير صحيح' >&2; exit 1;;
+            esac
 
-async function sendMessage(botToken, chatId, text, keyboard = null) {
-  const body = { chat_id: chatId, text };
-  if (keyboard) body.reply_markup = keyboard;
-  await sendTelegram(botToken, "sendMessage", body);
-}
+            INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$IN")
+            DECODER_ARGS=()
+            if [ "$INPUT_CODEC" = "av1" ]; then DECODER_ARGS=(-c:v libdav1d); fi
 
-async function sendMessageWithReturn(botToken, chatId, text, keyboard = null) {
-  const body = { chat_id: chatId, text };
-  if (keyboard) body.reply_markup = keyboard;
-  return await sendTelegram(botToken, "sendMessage", body);
-}
+            FILTERS=("setpts=PTS-STARTPTS")
+            # خوارزمية التصغير. lanczos (الافتراضي) و bicubic يُنتجان "هالة" خفيفة (تجاوز إضاءة)
+            # حول الخطوط الحادة؛ bilinear أو area لا يُنتجانها (area أنعم). للتجربة أضف في env الخطوة
+            # مثلاً SCALE_ALGO: bilinear
+            : "${SCALE_ALGO:=lanczos}"
+            case "$SCALE_ALGO" in lanczos|bicubic|bilinear|area|spline) ;; *) echo "SCALE_ALGO غير مدعوم" >&2; exit 1 ;; esac
+            if [ "$RESOLUTION" != "auto" ]; then
+              # min(ih,RES): إن كان ارتفاع المصدر >= المختارة تُطبَّق المختارة، وإن كان
+              # أقل يبقى ارتفاع المصدر كما هو (لا رفع دقة يزيد الحجم بلا فائدة).
+              # التعبير يُحسب داخل ffmpeg على الإطار الفعلي (بعد أي تدوير تلقائي).
+              FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=${SCALE_ALGO}+accurate_rnd+full_chroma_int")
+            fi
+            if [ "$ENCODE_MODE" = "filters" ]; then
+              # نحوّل إلى 10 بت قبل إزالة الضجيج وإزالة التدرجات (hqdn3d/deband) لتعملا
+              # بدقة أعلى بدل 8 بت ثم التحويل في النهاية (يقلّل خشونة التقريب في التدرجات
+              # الهادئة والمشاهد الداكنة بلا أي كلفة في الحجم).
+              FILTERS+=("format=yuv420p10le")
+            fi
+            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
+              FILTERS+=("hqdn3d=1.5:1.0:1.5:1.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
+            elif [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "realistic" ]; then
+              FILTERS+=("hqdn3d=0.5:0.5:0.5:0.5")
+            fi
+            FILTERS+=("format=yuv420p10le")
+            VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
 
-async function editMessage(botToken, chatId, messageId, text, keyboard = null) {
-  const body = { chat_id: chatId, message_id: messageId, text };
-  if (keyboard) body.reply_markup = keyboard;
-  await sendTelegram(botToken, "editMessageText", body);
-}
+            # الصوت: Opus بمعدل 16k أحادي (قرار المستخدم: أصغر حجم وأهدأ صوت).
+            # الأحادي يمنح الـ16k كاملة لقناة واحدة بدل تقسيمها على قناتين.
+            AUDIO_BITRATE="16k"
+            AC_ARGS=(-ac 1)
 
-async function deleteMessage(botToken, chatId, messageId) {
-  if (!messageId) return;
-  try {
-    await sendTelegram(botToken, "deleteMessage", { chat_id: chatId, message_id: messageId });
-  } catch {
-    // الحذف تحسين أمني فقط؛ فشله لا يجب أن يوقف التدفق.
-  }
-}
+            # وسوم الألوان وبيانات المصدر.
+            PROBE=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate,color_space,color_primaries,color_transfer -of default=noprint_wrappers=1 "$IN" 2>/dev/null || true)
+            probe_field() { sed -n "s/^$1=//p" <<<"$PROBE" | head -n 1; }
+            SRC_W=$(probe_field width); SRC_H=$(probe_field height)
+            SRC_CSP=$(probe_field color_space); SRC_PRI=$(probe_field color_primaries); SRC_TRC=$(probe_field color_transfer)
+            # مصدر عالي الدقة بلا أي وسم ألوان: المشغلات تفترض BT.709 له، لكن الناتج بعد
+            # التصغير لدقة SD سيُفسَّر غالباً BT.601 فتنزاح الألوان قليلاً. نوسمه BT.709
+            # صراحةً ليبقى مظهره كما كان. المصدر الموسوم أو منخفض الدقة لا يتغير.
+            # معدل الإطارات: كان يُفرض دائماً FRAME_RATE (24) حتى لو كان المصدر 23.976 أو أقل،
+            # فيُكرَّر إطار كل ~40 ثانية (ارتعاش خفيف) أو تُضاف إطارات مكررة بلا فائدة.
+            # نحافظ على معدل المصدر إذا كان لا يزيد عن FRAME_RATE (+0.5)، وإلا نستعمل FRAME_RATE.
+            SRC_FPS=$(probe_field avg_frame_rate)
+            OUT_FPS="$FRAME_RATE"
+            if [[ "$SRC_FPS" =~ ^[0-9]+/[0-9]+$ ]] && awk -v f="$SRC_FPS" -v cap="$FRAME_RATE" 'BEGIN{split(f,a,"/"); if (a[2]>0 && a[1]/a[2]>0 && a[1]/a[2] <= cap+0.5) exit 0; exit 1}'; then
+              OUT_FPS="$SRC_FPS"
+            fi
+            COLOR_ARGS=()
+            is_unset() { [ -z "$1" ] || [ "$1" = "unknown" ] || [ "$1" = "unspecified" ]; }
+            if is_unset "$SRC_CSP" && is_unset "$SRC_PRI" && is_unset "$SRC_TRC" \
+               && { [ "${SRC_W:-0}" -ge 1280 ] || [ "${SRC_H:-0}" -gt 576 ]; }; then
+              COLOR_ARGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709)
+            fi
 
-async function answerCallback(botToken, callbackQueryId) {
-  await sendTelegram(botToken, "answerCallbackQuery", { callback_query_id: callbackQueryId });
-}
+            # تحسينات المشاهد المظلمة والتفاصيل الهادئة (اختيارية ومعطّلة افتراضياً):
+            # variance-boost و luminance-qp-bias يرفعان البت في المناطق المسطحة والمظلمة،
+            # والأنمي مليء بها، فرفعا حجم الحلقة من ~35-50MB إلى ~85-100MB عند CRF 45 / 720p.
+            # القيمة 0 = معطّل (السلوك الأصلي). لتجربتهما أضف في env الخطوة مثلاً:
+            #   VARIANCE_BOOST_STRENGTH: 1   (من 1 إلى 4)
+            #   LUMA_QP_BIAS: 10             (من 1 إلى 100، ويُتخطى تلقائياً لمصادر PQ/HDR10)
+            # وارفع CRF قليلاً لتعويض زيادة الحجم.
+            : "${VARIANCE_BOOST_STRENGTH:=0}"
+            : "${LUMA_QP_BIAS:=0}"
+            SVT_BASE="tune=0:enable-qm=1:qm-min=0"
+            if [ "$VARIANCE_BOOST_STRENGTH" -gt 0 ]; then
+              SVT_BASE="${SVT_BASE}:enable-variance-boost=1:variance-boost-strength=${VARIANCE_BOOST_STRENGTH}"
+            fi
+            if [ "$LUMA_QP_BIAS" -gt 0 ] && [ "$SRC_TRC" != "smpte2084" ]; then
+              SVT_BASE="${SVT_BASE}:luminance-qp-bias=${LUMA_QP_BIAS}"
+            fi
+            SVT_PARAMS="-svtav1-params ${SVT_BASE}"
+            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
+              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1:film-grain=6:film-grain-denoise=0"
+            fi
+            echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
+            if [ "$ENCODE_METHOD" = "crf" ]; then
+              # التحقق من CRF داخل فرع CRF فقط؛ كان يُطبَّق قبل التفريع فيُفشل Two-Pass
+              # دائماً لأن قيمته معدل بت (مثل 200k) وليست رقم CRF.
+              [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 240 "${COLOR_ARGS[@]}" $SVT_PARAMS \
+                -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
+            else
+              [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+              TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"  # m الصغيرة = milli في ffmpeg
+              PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 240 -pass 1 -passlogfile "$PASSLOG" -an -f null /dev/null
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 240 -pass 2 -passlogfile "$PASSLOG" "${COLOR_ARGS[@]}" $SVT_PARAMS \
+                -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
+            fi
+          fi
+
+          test -s "$OUT_FILE"
+          if [ "$CODEC" != "audio" ]; then
+            "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | grep -Eq '^av1$' || { echo 'خطأ: لا يوجد فيديو AV1' >&2; exit 1; }
+          fi
+          HAS_INPUT_AUDIO=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$IN" | head -n 1 || true)
+          if [ "$CODEC" = "audio" ] || [ -n "$HAS_INPUT_AUDIO" ]; then
+            "$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | grep -q 'opus' || { echo 'خطأ: لا يوجد صوت Opus' >&2; exit 1; }
+          fi
+          IN_DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$IN")
+          OUT_DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
+          printf 'DURATION CHECK: input=%s output=%s\n' "$IN_DURATION" "$OUT_DURATION"
+
+          # قياس جودة القطعة (SSIM دائماً، و VMAF إن كان البناء يدعمه) مقابل المصدر بعد تصغيره
+          # لدقة الناتج بخوارزمية bicubic ثابتة. النتيجة تُرفع مع القطعة وتُجمَّع في رسالة النهاية.
+          # القياس غير حرج: أي فشل فيه لا يُفشل الترميز. لإيقافه اضبط QUALITY_REPORT: 0 في env الخطوة.
+          if [ "$CODEC" != "audio" ] && [ "${QUALITY_REPORT:-1}" = "1" ]; then
+            (
+              set +e
+              Q_W=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" | head -n 1)
+              Q_H=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" | head -n 1)
+              Q_N=$("$FFPROBE" -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE" | head -n 1)
+              Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,fps=${OUT_FPS:-24},scale=${Q_W}:${Q_H}:flags=bicubic,format=yuv420p10le[r]"
+              SSIM_ALL=$("$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | grep -o 'All:[0-9.]*' | tail -n 1 | cut -d: -f2)
+              VMAF_MEAN=""
+              if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
+                "$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
+                  -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:log_path=${OUT_DIR}/vmaf_${CHUNK_ID}.json:n_threads=$(nproc):n_subsample=2" -f null - >/dev/null 2>&1
+                VMAF_MEAN=$(python3 -c "import json,sys; print(round(json.load(open(sys.argv[1]))['pooled_metrics']['vmaf']['mean'],2))" "${OUT_DIR}/vmaf_${CHUNK_ID}.json" 2>/dev/null)
+              fi
+              echo "frames=${Q_N:-0} ssim=${SSIM_ALL:-NA} vmaf=${VMAF_MEAN:-NA}" > "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt"
+              echo "QUALITY chunk=${CHUNK_ID}: $(cat "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt")"
+            ) || true
+          fi
+
+      - name: رفع الجزء المضغوط
+        uses: actions/upload-artifact@v4
+        with:
+          name: encoded-${{ matrix.chunk }}
+          path: chunks_encoded/encoded_${{ matrix.chunk }}.*
+          retention-days: 1
+          if-no-files-found: error
+
+  merge-and-send:
+    name: دمج الناتج وإرساله
+    needs: [prepare-codec-build, split-video, encode-chunks]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: استعادة FFmpeg الموحد للدمج
+        if: github.event.inputs.codec != 'audio'
+        uses: actions/cache@v4
+        with:
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
+
+      - name: تجهيز أدوات الدمج والإرسال
+        run: |
+          set -euo pipefail
+          sudo apt update
+          sudo apt install -y ffmpeg libdav1d-dev libopus0
+          python3 -m pip install --user telethon
+
+      - name: تنزيل جميع الأجزاء المضغوطة
+        uses: actions/download-artifact@v4
+        with:
+          pattern: encoded-*
+          path: all_encoded
+          merge-multiple: true
+
+      - name: دمج الأجزاء
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+        run: |
+          set -euo pipefail
+          if [ "$CODEC" = "audio" ]; then
+            FFMPEG=ffmpeg; FFPROBE=ffprobe
+          else
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          fi
+          cd all_encoded
+          find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
+          test -s /tmp/encoded_files.txt
+          sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
+          "$FFMPEG" -hide_banner -nostdin -y -f concat -safe 0 -i concat_list.txt -map 0 -c copy "../output.mkv"
+          test -s "../output.mkv"
+          if [ "$CODEC" != "audio" ]; then
+            "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "../output.mkv" | grep -Eq '^av1$' || { echo 'الدمج فقد الفيديو' >&2; exit 1; }
+          fi
+
+      - name: استخراج معلومات الناتج
+        id: videoinfo
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+        run: |
+          set -euo pipefail
+          DURATION_SEC=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "output.mkv" | cut -d. -f1)
+          H=$((DURATION_SEC / 3600)); M=$(((DURATION_SEC % 3600) / 60)); S=$((DURATION_SEC % 60))
+          echo "duration_fmt=$(printf '%02d:%02d:%02d' "$H" "$M" "$S")" >> "$GITHUB_OUTPUT"
+          if [ "$CODEC" = "audio" ]; then
+            echo 'actual_res=صوت فقط' >> "$GITHUB_OUTPUT"
+          else
+            ACTUAL_RES=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
+            echo "actual_res=$ACTUAL_RES" >> "$GITHUB_OUTPUT"
+          fi
+          # نقرأ حالة الصوت الفعلية من الناتج المدموج. bit_rate قد يكون N/A في mkv،
+          # فلا نستنتج "بلا صوت" منه؛ وجود مسار الصوت هو المعيار.
+          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+          if [ -z "$A_CODEC" ]; then
+            echo "actual_abr=بلا صوت" >> "$GITHUB_OUTPUT"
+          else
+            A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+            A_BR=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+            A_LABEL="$A_CODEC"
+            if [ "$A_CH" = "1" ]; then A_LABEL="$A_LABEL أحادي"; elif [ "$A_CH" = "2" ]; then A_LABEL="$A_LABEL ستيريو"; fi
+            if [[ "$A_BR" =~ ^[0-9]+$ ]]; then A_LABEL="$A_LABEL ~$((A_BR / 1000))k"; fi
+            echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
+          fi
+
+          # تجميع قياسات الجودة من القطع (متوسط مرجّح بعدد الإطارات + أدنى قطعة)
+          Q_LINE="غير متاح"
+          if ls all_encoded/encoded_*.quality.txt >/dev/null 2>&1; then
+            Q_LINE=$(cat all_encoded/encoded_*.quality.txt | awk '
+              { f=0; s=""; v="";
+                for (i=1; i<=NF; i++) { split($i, kv, "="); if (kv[1]=="frames") f=kv[2]; else if (kv[1]=="ssim") s=kv[2]; else if (kv[1]=="vmaf") v=kv[2] }
+                if (f>0 && s ~ /^[0-9.]+$/) { sf+=f*s; nf+=f }
+                if (f>0 && v ~ /^[0-9.]+$/) { vf+=f*v; vn+=f; if (min_v=="" || v+0<min_v+0) min_v=v } }
+              END { out="";
+                    if (nf>0) out=sprintf("SSIM %.4f", sf/nf);
+                    if (vn>0) out=out sprintf(" • VMAF %.1f (أدنى قطعة %.1f)", vf/vn, min_v);
+                    if (out=="") out="غير متاح";
+                    print out }')
+          fi
+          echo "quality=$Q_LINE" >> "$GITHUB_OUTPUT"
+
+      - name: إعداد الاسم النهائي
+        id: naming
+        env:
+          FILENAME: ${{ github.event.inputs.filename }}
+        run: |
+          set -euo pipefail
+          sanitize() { printf '%s' "$1" | head -n1 | tr -d '\r' | sed 's#[/\\:*?"<>|]# #g; s/  */ /g; s/^ *//; s/ *$//'; }
+          SAFE_FILENAME=$(sanitize "$FILENAME")
+          echo "final_name=${SAFE_FILENAME:-video}" >> "$GITHUB_OUTPUT"
+
+      - name: رفع الناتج وإشعار المستخدم
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          TG_SESSION: ${{ secrets.TG_SESSION }}
+          TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          FINAL_NAME: ${{ steps.naming.outputs.final_name }}
+          DURATION_FMT: ${{ steps.videoinfo.outputs.duration_fmt }}
+          ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
+          ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
+          QUALITY: ${{ steps.videoinfo.outputs.quality }}
+          CODEC: ${{ github.event.inputs.codec }}
+          FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
+        run: |
+          set -euo pipefail
+          UPLOAD_FILE="${FINAL_NAME}.mkv"
+          mv "output.mkv" "$UPLOAD_FILE"
+          FILE_SIZE=$(stat -c%s "$UPLOAD_FILE")
+          SIZE_MB=$(awk -v size="$FILE_SIZE" 'BEGIN {printf "%.1f", size / 1048576}')
+          CAPTION=$(printf '🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT" "$CODEC" "$FILTER_PROFILE")
+          export UPLOAD_FILE CAPTION
+          python3 <<'PYEOF'
+          import asyncio, os
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+          async def main():
+              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              await client.start()
+              async with client:
+                  await client.send_file(int(os.environ["TG_CHANNEL_ID"]), os.environ["UPLOAD_FILE"], caption=os.environ["CAPTION"], force_document=True)
+          asyncio.run(main())
+          PYEOF
+          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s MB\n📐 %s\n⏱️ %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$DURATION_FMT")
+          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MESSAGE}"
+
+  notify-failure:
+    name: إشعار فشل العملية
+    needs: [prepare-codec-build, split-video, encode-chunks, merge-and-send]
+    if: >-
+      ${{ always() && (
+        needs.prepare-codec-build.result == 'failure' ||
+        needs.split-video.result == 'failure' ||
+        needs.encode-chunks.result == 'failure' ||
+        needs.merge-and-send.result == 'failure'
+      ) }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: إرسال رابط سجل الفشل
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          MESSAGE=$(printf '❌ فشلت عملية الضغط.\n\n📋 افتح السجل لمعرفة المرحلة والخطأ:\n%s' "$RUN_URL")
+          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MESSAGE}"
