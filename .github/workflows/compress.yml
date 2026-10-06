@@ -79,7 +79,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/codec-build
-          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
 
       - name: بناء المرّمّزات والمفكك وFFmpeg
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
@@ -94,11 +94,24 @@ jobs:
           cmake -S SVT-AV1 -B SVT-AV1/Build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
           cmake --build SVT-AV1/Build --parallel "$(nproc)"
           cmake --install SVT-AV1/Build
+          # libvmaf (اختياري، لقياس جودة VMAF): إن فشل أي جزء من بنائه نكمل بدونه
+          # ويبقى قياس SSIM متاحاً. لا يُفشل هذا الجزء البناء الأساسي.
+          VMAF_FLAG=""
+          if sudo apt install -y meson ninja-build xxd \
+             && git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git \
+             && meson setup vmaf/libvmaf/build vmaf/libvmaf --buildtype release --prefix="$HOME/codec-build" --libdir=lib -Denable_tests=false -Denable_docs=false \
+             && ninja -C vmaf/libvmaf/build \
+             && ninja -C vmaf/libvmaf/build install; then
+            VMAF_FLAG="--enable-libvmaf"
+            echo "✅ تم بناء libvmaf"
+          else
+            echo "⚠️ تعذّر بناء libvmaf؛ سنكمل بدون VMAF (SSIM يبقى متاحاً)"
+          fi
           git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           cd FFmpeg
-          ./configure --prefix="$HOME/codec-build" --enable-gpl --enable-version3 --disable-doc --enable-libopus --enable-libdav1d --enable-libsvtav1 --extra-cflags="-I$HOME/codec-build/include" --extra-ldflags="-L$HOME/codec-build/lib"
+          ./configure --prefix="$HOME/codec-build" --enable-gpl --enable-version3 --disable-doc --enable-libopus --enable-libdav1d --enable-libsvtav1 $VMAF_FLAG --extra-cflags="-I$HOME/codec-build/include" --extra-ldflags="-L$HOME/codec-build/lib"
           make -j"$(nproc)"
           make install
 
@@ -112,6 +125,7 @@ jobs:
           test -x "$HOME/codec-build/bin/ffmpeg"
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
+          if "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf '; then echo "✅ VMAF متاح في البناء"; else echo "⚠️ VMAF غير متاح؛ سيُستعمل SSIM فقط"; fi
 
   split-video:
     name: تحميل المصدر وفحصه وتقطيعه
@@ -136,7 +150,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/codec-build
-          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
 
       - name: تحميل الفيديو المصدر والتحقق منه
         env:
@@ -633,7 +647,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/codec-build
-          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
 
       - name: تجهيز الاعتماديات
         env:
@@ -728,10 +742,9 @@ jobs:
               FILTERS+=("format=yuv420p10le")
             fi
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
-              # إزالة التشويش الحركي والمكاني من المساحات اللونية مع منع التدرجات
-              FILTERS+=("hqdn3d=2.0:1.5:2.5:2.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
+              FILTERS+=("hqdn3d=1.5:1.0:1.5:1.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
             elif [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "realistic" ]; then
-              FILTERS+=("hqdn3d=1.0:0.8:1.0:0.8")
+              FILTERS+=("hqdn3d=0.5:0.5:0.5:0.5")
             fi
             FILTERS+=("format=yuv420p10le")
             VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
@@ -773,7 +786,6 @@ jobs:
             # وارفع CRF قليلاً لتعويض زيادة الحجم.
             : "${VARIANCE_BOOST_STRENGTH:=0}"
             : "${LUMA_QP_BIAS:=0}"
-            # الأساس هو التوفير الأقصى: تعطيل تعزيز التباين للمناطق المظلمة لمنع تضخم الحجم في الأنمي
             SVT_BASE="tune=0:enable-qm=1:qm-min=0"
             if [ "$VARIANCE_BOOST_STRENGTH" -gt 0 ]; then
               SVT_BASE="${SVT_BASE}:enable-variance-boost=1:variance-boost-strength=${VARIANCE_BOOST_STRENGTH}"
@@ -783,8 +795,7 @@ jobs:
             fi
             SVT_PARAMS="-svtav1-params ${SVT_BASE}"
             if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
-              # إبقاء إعدادات خفيفة تماماً بدون شحذ أو رفع بتات زائد
-              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1"
+              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1:film-grain=6:film-grain-denoise=0"
             fi
             echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
             if [ "$ENCODE_METHOD" = "crf" ]; then
@@ -818,6 +829,28 @@ jobs:
           OUT_DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
           printf 'DURATION CHECK: input=%s output=%s\n' "$IN_DURATION" "$OUT_DURATION"
 
+          # قياس جودة القطعة (SSIM دائماً، و VMAF إن كان البناء يدعمه) مقابل المصدر بعد تصغيره
+          # لدقة الناتج بخوارزمية bicubic ثابتة. النتيجة تُرفع مع القطعة وتُجمَّع في رسالة النهاية.
+          # القياس غير حرج: أي فشل فيه لا يُفشل الترميز. لإيقافه اضبط QUALITY_REPORT: 0 في env الخطوة.
+          if [ "$CODEC" != "audio" ] && [ "${QUALITY_REPORT:-1}" = "1" ]; then
+            (
+              set +e
+              Q_W=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" | head -n 1)
+              Q_H=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" | head -n 1)
+              Q_N=$("$FFPROBE" -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE" | head -n 1)
+              Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,fps=${OUT_FPS:-24},scale=${Q_W}:${Q_H}:flags=bicubic,format=yuv420p10le[r]"
+              SSIM_ALL=$("$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | grep -o 'All:[0-9.]*' | tail -n 1 | cut -d: -f2)
+              VMAF_MEAN=""
+              if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
+                "$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
+                  -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:log_path=${OUT_DIR}/vmaf_${CHUNK_ID}.json:n_threads=$(nproc):n_subsample=2" -f null - >/dev/null 2>&1
+                VMAF_MEAN=$(python3 -c "import json,sys; print(round(json.load(open(sys.argv[1]))['pooled_metrics']['vmaf']['mean'],2))" "${OUT_DIR}/vmaf_${CHUNK_ID}.json" 2>/dev/null)
+              fi
+              echo "frames=${Q_N:-0} ssim=${SSIM_ALL:-NA} vmaf=${VMAF_MEAN:-NA}" > "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt"
+              echo "QUALITY chunk=${CHUNK_ID}: $(cat "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt")"
+            ) || true
+          fi
+
       - name: رفع الجزء المضغوط
         uses: actions/upload-artifact@v4
         with:
@@ -837,7 +870,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/codec-build
-          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v5
 
       - name: تجهيز أدوات الدمج والإرسال
         run: |
@@ -903,6 +936,22 @@ jobs:
             echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
           fi
 
+          # تجميع قياسات الجودة من القطع (متوسط مرجّح بعدد الإطارات + أدنى قطعة)
+          Q_LINE="غير متاح"
+          if ls all_encoded/encoded_*.quality.txt >/dev/null 2>&1; then
+            Q_LINE=$(cat all_encoded/encoded_*.quality.txt | awk '
+              { f=0; s=""; v="";
+                for (i=1; i<=NF; i++) { split($i, kv, "="); if (kv[1]=="frames") f=kv[2]; else if (kv[1]=="ssim") s=kv[2]; else if (kv[1]=="vmaf") v=kv[2] }
+                if (f>0 && s ~ /^[0-9.]+$/) { sf+=f*s; nf+=f }
+                if (f>0 && v ~ /^[0-9.]+$/) { vf+=f*v; vn+=f; if (min_v=="" || v+0<min_v+0) min_v=v } }
+              END { out="";
+                    if (nf>0) out=sprintf("SSIM %.4f", sf/nf);
+                    if (vn>0) out=out sprintf(" • VMAF %.1f (أدنى قطعة %.1f)", vf/vn, min_v);
+                    if (out=="") out="غير متاح";
+                    print out }')
+          fi
+          echo "quality=$Q_LINE" >> "$GITHUB_OUTPUT"
+
       - name: إعداد الاسم النهائي
         id: naming
         env:
@@ -925,6 +974,7 @@ jobs:
           DURATION_FMT: ${{ steps.videoinfo.outputs.duration_fmt }}
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
+          QUALITY: ${{ steps.videoinfo.outputs.quality }}
           CODEC: ${{ github.event.inputs.codec }}
           FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
         run: |
@@ -933,7 +983,7 @@ jobs:
           mv "output.mkv" "$UPLOAD_FILE"
           FILE_SIZE=$(stat -c%s "$UPLOAD_FILE")
           SIZE_MB=$(awk -v size="$FILE_SIZE" 'BEGIN {printf "%.1f", size / 1048576}')
-          CAPTION=$(printf '🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$DURATION_FMT" "$CODEC" "$FILTER_PROFILE")
+          CAPTION=$(printf '🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT" "$CODEC" "$FILTER_PROFILE")
           export UPLOAD_FILE CAPTION
           python3 <<'PYEOF'
           import asyncio, os
@@ -946,7 +996,7 @@ jobs:
                   await client.send_file(int(os.environ["TG_CHANNEL_ID"]), os.environ["UPLOAD_FILE"], caption=os.environ["CAPTION"], force_document=True)
           asyncio.run(main())
           PYEOF
-          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s MB\n📐 %s\n⏱️ %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$DURATION_FMT")
+          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
           curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MESSAGE}"
 
