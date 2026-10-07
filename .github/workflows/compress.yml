@@ -82,7 +82,6 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-            ~/vapoursynth-build
           key: codec-universal-av1-av1an-vapoursynth-ubuntu-24.04-v6
 
       - name: بناء المرّمّزات والمفكك وFFmpeg
@@ -98,8 +97,7 @@ jobs:
           cmake -S SVT-AV1 -B SVT-AV1/Build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
           cmake --build SVT-AV1/Build --parallel "$(nproc)"
           cmake --install SVT-AV1/Build
-          # libvmaf (مطلوب لـ Av1an Target Quality): إن فشل بناؤه، نفشل هنا لأن Av1an
-          # بدون VMAF لا يمكنه العمل في وضع auto. باقي الأوضاع (crf/twopass) لا تتأثر.
+          # libvmaf (مطلوب لـ Av1an Target Quality)
           sudo apt install -y meson ninja-build xxd
           git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git
           meson setup vmaf/libvmaf/build vmaf/libvmaf --buildtype release --prefix="$HOME/codec-build" --libdir=lib -Denable_tests=false -Denable_docs=false
@@ -117,7 +115,7 @@ jobs:
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          sudo apt install -y python3-pip python3-dev cython3 autoconf automake libtool libtool-bin libarchive-dev libxml2-dev zlib1g-dev
+          sudo apt install -y python3-pip python3-dev cython3 autoconf automake libtool libtool-bin libarchive-dev libxml2-dev zlib1g-dev meson ninja-build pkg-config libbz2-dev
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           cd "$HOME/codec-sources"
@@ -130,7 +128,7 @@ jobs:
           make -j"$(nproc)" && make install
           cd ..
 
-          # VapourSynth R65+
+          # VapourSynth R65
           git clone --depth 1 --branch R65 https://github.com/vapoursynth/vapoursynth.git
           cd vapoursynth
           ./autogen.sh
@@ -146,12 +144,13 @@ jobs:
           make -j"$(nproc)" && make install
           cd ..
 
-          # L-SMASH-Works (أفضل chunk method في Av1an)
+          # L-SMASH-Works (أفضل chunk method في Av1an) — مبني على Meson
           git clone --depth 1 https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git
           cd L-SMASH-Works/VapourSynth
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          ./configure --prefix="$HOME/codec-build"
-          make -j"$(nproc)" && make install
+          meson setup build --prefix="$HOME/codec-build" --libdir=lib
+          ninja -C build
+          ninja -C build install
           cd ../..
 
           # FFMS2 (chunk method بديل دقيق)
@@ -161,6 +160,10 @@ jobs:
           ./configure --prefix="$HOME/codec-build" --with-vapoursynth
           make -j"$(nproc)" && make install
           cd ..
+
+          # تحقق سريع
+          echo "--- محتوى مجلد vapoursynth plugins ---"
+          ls -la "$HOME/codec-build/lib/vapoursynth/" 2>/dev/null || echo "⚠️ مجلد vapoursynth plugins غير موجود"
 
       - name: بناء Av1an
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
@@ -190,8 +193,7 @@ jobs:
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf ' || { echo '❌ libvmaf مفقود — Av1an auto لن يعمل' >&2; exit 1; }
           test -x "$HOME/.cargo/bin/av1an" || { echo '❌ av1an مفقود' >&2; exit 1; }
           "$HOME/.cargo/bin/av1an" --version
-          # التحقق من أن Av1an يرى LSMASH
-          if "$HOME/.cargo/bin/av1an" --help 2>&1 | grep -q 'lsmash'; then
+          if "$HOME/.cargo/bin/av1an" --help 2>&1 | grep -qi 'lsmash'; then
             echo "✅ Av1an يدعم lsmash"
           else
             echo "⚠️ Av1an لا يذكر lsmash في --help؛ سنستعمل fallback"
@@ -223,7 +225,6 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-            ~/vapoursynth-build
           key: codec-universal-av1-av1an-vapoursynth-ubuntu-24.04-v6
 
       - name: تحميل الفيديو المصدر والتحقق منه
@@ -685,7 +686,6 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-            ~/vapoursynth-build
           key: codec-universal-av1-av1an-vapoursynth-ubuntu-24.04-v6
 
       - name: تجهيز الاعتماديات
@@ -823,38 +823,28 @@ jobs:
               [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || { echo 'هدف VMAF يجب أن يكون 50-99' >&2; exit 1; }
               VMAF_TARGET="$TARGET_VALUE"
 
-              # بناء معاملات SVT-AV1 لـ Av1an: نُزيل البادئة "-svtav1-params "
-              # لأن Av1an يتوقع القيم مباشرة في -v
-              SVT_FOR_AV1AN="${SVT_BASE}"
+              SVT_FOR_AV1AN="${SVT_BASE//:/ }"
 
-              # الفلاتر: Av1an يقبل FFmpeg filters مباشرة عبر --ffmpeg-filter
-              # (لا نمرّر setpts=PTS-STARTPTS لأن Av1an يتولى المزامنة)
               AV1AN_FILTERS=$(printf '%s' "${FILTERS[*]}" | sed 's/^setpts=PTS-STARTPTS,//')
 
-              # audio params: نُمرّرها لـ Av1an ليضمّها في الناتج
               AUDIO_PARAMS_STR="-c:a libopus -b:a ${AUDIO_BITRATE} -ac 1"
 
-              # chunk method: lsmash إن كان متاحاً، وإلا av1an (fallback)
               CHUNK_METHOD="lsmash"
               if ! "$HOME/.cargo/bin/av1an" --help 2>&1 | grep -qi 'lsmash'; then
                 echo "⚠️ lsmash غير مذكور في Av1an؛ التبديل إلى av1an chunk method"
                 CHUNK_METHOD="av1an"
               fi
 
-              # اختيار مُشفّر Av1an: svt-av1 binary أو ffmpeg libsvtav1
-              # Av1an يستدعي SvtAv1EncApp مباشرة إن وُجد، وإلا يستعمل ffmpeg
-              # نُفضّل ffmpeg لأننا بنيناه مع libsvtav1
               ENCODER_BIN="$HOME/codec-build/bin/ffmpeg"
 
               echo "🎯 Av1an Target Quality: VMAF=$VMAF_TARGET | chunk-method=$CHUNK_METHOD | filters=$AV1AN_FILTERS"
 
-              # تشغيل Av1an
               set +e
               "$HOME/.cargo/bin/av1an" \
                 -i "$IN" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
-                -v "--preset ${VIDEO_PRESET} --crf 30 ${SVT_FOR_AV1AN//:/ }" \
+                -v "--preset ${VIDEO_PRESET} --crf 30 ${SVT_FOR_AV1AN}" \
                 --target-quality "$VMAF_TARGET" \
                 --min-q 15 --max-q 50 \
                 -w "$(nproc)" \
@@ -949,7 +939,6 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-            ~/vapoursynth-build
           key: codec-universal-av1-av1an-vapoursynth-ubuntu-24.04-v6
 
       - name: تجهيز أدوات الدمج والإرسال
