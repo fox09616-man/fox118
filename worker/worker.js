@@ -486,9 +486,44 @@ async function handleCallback(env, cfg, query) {
     if (!isValidEncodeMethod(session.codec, method)) return;
 
     session.encode_method = method;
+    if (method === "auto") {
+      // لا نطلب رقماً: الافتراضي درجة VMAF مستهدفة 85، مع زر لتغييرها.
+      session.target_value = "85";
+      session.awaiting_target_value = false;
+      await setSession(env, chatId, session);
+      await editMessage(
+        cfg.botToken,
+        chatId,
+        messageId,
+        "🎯 جودة تلقائية موزّعة حسب المشهد (Av1an Target Quality): يقسّم Av1an الجزء إلى مشاهد، يقيس VMAF لكل مشهد، ويختار CRF الذي يبلغ الدرجة المستهدفة بأصغر حجم.\nالافتراضي: VMAF 85 (أصغر حجم مع جودة مناسبة للعين).",
+        {
+          inline_keyboard: [
+            [{ text: "✅ متابعة (VMAF 85)", callback_data: "autoref_ok" }],
+            [{ text: "✏️ درجة VMAF أخرى", callback_data: "autoref_custom" }],
+            [{ text: "🚫 إلغاء", callback_data: "cancel" }],
+          ],
+        },
+      );
+      return;
+    }
     session.awaiting_target_value = true;
     await setSession(env, chatId, session);
     await editMessage(cfg.botToken, chatId, messageId, encodeMethodPrompt(session.codec, method));
+    return;
+  }
+
+  if (data === "autoref_ok" && session.encode_method === "auto") {
+    session.target_value = session.target_value || "85";
+    await setSession(env, chatId, session);
+    await editMessage(cfg.botToken, chatId, messageId, `✅ جودة تلقائية بدرجة VMAF مستهدفة ${session.target_value}`);
+    await sendQualityKeyboard(cfg.botToken, chatId, RESOLUTIONS);
+    return;
+  }
+
+  if (data === "autoref_custom" && session.encode_method === "auto") {
+    session.awaiting_target_value = true;
+    await setSession(env, chatId, session);
+    await editMessage(cfg.botToken, chatId, messageId, encodeMethodPrompt(session.codec, "auto"));
     return;
   }
 
@@ -859,7 +894,7 @@ function buildSummaryMessage(session) {
       : session.encode_method === "twopass"
         ? "Two-Pass"
         : session.encode_method === "auto"
-          ? "جودة ثابتة تلقائية (VMAF)"
+          ? "جودة تلقائية (Av1an)"
           : "استخراج صوت";
   const resolutionLabel = resolutionText(session.resolution);
 
@@ -898,7 +933,7 @@ function presetStatusText(preset) {
       : preset.encode_method === "twopass"
         ? "Two-Pass"
         : preset.encode_method === "auto"
-          ? "جودة ثابتة تلقائية (VMAF)"
+          ? "جودة تلقائية (Av1an)"
           : "استخراج صوت";
   const resolutionLabel = resolutionText(preset.resolution);
 
@@ -991,8 +1026,10 @@ function normalizeTargetValue(codec, method, value) {
   if (codec === "av1" && method === "crf") {
     return /^(?:[0-9]|[1-5][0-9]|6[0-3])$/.test(text) ? text : null;
   }
-  // جودة ثابتة تلقائية: الهدف درجة VMAF صحيحة من 50 إلى 99
-  if (codec === "av1" && method === "auto") return /^[5-9][0-9]$/.test(text) ? text : null;
+  // جودة تلقائية (Av1an Target Quality): القيمة درجة VMAF مستهدفة (50-99)
+  if (codec === "av1" && method === "auto") {
+    return /^(?:[5-9][0-9])$/.test(text) ? text : null;
+  }
   return null;
 }
 
@@ -1009,7 +1046,7 @@ function presetPrompt() {
 function targetValueHint(codec, method) {
   if (codec === "audio") return "أرسل معدل بت بين 6k و510k، مثل 32k أو 48k (بدون وحدة تُعتبر k).";
   if (codec === "av1" && method === "crf") return "أرسل قيمة CRF من 0 إلى 63، مثل 28 أو 35.";
-  if (codec === "av1" && method === "auto") return "أرسل درجة VMAF المستهدفة، رقماً صحيحاً من 50 إلى 99، مثل 78.";
+  if (codec === "av1" && method === "auto") return "أرسل درجة VMAF مستهدفة من 50 إلى 99، مثل 85.";
   return "أرسل معدل بت بين 20k و50M، مثل 250k أو 1000k (بدون وحدة تُعتبر k).";
 }
 
@@ -1018,7 +1055,7 @@ function encodeMethodPrompt(codec, method) {
     return "تم اختيار CRF. أرسل قيمة CRF من 0 إلى 63، مثل 28 أو 35:";
   }
   if (codec === "av1" && method === "auto") {
-    return "تم اختيار الجودة الثابتة التلقائية. سيختار البوت CRF لكل قطعة ليقترب من الدرجة المستهدفة (يحتاج VMAF في البناء). أرسل درجة VMAF المستهدفة من 50 إلى 99، مثل 78:";
+    return "أرسل درجة VMAF مستهدفة للجودة التلقائية (من 50 إلى 99)، مثل 85:";
   }
   if (codec === "av1" && method === "twopass") {
     return "تم اختيار Two-Pass. أرسل معدل البت المستهدف، مثل 250k أو 1000k:";
@@ -1160,7 +1197,7 @@ function encodeMethodKeyboardMarkup() {
     inline_keyboard: [
       [{ text: "🎚️ ضغط ذكي (CRF)", callback_data: "encmethod_crf" }],
       [{ text: "⚖️ حجم مضبوط (Two-Pass)", callback_data: "encmethod_twopass" }],
-      [{ text: "🎯 جودة ثابتة تلقائية (VMAF)", callback_data: "encmethod_auto" }],
+      [{ text: "🎯 جودة تلقائية (Av1an)", callback_data: "encmethod_auto" }],
       [{ text: "🚫 إلغاء", callback_data: "cancel" }],
     ],
   };
