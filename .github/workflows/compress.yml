@@ -111,20 +111,16 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      - name: بناء Av1an بدون VapourSynth
-        if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
+      - name: تثبيت Av1an عبر Homebrew
+        if: github.event.inputs.codec != 'audio'
         run: |
           set -euo pipefail
-          export PATH="$HOME/.cargo/bin:$PATH"
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-          fi
-          source "$HOME/.cargo/env"
-          export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          export LIBRARY_PATH="$HOME/codec-build/lib:${LIBRARY_PATH:-}"
-          # --no-default-features يُلغي الاعتماد على VapourSynth
-          cargo install --locked av1an --no-default-features
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install av1an
+          AV1AN_BIN="$(brew --prefix)/bin/av1an"
+          test -x "$AV1AN_BIN"
+          "$AV1AN_BIN" --version
+          "$AV1AN_BIN" --help | grep -E "chunk-method|audio-params|keep|target-quality|ffmpeg" || true
 
       - name: فحص البناء الموحد
         if: github.event.inputs.codec != 'audio'
@@ -132,14 +128,16 @@ jobs:
           set -euo pipefail
           sudo apt update
           sudo apt install -y libdav1d-dev libopus0
-          export PATH="$HOME/.cargo/bin:$PATH"
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          export PATH="$HOME/codec-build/bin:$PATH"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           test -x "$HOME/codec-build/bin/ffmpeg"
+          test -x "$HOME/codec-build/bin/SvtAv1EncApp" || { echo '❌ SvtAv1EncApp مفقود' >&2; exit 1; }
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf ' || { echo '❌ libvmaf مفقود — Av1an auto لن يعمل' >&2; exit 1; }
-          test -x "$HOME/.cargo/bin/av1an" || { echo '❌ av1an مفقود' >&2; exit 1; }
-          "$HOME/.cargo/bin/av1an" --version
+          command -v av1an >/dev/null || { echo '❌ av1an مفقود' >&2; exit 1; }
+          av1an --version
 
   split-video:
     name: تحميل المصدر وفحصه وتقطيعه
@@ -638,13 +636,16 @@ jobs:
           sudo apt update
           sudo apt install -y ffmpeg libdav1d-dev libopus0
           if [ "$CODEC" != "audio" ]; then
-            export PATH="$HOME/.cargo/bin:$PATH"
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+            brew install av1an
+            export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
             test -x "$HOME/codec-build/bin/ffmpeg"
-            test -x "$HOME/.cargo/bin/av1an"
+            test -x "$HOME/codec-build/bin/SvtAv1EncApp" || { echo '❌ SvtAv1EncApp مفقود' >&2; exit 1; }
             "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
             "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
             "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf '
+            command -v av1an >/dev/null
           fi
 
       - name: ضغط الجزء
@@ -669,9 +670,10 @@ jobs:
           if [ "$CODEC" = "audio" ]; then
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           else
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
             FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-            export PATH="$HOME/.cargo/bin:$PATH"
+            export PATH="$HOME/codec-build/bin:$PATH"
           fi
 
           printf 'INPUTS: codec=%s preset=%s mode=%s filter=%s method=%s target=%s resolution=%s fps=%s chunk=%s\n' \
@@ -760,7 +762,7 @@ jobs:
             # ============================================================
             # فرع auto: Av1an Target Quality (chunk-method segment)
             # الفلاتر تُطبَّق فقط عند encode_mode=filters، عبر خطوة FFmpeg
-            # منفصلة قبل Av1an (بصيغة ffv1 بلا فقدان)، ولا تحتاج --ffmpeg-filter
+            # منفصلة قبل Av1an (بصيغة ffv1 بلا فقدان)
             # ============================================================
             if [ "$ENCODE_METHOD" = "auto" ]; then
               [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || { echo 'هدف VMAF يجب أن يكون 50-99' >&2; exit 1; }
@@ -785,7 +787,7 @@ jobs:
               echo "🎯 Av1an Target Quality: VMAF=$VMAF_TARGET | chunk-method=segment | filters=$ENCODE_MODE"
 
               set +e
-              "$HOME/.cargo/bin/av1an" \
+              av1an \
                 -i "$AV1AN_IN" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
