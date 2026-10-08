@@ -663,6 +663,31 @@ jobs:
           echo "SvtAv1EncApp: $(command -v SvtAv1EncApp || echo 'غير موجود في PATH')"
           ls -la "$HOME/codec-build/bin" | head -n 20
 
+      - name: اختبار Av1an على مقطع صغير بكل ffmpeg
+        if: github.event.inputs.codec != 'audio'
+        run: |
+          set -euo pipefail
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          BREW_BIN="$(brew --prefix)/bin"
+          OUR_BIN="$HOME/codec-build/bin"
+          export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          mkdir -p /tmp/abtest && cd /tmp/abtest
+          "$OUR_BIN/ffmpeg" -hide_banner -loglevel error -y -f lavfi \
+            -i testsrc=duration=12:size=640x360:rate=24 -pix_fmt yuv420p10le -c:v ffv1 src.mkv
+
+          echo "===== ffmpeg من نسختنا"
+          env PATH="$OUR_BIN:$BREW_BIN:/usr/bin:/bin" \
+            av1an -i src.mkv -o out_ours.mkv -e svt-av1 \
+            -v "--preset 8 --crf 30 --tune 0" --target-quality 85 \
+            -w 2 --chunk-method segment --keep > log_ours.txt 2>&1 || echo "exit=$?"
+          tail -n 8 log_ours.txt
+
+          echo "===== ffmpeg من Homebrew"
+          env PATH="$BREW_BIN:$OUR_BIN:/usr/bin:/bin" \
+            av1an -i src.mkv -o out_brew.mkv -e svt-av1 \
+            -v "--preset 8 --crf 30 --tune 0" --target-quality 85 \
+            -w 2 --chunk-method segment --keep > log_brew.txt 2>&1 || echo "exit=$?"
+          tail -n 8 log_brew.txt
       - name: ضغط الجزء
         env:
           CODEC: ${{ github.event.inputs.codec }}
