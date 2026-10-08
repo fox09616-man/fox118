@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: استعادة البناء الموحد (FFmpeg + Av1an + VapourSynth R72)
+      - name: استعادة البناء الموحد (FFmpeg + Av1an)
         if: github.event.inputs.codec != 'audio'
         id: cache-build
         uses: actions/cache@v4
@@ -82,7 +82,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
       - name: بناء المرّمّزات والمفكك وFFmpeg
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
@@ -111,69 +111,7 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      - name: بناء VapourSynth R72 و LSMASH (متوافق مع Av1an)
-        if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          # libxxhash-dev مطلوب لـ L-SMASH-Works، و libbz2-dev لـ FFMS2
-          sudo apt install -y python3-pip python3-dev cython3 autoconf automake libtool libtool-bin libarchive-dev libxml2-dev zlib1g-dev meson ninja-build pkg-config libbz2-dev libxxhash-dev
-          export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          cd "$HOME/codec-sources"
-
-          # zimg (اعتمادية VapourSynth الأساسية)
-          git clone --depth 1 --branch release-3.0.5 https://github.com/sekrit-twc/zimg.git
-          cd zimg
-          ./autogen.sh
-          ./configure --prefix="$HOME/codec-build"
-          make -j"$(nproc)" && make install
-          cd ..
-
-          # VapourSynth R72 (آخر إصدار متوافق مع Av1an)
-          git clone --depth 1 --branch R72 https://github.com/vapoursynth/vapoursynth.git
-          cd vapoursynth
-          ./autogen.sh
-          PYTHON3_CONFIG=$(which python3-config)
-          ./configure --prefix="$HOME/codec-build" --libdir="$HOME/codec-build/lib" PYTHON3_CONFIG="$PYTHON3_CONFIG"
-          make -j"$(nproc)" && make install
-          cd ..
-
-          # التحقق من أن مكتبات VapourSynth في مكانها (حاسم لـ Av1an)
-          test -f "$HOME/codec-build/lib/libvapoursynth.so" || { echo "❌ libvapoursynth.so مفقود"; exit 1; }
-          test -f "$HOME/codec-build/lib/libvapoursynth-script.so" || { echo "❌ libvapoursynth-script.so مفقود"; exit 1; }
-          test -f "$HOME/codec-build/lib/pkgconfig/vapoursynth.pc" || { echo "❌ vapoursynth.pc مفقود"; exit 1; }
-          test -f "$HOME/codec-build/lib/pkgconfig/vapoursynth-script.pc" || { echo "❌ vapoursynth-script.pc مفقود"; exit 1; }
-          echo "✅ مكتبات VapourSynth R72 وملفات pkg-config في مكانها"
-
-          # L-SMASH (الاعتمادية الأساسية لـ L-SMASH-Works)
-          git clone --depth 1 https://github.com/l-smash/l-smash.git
-          cd l-smash
-          ./configure --prefix="$HOME/codec-build" --enable-shared
-          make -j"$(nproc)" && make install
-          cd ..
-
-          # L-SMASH-Works (فرع ffmpeg-4.5 من AkarinVS للتوافق مع FFmpeg الحديث)
-          git clone --depth 1 --branch ffmpeg-4.5 https://github.com/AkarinVS/L-SMASH-Works.git
-          cd L-SMASH-Works/VapourSynth
-          export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          meson setup build --prefix="$HOME/codec-build" --libdir=lib
-          ninja -C build
-          ninja -C build install
-          cd ../..
-
-          # FFMS2 (اختياري - إن فشل، لا يوقف البناء)
-          git clone --depth 1 https://github.com/FFMS/ffms2.git
-          cd ffms2
-          ./autogen.sh
-          ./configure --prefix="$HOME/codec-build" --with-vapoursynth
-          make -j"$(nproc)" && make install || echo "⚠️ FFMS2 فشل، سنكمل بدونه"
-          cd ..
-
-          # تحقق نهائي
-          echo "--- محتوى مجلد vapoursynth plugins ---"
-          ls -la "$HOME/codec-build/lib/vapoursynth/" 2>/dev/null || echo "⚠️ مجلد vapoursynth plugins غير موجود"
-
-      - name: بناء Av1an مع VapourSynth R72
+      - name: بناء Av1an بدون VapourSynth
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -185,8 +123,8 @@ jobs:
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           export LIBRARY_PATH="$HOME/codec-build/lib:${LIBRARY_PATH:-}"
-          export VAPOURSYNTH_LIB_DIR="$HOME/codec-build/lib"
-          cargo install --locked av1an
+          # --no-default-features يُلغي الاعتماد على VapourSynth
+          cargo install --locked av1an --no-default-features
 
       - name: فحص البناء الموحد
         if: github.event.inputs.codec != 'audio'
@@ -202,11 +140,6 @@ jobs:
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf ' || { echo '❌ libvmaf مفقود — Av1an auto لن يعمل' >&2; exit 1; }
           test -x "$HOME/.cargo/bin/av1an" || { echo '❌ av1an مفقود' >&2; exit 1; }
           "$HOME/.cargo/bin/av1an" --version
-          if "$HOME/.cargo/bin/av1an" --help 2>&1 | grep -qi 'lsmash'; then
-            echo "✅ Av1an يدعم lsmash"
-          else
-            echo "⚠️ Av1an لا يذكر lsmash في --help؛ سنستعمل fallback"
-          fi
 
   split-video:
     name: تحميل المصدر وفحصه وتقطيعه
@@ -234,7 +167,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
       - name: تحميل الفيديو المصدر والتحقق منه
         env:
@@ -695,7 +628,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
       - name: تجهيز الاعتماديات
         env:
@@ -739,7 +672,6 @@ jobs:
             FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
             export PATH="$HOME/.cargo/bin:$PATH"
-            export VAPOURSYNTH_LIB_DIR="$HOME/codec-build/lib"
           fi
 
           printf 'INPUTS: codec=%s preset=%s mode=%s filter=%s method=%s target=%s resolution=%s fps=%s chunk=%s\n' \
@@ -826,7 +758,9 @@ jobs:
             echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
 
             # ============================================================
-            # فرع auto: Av1an Target Quality
+            # فرع auto: Av1an Target Quality (chunk-method segment)
+            # الفلاتر تُطبَّق فقط عند encode_mode=filters، عبر خطوة FFmpeg
+            # منفصلة قبل Av1an (بصيغة ffv1 بلا فقدان)، ولا تحتاج --ffmpeg-filter
             # ============================================================
             if [ "$ENCODE_METHOD" = "auto" ]; then
               [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || { echo 'هدف VMAF يجب أن يكون 50-99' >&2; exit 1; }
@@ -834,39 +768,39 @@ jobs:
 
               SVT_FOR_AV1AN="${SVT_BASE//:/ }"
 
-              AV1AN_FILTERS=$(printf '%s' "${FILTERS[*]}" | sed 's/^setpts=PTS-STARTPTS,//')
-
+              AV1AN_IN="$IN"
               AUDIO_PARAMS_STR="-c:a libopus -b:a ${AUDIO_BITRATE} -ac 1"
 
-              CHUNK_METHOD="lsmash"
-              if ! "$HOME/.cargo/bin/av1an" --help 2>&1 | grep -qi 'lsmash'; then
-                echo "⚠️ lsmash غير مذكور في Av1an؛ التبديل إلى av1an chunk method"
-                CHUNK_METHOD="av1an"
+              # معالجة مسبقة للفلاتر أو تغيير الدقة فقط
+              if [ "$ENCODE_MODE" = "filters" ] || [ "$RESOLUTION" != "auto" ]; then
+                PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
+                "$FFMPEG" -hide_banner -nostdin -y "${DECODER_ARGS[@]}" -i "$IN" \
+                  -map 0:v:0 -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr -c:v ffv1 \
+                  -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" -ac 1 "$PRE_FILE"
+                test -s "$PRE_FILE"
+                AV1AN_IN="$PRE_FILE"
+                AUDIO_PARAMS_STR="-c:a copy"
               fi
 
-              ENCODER_BIN="$HOME/codec-build/bin/ffmpeg"
-
-              echo "🎯 Av1an Target Quality: VMAF=$VMAF_TARGET | chunk-method=$CHUNK_METHOD | filters=$AV1AN_FILTERS"
+              echo "🎯 Av1an Target Quality: VMAF=$VMAF_TARGET | chunk-method=segment | filters=$ENCODE_MODE"
 
               set +e
               "$HOME/.cargo/bin/av1an" \
-                -i "$IN" \
+                -i "$AV1AN_IN" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
                 -v "--preset ${VIDEO_PRESET} --crf 30 ${SVT_FOR_AV1AN}" \
                 --target-quality "$VMAF_TARGET" \
                 --min-q 15 --max-q 50 \
                 -w "$(nproc)" \
-                --chunk-method "$CHUNK_METHOD" \
-                --ffmpeg-filter "$AV1AN_FILTERS" \
+                --chunk-method segment \
                 --audio-params "$AUDIO_PARAMS_STR" \
-                --ffmpeg "$ENCODER_BIN" \
                 --keep
               AV1AN_EXIT=$?
               set -e
 
               if [ "$AV1AN_EXIT" -ne 0 ] || [ ! -s "$OUT_FILE" ]; then
-                echo "❌ Av1an فشل (exit=$AV1AN_EXIT). لا fallback إلى FFmpeg — العملية تفشل ليُنبَّه المستخدم." >&2
+                echo "❌ Av1an فشل (exit=$AV1AN_EXIT)." >&2
                 exit 1
               fi
               CRF_USED="Av1an-VMAF${VMAF_TARGET}"
@@ -948,7 +882,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
       - name: تجهيز أدوات الدمج والإرسال
         run: |
