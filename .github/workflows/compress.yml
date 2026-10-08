@@ -796,8 +796,7 @@ jobs:
                 -o "$OUT_FILE" \
                 -e svt-av1 \
                 -v "--preset ${VIDEO_PRESET} --crf 30 ${SVT_FOR_AV1AN}" \
-                --target-quality "$VMAF_TARGET" \
-                --min-q 38 \
+                --target-quality "$VMAF_TARGET" \                
                 -w "$(nproc)" \
                 --chunk-method segment \
                 --audio-params "$AUDIO_PARAMS_STR" \
