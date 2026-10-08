@@ -813,6 +813,233 @@ jobs:
               if [ "$ENCODE_METHOD" = "crf" ]; then
                 [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
                 CRF_USED="$TARGET_VALUE"
+                "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_encode-chunks:
+    name: ضغط الأجزاء
+    needs: [prepare-codec-build, split-video]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 10
+      matrix:
+        chunk: ${{ fromJSON(needs.split-video.outputs.chunks) }}
+    steps:
+      - name: تنزيل الجزء الخام
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-chunks
+          path: chunks_raw
+
+      - name: استعادة البناء الموحد (FFmpeg + Av1an)
+        if: github.event.inputs.codec != 'audio'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/codec-build
+            ~/.cargo
+            ~/.rustup
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+
+      - name: تجهيز الاعتماديات
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+        run: |
+          set -euo pipefail
+          sudo apt update
+          sudo apt install -y ffmpeg libdav1d-dev libopus0
+          if [ "$CODEC" != "audio" ]; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+            brew install av1an
+            export PATH="$HOME/codec-build/bin:$PATH"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+            test -x "$HOME/codec-build/bin/ffmpeg"
+            test -x "$HOME/codec-build/bin/SvtAv1EncApp" || { echo '❌ SvtAv1EncApp مفقود' >&2; exit 1; }
+            "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
+            "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
+            "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf '
+            command -v av1an >/dev/null
+          fi
+
+      - name: تشخيص أدوات الترميز
+        if: github.event.inputs.codec != 'audio'
+        run: |
+          set -euo pipefail
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          export PATH="$HOME/codec-build/bin:$PATH"
+          export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          echo "ffmpeg: $(command -v ffmpeg)"
+          ffmpeg -version | head -n 1
+          echo "ffprobe: $(command -v ffprobe)"
+          echo "av1an: $(command -v av1an)"
+          av1an --version
+          echo "SvtAv1EncApp: $(command -v SvtAv1EncApp || echo 'غير موجود في PATH')"
+          ls -la "$HOME/codec-build/bin" | head -n 20
+
+      - name: ضغط الجزء
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+          PRESET_INPUT: ${{ github.event.inputs.preset }}
+          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
+          FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
+          ENCODE_METHOD: ${{ github.event.inputs.encode_method }}
+          TARGET_VALUE: ${{ github.event.inputs.target_value }}
+          RESOLUTION: ${{ github.event.inputs.resolution }}
+          FRAME_RATE: ${{ github.event.inputs.frame_rate }}
+          CHUNK_ID: ${{ matrix.chunk }}
+        run: |
+          set -euo pipefail
+          IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
+          OUT_DIR="chunks_encoded"
+          OUT_FILE="${OUT_DIR}/encoded_${CHUNK_ID}.mkv"
+          mkdir -p "$OUT_DIR"
+          test -s "$IN"
+
+          if [ "$CODEC" = "audio" ]; then
+            FFMPEG=ffmpeg; FFPROBE=ffprobe
+          else
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+            export PATH="$HOME/codec-build/bin:$PATH"
+          fi
+
+          printf 'INPUTS: codec=%s preset=%s mode=%s filter=%s method=%s target=%s resolution=%s fps=%s chunk=%s\n' \
+            "$CODEC" "$PRESET_INPUT" "$ENCODE_MODE" "$FILTER_PROFILE" "$ENCODE_METHOD" "$TARGET_VALUE" "$RESOLUTION" "$FRAME_RATE" "$CHUNK_ID"
+
+          case "$CODEC" in av1|audio) ;; *) echo "مرمّز غير مدعوم" >&2; exit 1 ;; esac
+          if [ "$RESOLUTION" != "auto" ]; then
+            [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'الدقة غير صحيحة' >&2; exit 1; }
+            RESOLUTION=$((10#$RESOLUTION))
+            (( RESOLUTION >= 144 && RESOLUTION <= 2160 )) || { echo 'الدقة خارج النطاق' >&2; exit 1; }
+          fi
+          [[ "$FRAME_RATE" =~ ^([1-9]|[1-5][0-9])$ ]] || { echo 'معدل الإطارات غير صحيح' >&2; exit 1; }
+
+          if [ "$CODEC" = "audio" ]; then
+            [ "$ENCODE_MODE" = "audio" ] || { echo 'الصوت يتطلب encode_mode=audio' >&2; exit 1; }
+            [ "$ENCODE_METHOD" = "audio" ] || { echo 'الصوت يتطلب encode_method=audio' >&2; exit 1; }
+            [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+            TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
+            "$FFMPEG" -hide_banner -nostdin -y -i "$IN" -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 2 "$OUT_FILE"
+          else
+            [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'AV1 preset غير صحيح' >&2; exit 1; }
+            [ "$ENCODE_METHOD" = "crf" ] || [ "$ENCODE_METHOD" = "twopass" ] || [ "$ENCODE_METHOD" = "auto" ] || { echo 'طريقة AV1 غير صحيحة' >&2; exit 1; }
+            VIDEO_CODEC=libsvtav1; VIDEO_PRESET="$PRESET_INPUT"
+
+            case "$ENCODE_MODE" in
+              nofilters) [ "$FILTER_PROFILE" = "none" ] || { echo 'بدون فلاتر يتطلب none' >&2; exit 1; };;
+              filters) [[ "$FILTER_PROFILE" = "anime" || "$FILTER_PROFILE" = "realistic" ]] || { echo 'الفلاتر غير صحيحة' >&2; exit 1; };;
+              *) echo 'encode_mode غير صحيح' >&2; exit 1;;
+            esac
+
+            INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$IN")
+            DECODER_ARGS=()
+            if [ "$INPUT_CODEC" = "av1" ]; then DECODER_ARGS=(-c:v libdav1d); fi
+
+            FILTERS=("setpts=PTS-STARTPTS")
+            : "${SCALE_ALGO:=lanczos}"
+            case "$SCALE_ALGO" in lanczos|bicubic|bilinear|area|spline) ;; *) echo "SCALE_ALGO غير مدعوم" >&2; exit 1 ;; esac
+            if [ "$RESOLUTION" != "auto" ]; then
+              FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=${SCALE_ALGO}+accurate_rnd+full_chroma_int")
+            fi
+            if [ "$ENCODE_MODE" = "filters" ]; then
+              FILTERS+=("format=yuv420p10le")
+            fi
+            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
+              FILTERS+=("hqdn3d=1.5:1.0:1.5:1.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
+            elif [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "realistic" ]; then
+              FILTERS+=("hqdn3d=0.5:0.5:0.5:0.5")
+            fi
+            FILTERS+=("format=yuv420p10le")
+            VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
+
+            AUDIO_BITRATE="16k"
+            AC_ARGS=(-ac 1)
+
+            PROBE=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate,color_space,color_primaries,color_transfer -of default=noprint_wrappers=1 "$IN" 2>/dev/null || true)
+            probe_field() { sed -n "s/^$1=//p" <<<"$PROBE" | head -n 1; }
+            SRC_W=$(probe_field width); SRC_H=$(probe_field height)
+            SRC_CSP=$(probe_field color_space); SRC_PRI=$(probe_field color_primaries); SRC_TRC=$(probe_field color_transfer)
+            SRC_FPS=$(probe_field avg_frame_rate)
+            OUT_FPS="$FRAME_RATE"
+            if [[ "$SRC_FPS" =~ ^[0-9]+/[0-9]+$ ]] && awk -v f="$SRC_FPS" -v cap="$FRAME_RATE" 'BEGIN{split(f,a,"/"); if (a[2]>0 && a[1]/a[2]>0 && a[1]/a[2] <= cap+0.5) exit 0; exit 1}'; then
+              OUT_FPS="$SRC_FPS"
+            fi
+            COLOR_ARGS=()
+            is_unset() { [ -z "$1" ] || [ "$1" = "unknown" ] || [ "$1" = "unspecified" ]; }
+            if is_unset "$SRC_CSP" && is_unset "$SRC_PRI" && is_unset "$SRC_TRC" \
+               && { [ "${SRC_W:-0}" -ge 1280 ] || [ "${SRC_H:-0}" -gt 576 ]; }; then
+              COLOR_ARGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709)
+            fi
+
+            : "${VARIANCE_BOOST_STRENGTH:=0}"
+            : "${LUMA_QP_BIAS:=0}"
+            SVT_BASE="tune=0:enable-qm=1:qm-min=0"
+            if [ "$VARIANCE_BOOST_STRENGTH" -gt 0 ]; then
+              SVT_BASE="${SVT_BASE}:enable-variance-boost=1:variance-boost-strength=${VARIANCE_BOOST_STRENGTH}"
+            fi
+            if [ "$LUMA_QP_BIAS" -gt 0 ] && [ "$SRC_TRC" != "smpte2084" ]; then
+              SVT_BASE="${SVT_BASE}:luminance-qp-bias=${LUMA_QP_BIAS}"
+            fi
+            SVT_PARAMS="-svtav1-params ${SVT_BASE}"
+            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
+              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1:film-grain=6:film-grain-denoise=0"
+            fi
+            echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
+
+            # ============================================================
+            # فرع auto: Av1an Target Quality (chunk-method segment)
+            # الفلاتر تُطبَّق فقط عند encode_mode=filters، عبر خطوة FFmpeg
+            # منفصلة قبل Av1an (بصيغة ffv1 بلا فقدان)
+            # ============================================================
+            if [ "$ENCODE_METHOD" = "auto" ]; then
+              [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || { echo 'هدف VMAF يجب أن يكون 50-99' >&2; exit 1; }
+              VMAF_TARGET="$TARGET_VALUE"
+
+              SVT_FOR_AV1AN="${SVT_BASE//:/ }"
+
+              AV1AN_IN="$IN"
+              AUDIO_PARAMS_STR="-c:a libopus -b:a ${AUDIO_BITRATE} -ac 1"
+
+              # معالجة مسبقة للفلاتر أو تغيير الدقة فقط
+              if [ "$ENCODE_MODE" = "filters" ] || [ "$RESOLUTION" != "auto" ]; then
+                PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
+                "$FFMPEG" -hide_banner -nostdin -y "${DECODER_ARGS[@]}" -i "$IN" \
+                  -map 0:v:0 -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr -c:v ffv1 \
+                  -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" -ac 1 "$PRE_FILE"
+                test -s "$PRE_FILE"
+                AV1AN_IN="$PRE_FILE"
+                AUDIO_PARAMS_STR="-c:a copy"
+              fi
+
+              echo "🎯 Av1an Target Quality: VMAF=$VMAF_TARGET | chunk-method=segment | filters=$ENCODE_MODE"
+
+              set +e
+              av1an \
+                -i "$AV1AN_IN" \
+                -o "$OUT_FILE" \
+                -e svt-av1 \
+                -v "--preset ${VIDEO_PRESET} --crf 30 ${SVT_FOR_AV1AN}" \
+                --target-quality "$VMAF_TARGET" \
+                -w "$(nproc)" \
+                --chunk-method segment \
+                --audio-params "$AUDIO_PARAMS_STR" \
+                --keep
+              AV1AN_EXIT=$?
+              set -e
+
+              if [ "$AV1AN_EXIT" -ne 0 ] || [ ! -s "$OUT_FILE" ]; then
+                echo "❌ Av1an فشل (exit=$AV1AN_EXIT)." >&2
+                exit 1
+              fi
+              CRF_USED="Av1an-VMAF${VMAF_TARGET}"
+            else
+              # ============================================================
+              # فرع crf / twopass: FFmpeg كما هو (بلا تغيير)
+              # ============================================================
+              CRF_USED=""
+              if [ "$ENCODE_METHOD" = "crf" ]; then
+                [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
+                CRF_USED="$TARGET_VALUE"
                 "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
                   -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 240 "${COLOR_ARGS[@]}" $SVT_PARAMS \
                   -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
