@@ -97,7 +97,6 @@ jobs:
           cmake -S SVT-AV1 -B SVT-AV1/Build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
           cmake --build SVT-AV1/Build --parallel "$(nproc)"
           cmake --install SVT-AV1/Build
-          # libvmaf (مطلوب لـ Av1an Target Quality)
           sudo apt install -y meson ninja-build xxd
           git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git
           meson setup vmaf/libvmaf/build vmaf/libvmaf --buildtype release --prefix="$HOME/codec-build" --libdir=lib -Denable_tests=false -Denable_docs=false
@@ -120,7 +119,6 @@ jobs:
           AV1AN_BIN="$(brew --prefix)/bin/av1an"
           test -x "$AV1AN_BIN"
           "$AV1AN_BIN" --version
-          "$AV1AN_BIN" --help | grep -E "chunk-method|audio-params|keep|target-quality|ffmpeg" || true
 
       - name: فحص البناء الموحد
         if: github.event.inputs.codec != 'audio'
@@ -179,7 +177,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1. تحميل من رسالة تيليجرام
           if [ -n "$MESSAGE_ID" ]; then
             echo "📥 تحميل من رسالة تيليجرام..."
             python3 <<'PYEOF'
@@ -196,8 +193,6 @@ jobs:
                   await client.download_media(message, file="raw_input.mp4")
           asyncio.run(main())
           PYEOF
-
-          # 2. تحميل من رابط تيليجرام
           elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
             echo "📥 تحميل من رابط تيليجرام..."
             python3 <<'PYEOF'
@@ -244,13 +239,9 @@ jobs:
                       sys.exit(f"فشل: {str(e)}")
           asyncio.run(main())
           PYEOF
-
-          # 3. تحميل من رابط مباشر
           elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$ ]]; then
             echo "📥 تحميل من رابط مباشر..."
             curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
-
-          # 4. تحميل ذكي
           elif [ -n "$VIDEO_URL" ]; then
             echo "📥 تحميل ذكي من الرابط..."
             python3 <<'PYEOF'
@@ -554,7 +545,6 @@ jobs:
           echo "✅ حجم الملف: $(stat -c%s raw_input.mp4) بايت"
           DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
           echo "✅ المدة: $DURATION ثانية"
-          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 raw_input.mp4 >/dev/null
 
       - name: تقسيم المصدر إلى أجزاء MKV مستقلة
         id: segment
@@ -758,26 +748,15 @@ jobs:
             fi
             echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
 
-            # ============================================================
-            # فرع auto: Av1an Target Quality (chunk-method segment)
-            # ============================================================
             if [ "$ENCODE_METHOD" = "auto" ]; then
               [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || { echo 'هدف VMAF يجب أن يكون 50-99' >&2; exit 1; }
               VMAF_TARGET="$TARGET_VALUE"
 
-              # Av1an يستدعي ffmpeg من PATH: نضع ffmpeg الخاص بـ Homebrew أولاً
-              BREW_BIN="$(brew --prefix)/bin"
-              test -x "$BREW_BIN/ffmpeg" || { echo '❌ ffmpeg من Homebrew مفقود' >&2; exit 1; }
-              export PATH="$BREW_BIN:$HOME/codec-build/bin:$PATH"
-              echo "av1an ffmpeg: $(command -v ffmpeg)"
-
-              # تحويل معاملات SVT (tune=0:enable-qm=1) إلى صيغة --tune 0 --enable-qm 1
               SVT_FOR_AV1AN=$(printf '%s' "$SVT_BASE" | tr ':' '\n' | sed 's/=/ /; s/^/--/' | paste -sd' ' -)
 
               AV1AN_IN="$IN"
               AUDIO_PARAMS_STR="-c:a libopus -b:a ${AUDIO_BITRATE} -ac 1"
 
-              # معالجة مسبقة للفلاتر أو تغيير الدقة فقط
               if [ "$ENCODE_MODE" = "filters" ] || [ "$RESOLUTION" != "auto" ]; then
                 PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
                 "$FFMPEG" -hide_banner -nostdin -y "${DECODER_ARGS[@]}" -i "$IN" \
@@ -788,31 +767,24 @@ jobs:
                 AUDIO_PARAMS_STR="-c:a copy"
               fi
 
+              BREW_BIN="$(brew --prefix)/bin"
+              test -x "$BREW_BIN/ffmpeg" || { echo '❌ ffmpeg من Homebrew مفقود' >&2; exit 1; }
+              export PATH="$BREW_BIN:$HOME/codec-build/bin:$PATH"
+              echo "av1an ffmpeg: $(command -v ffmpeg)"
               echo "🎯 Av1an Target Quality: VMAF=$VMAF_TARGET | chunk-method=segment | filters=$ENCODE_MODE"
 
-              set +e
               av1an \
                 -i "$AV1AN_IN" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
                 -v "--preset ${VIDEO_PRESET} --crf 30 ${SVT_FOR_AV1AN}" \
-                --target-quality "$VMAF_TARGET" \                
+                --target-quality "$VMAF_TARGET" \
                 -w "$(nproc)" \
                 --chunk-method segment \
                 --audio-params "$AUDIO_PARAMS_STR" \
                 --keep
-              AV1AN_EXIT=$?
-              set -e
-
-              if [ "$AV1AN_EXIT" -ne 0 ] || [ ! -s "$OUT_FILE" ]; then
-                echo "❌ Av1an فشل (exit=$AV1AN_EXIT)." >&2
-                exit 1
-              fi
               CRF_USED="Av1an-VMAF${VMAF_TARGET}"
             else
-              # ============================================================
-              # فرع crf / twopass: FFmpeg كما هو (بلا تغيير)
-              # ============================================================
               CRF_USED=""
               if [ "$ENCODE_METHOD" = "crf" ]; then
                 [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
