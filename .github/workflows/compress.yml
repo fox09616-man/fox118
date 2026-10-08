@@ -82,7 +82,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v7
+          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
 
       - name: بناء المرّمّزات والمفكك وFFmpeg
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
@@ -152,8 +152,8 @@ jobs:
           make -j"$(nproc)" && make install
           cd ..
 
-          # L-SMASH-Works (مبني على Meson - chunk method الأفضل لـ Av1an)
-          git clone --depth 1 https://github.com/HomeOfAviSynthPlusEvolution/L-SMASH-Works.git
+          # L-SMASH-Works (فرع ffmpeg-4.5 من AkarinVS للتوافق مع FFmpeg الحديث)
+          git clone --depth 1 --branch ffmpeg-4.5 https://github.com/AkarinVS/L-SMASH-Works.git
           cd L-SMASH-Works/VapourSynth
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           meson setup build --prefix="$HOME/codec-build" --libdir=lib
@@ -182,7 +182,6 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           fi
           source "$HOME/.cargo/env"
-          # إعداد المسارات ليجد الـ linker مكتبات VapourSynth
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           export LIBRARY_PATH="$HOME/codec-build/lib:${LIBRARY_PATH:-}"
@@ -235,7 +234,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v7
+          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
 
       - name: تحميل الفيديو المصدر والتحقق منه
         env:
@@ -696,7 +695,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v7
+          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
 
       - name: تجهيز الاعتماديات
         env:
@@ -949,7 +948,7 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v7
+          key: codec-universal-av1-av1an-vapoursynth-r72-ubuntu-24.04-v8
 
       - name: تجهيز أدوات الدمج والإرسال
         run: |
