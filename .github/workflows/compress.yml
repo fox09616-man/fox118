@@ -19,43 +19,43 @@ on:
         required: false
         default: ''
       codec:
-        description: 'av1 أو audio'
+        description: 'المرمّز: av1 للفيديو أو audio للصوت فقط.'
         required: true
         default: 'av1'
         type: choice
         options: ['av1', 'audio']
       preset:
-        description: 'AV1: رقم 0-13.'
+        description: 'AV1: رقم من 0 إلى 13. كلما قل كان أبطأ وأصغر حجماً.'
         required: true
         default: '6'
       encode_mode:
-        description: 'filters أو nofilters أو audio'
+        description: 'وضع الفلاتر: filters مع فلاتر، nofilters بدونها، audio للصوت.'
         required: true
         default: 'filters'
         type: choice
         options: ['filters', 'nofilters', 'audio']
       filter_profile:
-        description: 'anime أو realistic أو none'
+        description: 'نوع المحتوى: anime للأنمي، realistic للواقعي، none بدون.'
         required: true
         default: 'anime'
         type: choice
         options: ['anime', 'realistic', 'none']
       encode_method:
-        description: 'AV1: crf أو twopass أو auto'
+        description: 'طريقة الترميز: crf بجودة ثابتة، twopass بمعدل بت، auto بهدف VMAF.'
         required: true
         default: 'crf'
         type: choice
         options: ['crf', 'twopass', 'auto']
       target_value:
-        description: 'CRF (0-63) أو معدل بت أو هدف VMAF مع auto (50-99).'
+        description: 'CRF من 0 إلى 63، أو معدل بت مثل 500k، أو هدف VMAF من 50 إلى 99 مع auto.'
         required: true
         default: '38'
       resolution:
-        description: 'الارتفاع النهائي أو auto.'
+        description: 'الارتفاع النهائي مثل 480 أو 720 أو 1080، أو auto للإبقاء على دقة المصدر.'
         required: true
         default: '720'
       frame_rate:
-        description: 'معدل الإطارات: 23.976 أو 24000/1001 أو 25 أو 30 أو auto.'
+        description: 'معدل الإطارات: 23.976 أو 24000/1001 للأنمي، 25 للبث الأوروبي، 30 أو 29.97 للبث الأمريكي، أو auto للإبقاء على معدل المصدر.'
         required: true
         default: '23.976'
 
@@ -67,12 +67,15 @@ permissions:
   contents: read
 
 jobs:
+  # ============================================================
+  # 1. بناء الأدوات
+  # ============================================================
   prepare-codec-build:
-    name: Build FFmpeg and Av1an
+    name: بناء FFmpeg و Av1an
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Restore unified build
+      - name: استعادة البناء الموحد من الكاش
         if: github.event.inputs.codec != 'audio'
         id: cache-build
         uses: actions/cache@v4
@@ -83,7 +86,7 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      - name: Build SVT-AV1 v2.3.0 + VMAF v3.0.0 + FFmpeg n7.1
+      - name: بناء SVT-AV1 v2.3.0 و VMAF v3.0.0 و FFmpeg n7.1
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
         timeout-minutes: 90
         run: |
@@ -100,6 +103,7 @@ jobs:
           mkdir -p "$HOME/codec-build" "$HOME/codec-sources"
           cd "$HOME/codec-sources"
 
+          # SVT-AV1 إصدار مثبّت
           git clone --depth 1 --branch v2.3.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git
           cmake -S SVT-AV1 -B SVT-AV1/Build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -108,6 +112,7 @@ jobs:
           cmake --build SVT-AV1/Build --parallel "$(nproc)"
           cmake --install SVT-AV1/Build
 
+          # VMAF إصدار مثبّت
           git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git
           meson setup vmaf/libvmaf/build vmaf/libvmaf \
             --buildtype release \
@@ -118,6 +123,7 @@ jobs:
           ninja -C vmaf/libvmaf/build
           ninja -C vmaf/libvmaf/build install
 
+          # FFmpeg إصدار مثبّت
           git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
@@ -136,7 +142,7 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      - name: Install av1an (only if encode_method is auto)
+      - name: تثبيت av1an عند الحاجة فقط
         if: >-
           github.event.inputs.codec != 'audio' &&
           github.event.inputs.encode_method == 'auto'
@@ -148,7 +154,7 @@ jobs:
           AV1AN_VER=$(av1an --version 2>/dev/null || true)
           echo "av1an: $AV1AN_VER"
 
-      - name: Verify build
+      - name: التحقق من البناء
         if: github.event.inputs.codec != 'audio'
         run: |
           set -euo pipefail
@@ -174,8 +180,11 @@ jobs:
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf ' \
             && echo "OK libvmaf" || { echo 'MISSING libvmaf' >&2; exit 1; }
 
+  # ============================================================
+  # 2. تحميل المصدر وفحصه وتقطيعه
+  # ============================================================
   split-video:
-    name: Download, probe, and split source
+    name: تحميل المصدر وفحصه وتقطيعه
     needs: prepare-codec-build
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -183,7 +192,7 @@ jobs:
       chunks: ${{ steps.segment.outputs.chunks }}
       source_info: ${{ steps.probe_source.outputs.source_info }}
     steps:
-      - name: Prepare download tools
+      - name: تجهيز أدوات التحميل
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -192,7 +201,7 @@ jobs:
           python3 -m pip install --user telethon requests beautifulsoup4 lxml yt-dlp
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Restore unified FFmpeg
+      - name: استعادة FFmpeg الموحد
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
@@ -202,7 +211,7 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      - name: Download source video
+      - name: تحميل الفيديو المصدر
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -269,7 +278,7 @@ jobs:
           [ -s raw_input.mp4 ] || { echo "Download failed" >&2; exit 1; }
           echo "File size: $(stat -c%s raw_input.mp4) bytes"
 
-      - name: Detailed source probe
+      - name: فحص المصدر التفصيلي
         id: probe_source
         run: |
           set -euo pipefail
@@ -299,6 +308,7 @@ jobs:
           SRC_BITRATE=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=bit_rate -of csv=p=0 raw_input.mp4 | head -1)
 
+          # تحديد نوع المصدر
           is_bt2020=false
           is_hdr=false
           is_hlg=false
@@ -309,6 +319,7 @@ jobs:
             arib-std-b67)  is_hdr=true; is_hlg=true ;;
           esac
 
+          # عمق البت الحقيقي
           BIT_DEPTH=8
           case "$PIX_FMT" in
             *p10*|*10le*|*10be*) BIT_DEPTH=10 ;;
@@ -322,6 +333,7 @@ jobs:
 
           echo "Inter-frame PSNR noise: $NOISE_SCORE"
 
+          # تصنيف الضجيج: نظيف أعلى من 50، متوسط بين 40 و 50، عالٍ أقل من 40
           NOISE_CLASS="clean"
           if awk "BEGIN{exit !($NOISE_SCORE < 40)}"; then
             NOISE_CLASS="noisy"
@@ -362,7 +374,7 @@ jobs:
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Compress audio from full source
+      - name: ضغط الصوت من المصدر الكامل
         run: |
           set -euo pipefail
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
@@ -392,6 +404,7 @@ jobs:
             : > audio_compressed.opus
           fi
 
+          # إنشاء عيّنة صغيرة لقياس VMAF على الناتج الكامل
           SRC_DUR=$("$FFPROBE" -v error -show_entries format=duration \
             -of csv=p=0 raw_input.mp4 | cut -d. -f1)
           SAMPLE_START=$(( SRC_DUR / 2 - 45 ))
@@ -409,7 +422,7 @@ jobs:
           test -s source_sample.mkv
           echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
 
-      - name: Split source into chunks
+      - name: تقسيم المصدر إلى أجزاء
         id: segment
         run: |
           set -euo pipefail
@@ -487,7 +500,7 @@ jobs:
           CHUNKS_JSON=$(sed 's#^.*/chunk_##; s#\.mkv$##' /tmp/chunks.txt | jq -R . | jq -s -c .)
           echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
 
-      - name: Upload raw chunks, audio, and source sample
+      - name: رفع الأجزاء الخام والصوت وعيّنة المصدر
         uses: actions/upload-artifact@v4
         with:
           name: raw-chunks
@@ -498,8 +511,11 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # ============================================================
+  # 3. ترميز الأجزاء
+  # ============================================================
   encode-chunks:
-    name: Encode chunks
+    name: ضغط الأجزاء
     needs: [prepare-codec-build, split-video]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -509,13 +525,13 @@ jobs:
       matrix:
         chunk: ${{ fromJSON(needs.split-video.outputs.chunks) }}
     steps:
-      - name: Download raw chunks
+      - name: تنزيل الأجزاء الخام
         uses: actions/download-artifact@v4
         with:
           name: raw-chunks
           path: .
 
-      - name: Restore unified build
+      - name: استعادة البناء الموحد
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
@@ -525,7 +541,7 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      - name: Prepare dependencies
+      - name: تجهيز الاعتماديات
         env:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
@@ -541,7 +557,7 @@ jobs:
             echo "SvtAv1EncApp: $("$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || echo 'unavailable')"
           fi
 
-      - name: Install av1an (only if encode_method is auto)
+      - name: تثبيت av1an عند الحاجة فقط
         if: >-
           github.event.inputs.codec != 'audio' &&
           github.event.inputs.encode_method == 'auto'
@@ -552,7 +568,7 @@ jobs:
           brew install av1an
           echo "av1an: $(av1an --version 2>/dev/null | head -1)"
 
-      - name: Encode chunk
+      - name: ترميز الجزء
         env:
           CODEC: ${{ github.event.inputs.codec }}
           PRESET_INPUT: ${{ github.event.inputs.preset }}
@@ -586,6 +602,7 @@ jobs:
             fi
           fi
 
+          # قراءة معلومات المصدر من JSON
           eval "$(echo "$SOURCE_INFO" | python3 -c "
           import json, sys
           try:
@@ -606,6 +623,7 @@ jobs:
           echo "BT.2020=$IS_BT2020 | HDR=$IS_HDR | HLG=$IS_HLG | noise=$NOISE_CLASS"
           echo "Color: $SRC_PRIMARIES / $SRC_TRANSFER / $SRC_COLORSPACE | range: $SRC_RANGE"
 
+          # التحقق من المدخلات
           case "$CODEC" in av1|audio) ;; *) echo "Unsupported codec" >&2; exit 1 ;; esac
           if [ "$RESOLUTION" != "auto" ]; then
             [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'Invalid resolution' >&2; exit 1; }
@@ -616,6 +634,7 @@ jobs:
             { echo 'Invalid frame rate' >&2; exit 1; }
           [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'Invalid preset' >&2; exit 1; }
 
+          # وضع audio
           if [ "$CODEC" = "audio" ]; then
             [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'Invalid bitrate' >&2; exit 1; }
             TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
@@ -624,6 +643,7 @@ jobs:
             exit 0
           fi
 
+          # كشف الحواف السوداء
           echo "Detecting black bars..."
           CROPDETECT=$("$FFMPEG" -hide_banner -nostdin -t 120 -i "$IN" \
             -vf "cropdetect=24:16:0" -f null - 2>&1 | \
@@ -650,11 +670,13 @@ jobs:
             echo "No black bars"
           fi
 
+          # اختيار المفكك الصحيح
           INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=codec_name -of csv=p=0 "$IN")
           DECODER_ARGS=()
           [ "$INPUT_CODEC" = "av1" ] && DECODER_ARGS=(-c:v libdav1d)
 
+          # حساب معدل الإطارات
           SRC_FPS_RAW=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=avg_frame_rate -of csv=p=0 "$IN")
 
@@ -679,13 +701,14 @@ jobs:
               'BEGIN{print (s>0 && s <= c+0.01)?1:0}')
             if [ "$USE_SRC" = "1" ]; then
               OUT_FPS="$SRC_FPS_RAW"
-              echo "FPS src=$SRC_FPS_RAW tgt=$TARGET_FPS_FRAC keep-source"
+              echo "FPS keep source=$SRC_FPS_RAW target=$TARGET_FPS_FRAC"
             else
               OUT_FPS="$TARGET_FPS_FRAC"
               echo "FPS downscale from $SRC_FPS_RAW to $OUT_FPS"
             fi
           fi
 
+          # بناء سلسلة الفلاتر
           FILTERS=("setpts=PTS-STARTPTS")
 
           [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
@@ -700,7 +723,7 @@ jobs:
               anime)
                 case "$NOISE_CLASS" in
                   noisy)
-                    echo "anime noisy: strong denoise + sharpen"
+                    echo "anime noisy: strong denoise and sharpen"
                     FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0")
                     FILTERS+=("cas=0.4")
                     ;;
@@ -736,6 +759,7 @@ jobs:
             esac
           fi
 
+          # معالجة الألوان
           COLOR_ARGS=()
           OUT_PIX_FMT="yuv420p10le"
 
@@ -780,6 +804,7 @@ jobs:
           VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
           echo "Filter chain: $VF_CHAIN"
 
+          # معاملات SVT-AV1
           NPROC=$(nproc)
           if [ "$NPROC" -le 4 ]; then
             WORKERS=2
@@ -800,6 +825,7 @@ jobs:
           echo "SVT params: $SVT_PARAMS"
           echo "Workers: $WORKERS threads-per-worker: $THREADS_PER_WORKER"
 
+          # الترميز
           case "$ENCODE_METHOD" in
             crf)
               [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
@@ -911,6 +937,7 @@ jobs:
               ;;
           esac
 
+          # التحقق من الناتج
           test -s "$OUT_FILE" || { echo 'Empty output file' >&2; exit 1; }
 
           OUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
@@ -921,6 +948,7 @@ jobs:
           OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
           echo "Duration: in=$IN_DUR out=$OUT_DUR"
 
+          # قياس الجودة لكل قطعة
           (
             set +e
             Q_W=$("$FFPROBE" -v error -select_streams v:0 \
@@ -951,7 +979,7 @@ jobs:
             echo "Quality: $(cat "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt")"
           ) || true
 
-      - name: Upload encoded chunk
+      - name: رفع الجزء المضغوط
         uses: actions/upload-artifact@v4
         with:
           name: encoded-${{ matrix.chunk }}
@@ -959,13 +987,16 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # ============================================================
+  # 4. دمج الناتج وإرساله
+  # ============================================================
   merge-and-send:
-    name: Merge and send
+    name: دمج الناتج وإرساله
     needs: [prepare-codec-build, split-video, encode-chunks]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: Restore FFmpeg for merge
+      - name: استعادة FFmpeg للدمج
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
@@ -975,27 +1006,27 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      - name: Prepare merge tools
+      - name: تجهيز أدوات الدمج
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg libdav1d-dev libopus0
           python3 -m pip install --user telethon
 
-      - name: Download encoded chunks
+      - name: تنزيل الأجزاء المضغوطة
         uses: actions/download-artifact@v4
         with:
           pattern: encoded-*
           path: all_encoded
           merge-multiple: true
 
-      - name: Download audio and source sample
+      - name: تنزيل الصوت وعيّنة المصدر
         uses: actions/download-artifact@v4
         with:
           name: raw-chunks
           path: audio_dl
 
-      - name: Merge video + audio
+      - name: دمج الفيديو مع الصوت
         env:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
@@ -1048,7 +1079,7 @@ jobs:
           OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 output.mkv | cut -d. -f1)
           echo "Final duration: ${OUT_DUR}s"
 
-      - name: Measure quality on full output
+      - name: قياس الجودة على الناتج الكامل
         env:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
@@ -1123,7 +1154,7 @@ jobs:
           echo "SSIM=${SSIM} VMAF=${VMAF_SCORE}" > final_quality.txt
           rm -f sample_out.mkv
 
-      - name: Extract output info
+      - name: استخراج معلومات الناتج
         id: videoinfo
         env:
           CODEC: ${{ github.event.inputs.codec }}
@@ -1192,7 +1223,7 @@ jobs:
           fi
           echo "quality=$Q_LINE" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare final name
+      - name: إعداد الاسم النهائي
         id: naming
         env:
           FILENAME: ${{ github.event.inputs.filename }}
@@ -1201,7 +1232,7 @@ jobs:
             sed 's#[/\\:*?"<>|]# #g; s/  */ /g; s/^ *//; s/ *$//')
           echo "final_name=${SAFE:-video}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload output and notify user
+      - name: رفع الناتج وإشعار المستخدم
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -1227,9 +1258,9 @@ jobs:
           SIZE_MB=$(awk -v s="$FILE_SIZE" 'BEGIN{printf "%.1f",s/1048576}')
 
           COLOR_TAG=""
-          [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | BT.2020"
+          [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | 🎨 BT.2020"
 
-          CAPTION=$(printf 'Video: %s\nSize: %s MB\nResolution: %s\nAudio: %s\nQuality: %s\nDuration: %s\nStream: %s\nFilters: %s | Noise: %s%s' \
+          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s | ضجيج: %s%s' \
             "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
             "$QUALITY" "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
             "$FILTER_PROFILE" "$NOISE_CLASS" "$COLOR_TAG")
@@ -1254,15 +1285,18 @@ jobs:
           asyncio.run(main())
           PYEOF
 
-          MESSAGE=$(printf 'Done.\n\nFile: %s\nSize: %s MB\nResolution: %s\nAudio: %s\nQuality: %s\nDuration: %s' \
+          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' \
             "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
           curl --fail --silent --show-error \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${MESSAGE}"
 
+  # ============================================================
+  # 5. إشعار الفشل
+  # ============================================================
   notify-failure:
-    name: Notify failure
+    name: إشعار فشل العملية
     needs: [prepare-codec-build, split-video, encode-chunks, merge-and-send]
     if: >-
       ${{ always() && (
@@ -1273,7 +1307,7 @@ jobs:
       ) }}
     runs-on: ubuntu-24.04
     steps:
-      - name: Send log link
+      - name: إرسال رابط السجل
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
@@ -1281,7 +1315,7 @@ jobs:
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          MESSAGE=$(printf 'Compression failed.\n\nLog: %s' "$RUN_URL")
+          MESSAGE=$(printf '❌ فشلت عملية الضغط.\n\n📋 السجل:\n%s' "$RUN_URL")
           curl --fail --silent --show-error \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
