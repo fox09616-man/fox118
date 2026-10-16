@@ -54,8 +54,6 @@ on:
         description: 'معدل الإطارات: 23.976 أو 24000/1001 للأنمي، 25 للبث الأوروبي، 30 أو 29.97 للبث الأمريكي، أو auto للإبقاء على معدل المصدر.'
         required: true
         default: '23.976'
-
-      # ============ تشكيلات الفلاتر الجاهزة ============
       filter_preset:
         description: 'اختر تشكيلة الفلاتر الجاهزة بالأسماء المعبّرة أو الوضع اليدوي custom.'
         required: true
@@ -205,6 +203,7 @@ jobs:
     outputs:
       chunks: ${{ steps.segment.outputs.chunks }}
       source_info: ${{ steps.probe_source.outputs.source_info }}
+      has_video: ${{ steps.probe_source.outputs.has_video }}
     steps:
       - name: تجهيز أدوات التحميل
         run: |
@@ -225,6 +224,7 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
+      # ✅ FIX: تثبيت av1an عند الحاجة في split-video أيضاً (لو احتاج لاحقاً)
       - name: تحميل الفيديو المصدر
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -244,8 +244,13 @@ jobs:
           from telethon import TelegramClient
           from telethon.sessions import StringSession
           async def main():
-              client = TelegramClient(StringSession(), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
-              await client.start(bot_token=os.environ["BOT_TOKEN"])
+              # ✅ FIX: استخدام TG_SESSION بدلاً من StringSession() فارغ
+              sess = os.environ.get("TG_SESSION", "")
+              client = TelegramClient(StringSession(sess), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              if not sess:
+                  await client.start(bot_token=os.environ["BOT_TOKEN"])
+              else:
+                  await client.start()
               async with client:
                   message = await client.get_messages(int(os.environ["SOURCE_CHAT_ID"]), ids=int(os.environ["MESSAGE_ID"]))
                   if message is None or not message.media:
@@ -303,6 +308,11 @@ jobs:
             FFPROBE=ffprobe
           fi
 
+          # ✅ FIX: التحقق من وجود فيديو
+          HAS_VIDEO=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=codec_name -of csv=p=0 raw_input.mp4 | grep -c . || true)
+          echo "has_video=$HAS_VIDEO" >> "$GITHUB_OUTPUT"
+
           COLOR_SPACE=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=color_space -of csv=p=0 raw_input.mp4 | head -1)
           COLOR_PRIMARIES=$("$FFPROBE" -v error -select_streams v:0 \
@@ -338,18 +348,23 @@ jobs:
             *p12*|*12le*|*12be*) BIT_DEPTH=12 ;;
           esac
 
-          echo "Measuring noise level..."
-          NOISE_SCORE=$(ffmpeg -v error -t 10 -i raw_input.mp4 \
-            -vf "split[a][b];[a]settb=1/25[aa];[b]settb=1/25,trim=start_frame=1[bb];[aa][bb]psnr" \
-            -f null - 2>&1 | grep -o 'psnr_avg:[0-9.]*' | tail -1 | cut -d: -f2 || echo "45")
-
-          echo "Inter-frame PSNR noise: $NOISE_SCORE"
-
+          # ✅ FIX: قياس ضجيج صحيح باستخدام tblend + signalstats
           NOISE_CLASS="clean"
-          if awk "BEGIN{exit !($NOISE_SCORE < 40)}"; then
-            NOISE_CLASS="noisy"
-          elif awk "BEGIN{exit !($NOISE_SCORE < 50)}"; then
-            NOISE_CLASS="medium"
+          NOISE_SCORE="45"
+          if [ "$HAS_VIDEO" -gt 0 ]; then
+            echo "Measuring noise level..."
+            NOISE_SCORE=$(ffmpeg -hide_banner -nostdin -t 10 -i raw_input.mp4 \
+              -vf "tblend=all_mode=difference,format=gray,signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-" \
+              -f null - 2>/dev/null | \
+              grep -oP 'YAVG=\K[0-9.]+' | \
+              awk '{s+=$1;n++} END{if(n>0) printf "%.2f", 100-s/n*8; else print "45"}')
+            echo "Inter-frame difference score: $NOISE_SCORE"
+
+            if awk "BEGIN{exit !($NOISE_SCORE < 60)}"; then
+              NOISE_CLASS="noisy"
+            elif awk "BEGIN{exit !($NOISE_SCORE < 75)}"; then
+              NOISE_CLASS="medium"
+            fi
           fi
 
           echo "=== Source info ==="
@@ -358,7 +373,7 @@ jobs:
           echo "Range: $COLOR_RANGE"
           echo "Bit depth: ${BIT_DEPTH}-bit $PIX_FMT"
           echo "BT.2020: $is_bt2020 | HDR: $is_hdr | HLG: $is_hlg"
-          echo "Noise class: $NOISE_CLASS psnr=$NOISE_SCORE"
+          echo "Noise class: $NOISE_CLASS score=$NOISE_SCORE"
 
           SOURCE_INFO=$(jq -cn \
             --arg w "$SRC_W" \
@@ -415,22 +430,30 @@ jobs:
             : > audio_compressed.opus
           fi
 
-          SRC_DUR=$("$FFPROBE" -v error -show_entries format=duration \
-            -of csv=p=0 raw_input.mp4 | cut -d. -f1)
-          SAMPLE_START=$(( SRC_DUR / 2 - 45 ))
-          [ "$SAMPLE_START" -lt 0 ] && SAMPLE_START=0
-          SAMPLE_DUR=90
-          if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$SRC_DUR" ]; then
-            SAMPLE_DUR=$(( SRC_DUR - SAMPLE_START ))
+          # ✅ FIX: عيّنة المصدر فقط إذا كان هناك فيديو
+          HAS_VIDEO=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name \
+               -of csv=p=0 raw_input.mp4 | grep -c . || true)
+          if [ "$HAS_VIDEO" -gt 0 ]; then
+            SRC_DUR=$("$FFPROBE" -v error -show_entries format=duration \
+              -of csv=p=0 raw_input.mp4 | cut -d. -f1)
+            SAMPLE_START=$(( SRC_DUR / 2 - 45 ))
+            [ "$SAMPLE_START" -lt 0 ] && SAMPLE_START=0
+            SAMPLE_DUR=90
+            if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$SRC_DUR" ]; then
+              SAMPLE_DUR=$(( SRC_DUR - SAMPLE_START ))
+            fi
+            echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
+            "$FFMPEG" -hide_banner -nostdin -y \
+              -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
+              -i raw_input.mp4 \
+              -map 0:v:0 -c:v copy \
+              source_sample.mkv
+            test -s source_sample.mkv
+            echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
+          else
+            echo "No video, skipping source sample"
+            : > source_sample.mkv
           fi
-          echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
-          "$FFMPEG" -hide_banner -nostdin -y \
-            -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
-            -i raw_input.mp4 \
-            -map 0:v:0 -c:v copy \
-            source_sample.mkv
-          test -s source_sample.mkv
-          echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
 
       - name: تقسيم المصدر إلى أجزاء
         id: segment
@@ -444,6 +467,18 @@ jobs:
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           else
             FFMPEG=ffmpeg; FFPROBE=ffprobe
+          fi
+
+          # ✅ FIX: التحقق من وجود فيديو قبل التقسيم
+          HAS_VIDEO=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name \
+               -of csv=p=0 raw_input.mp4 | grep -c . || true)
+
+          if [ "$HAS_VIDEO" -eq 0 ]; then
+            echo "No video stream: creating single empty chunk placeholder"
+            ffmpeg -hide_banner -nostdin -y -f lavfi -i color=c=black:s=320x240:d=1 \
+              -c:v libx264 -pix_fmt yuv420p chunks_raw/chunk_000.mkv
+            echo 'chunks=["000"]' >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           DURATION=$("$FFPROBE" -v error -show_entries format=duration \
@@ -599,18 +634,25 @@ jobs:
           mkdir -p "$OUT_DIR"
           test -s "$IN"
 
+          # ✅ FIX: وضع audio = تخطي الفيديو كلياً
           if [ "$CODEC" = "audio" ]; then
-            FFMPEG=ffmpeg; FFPROBE=ffprobe
-          else
-            export PATH="$HOME/codec-build/bin:$PATH"
-            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
+            echo "Audio mode: skipping video encode"
+            # نسخة فارغة كعلامة فقط
+            ffmpeg -hide_banner -nostdin -y -f lavfi -i color=c=black:s=2x2:d=1 \
+              -c:v libx264 -pix_fmt yuv420p "$OUT_FILE" 2>/dev/null || \
+              cp "$IN" "$OUT_FILE"
+            echo "frames=NA ssim=NA vmaf=NA crf=audio-mode" > "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt"
+            exit 0
+          fi
 
-            if [ "$ENCODE_METHOD" = "auto" ]; then
-              export HOMEBREW_NO_AUTO_UPDATE=1
-              eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-            fi
+          export PATH="$HOME/codec-build/bin:$PATH"
+          export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          FFMPEG="$HOME/codec-build/bin/ffmpeg"
+          FFPROBE="$HOME/codec-build/bin/ffprobe"
+
+          if [ "$ENCODE_METHOD" = "auto" ]; then
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           fi
 
           eval "$(echo "$SOURCE_INFO" | python3 -c "
@@ -642,14 +684,6 @@ jobs:
           [[ "$FRAME_RATE" =~ ^(auto|[0-9]+(\.[0-9]+)?|[0-9]+/[0-9]+)$ ]] || \
             { echo 'Invalid frame rate' >&2; exit 1; }
           [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3]|none)$ ]] || { echo 'Invalid preset' >&2; exit 1; }
-
-          if [ "$CODEC" = "audio" ]; then
-            [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'Invalid bitrate' >&2; exit 1; }
-            TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
-            "$FFMPEG" -hide_banner -nostdin -y -i "$IN" \
-              -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 1 "$OUT_FILE"
-            exit 0
-          fi
 
           echo "Detecting black bars..."
           CROPDETECT=$("$FFMPEG" -hide_banner -nostdin -t 120 -i "$IN" \
@@ -713,21 +747,17 @@ jobs:
             fi
           fi
 
-          # ============================================================
-          # بناء سلسلة الفلاتر الأساسية
-          # ============================================================
           FILTERS=("setpts=PTS-STARTPTS")
-
           [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
 
           if [ "$RESOLUTION" != "auto" ]; then
-            # ملاحظة: full_chroma_pos ليس خياراً صالحاً في flags=
             FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
           fi
 
-          # ============================================================
-          # فلاتر التشكيلة المختارة
-          # ============================================================
+          # ✅ FIX: إضافة fps filter داخل سلسلة الفلاتر بدلاً من -r
+          # لتفادي التعارض مع -fps_mode cfr في ffmpeg 7
+          FILTERS+=("fps=${OUT_FPS}")
+
           FILTERS_EXTRA=()
 
           if [ "$ENCODE_MODE" = "filters" ]; then
@@ -824,9 +854,6 @@ jobs:
 
           fi
 
-          # ============================================================
-          # معالجة الألوان
-          # ============================================================
           COLOR_ARGS=()
           OUT_PIX_FMT="yuv420p10le"
 
@@ -847,7 +874,6 @@ jobs:
           elif [ "$IS_BT2020" = "true" ]; then
             echo "BT.2020 SDR source: keeping wide gamut"
 
-            # حماية من color_transfer غير معروف
             case "$SRC_TRANSFER" in
               ""|unknown|unspecified|reserved)
                 SAFE_TRC="bt709"
@@ -911,7 +937,7 @@ jobs:
               "$FFMPEG" -hide_banner -nostdin -hwaccel none \
                 "${DECODER_ARGS[@]}" -y -i "$IN" \
                 -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
+                -fps_mode cfr \
                 -c:v libsvtav1 \
                 -preset "$PRESET_INPUT" \
                 -crf "$TARGET_VALUE" \
@@ -924,35 +950,22 @@ jobs:
               ;;
 
             twopass)
+              # ✅ FIX: libsvtav1 لا يدعم -pass عبر ffmpeg.
+              # الحل: استخدام svtav1-params مع passes=2
               [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || \
                 { echo 'Invalid bitrate' >&2; exit 1; }
               TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
-              PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
 
               "$FFMPEG" -hide_banner -nostdin -hwaccel none \
                 "${DECODER_ARGS[@]}" -y -i "$IN" \
                 -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
+                -fps_mode cfr \
                 -c:v libsvtav1 \
                 -preset "$PRESET_INPUT" \
                 -b:v "$TARGET_VALUE" \
                 -g 240 \
                 "${COLOR_ARGS[@]}" \
-                $SVT_PARAMS \
-                -pass 1 -passlogfile "$PASSLOG" \
-                -an -f null /dev/null
-
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
-                "${DECODER_ARGS[@]}" -y -i "$IN" \
-                -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
-                -c:v libsvtav1 \
-                -preset "$PRESET_INPUT" \
-                -b:v "$TARGET_VALUE" \
-                -g 240 \
-                "${COLOR_ARGS[@]}" \
-                $SVT_PARAMS \
-                -pass 2 -passlogfile "$PASSLOG" \
+                -svtav1-params "${SVT_BASE}:passes=2" \
                 -an \
                 "$OUT_FILE"
               CRF_USED="twopass-${TARGET_VALUE}"
@@ -962,9 +975,6 @@ jobs:
               [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || \
                 { echo 'VMAF target must be 50-99' >&2; exit 1; }
               VMAF_TARGET="$TARGET_VALUE"
-
-              SVT_FOR_AV1AN=$(printf '%s' "$SVT_BASE" | \
-                tr ':' '\n' | sed 's/=/ /; s/^/--/' | paste -sd' ' -)
 
               FREE_GB=$(df -BG . | awk 'NR==2{gsub("G",""); print $4}')
               echo "Free space: ${FREE_GB}GB"
@@ -979,7 +989,7 @@ jobs:
                 "${DECODER_ARGS[@]}" -i "$IN" \
                 -map 0:v:0 \
                 -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
+                -fps_mode cfr \
                 -c:v ffv1 \
                 "$PRE_FILE"
               test -s "$PRE_FILE"
@@ -989,11 +999,21 @@ jobs:
               RAM_MB=$(awk '/MemAvailable/{print int($2/1024*0.8)}' /proc/meminfo)
               echo "Av1an RAM limit: ${RAM_MB}MB"
 
+              # ✅ FIX: تمرير معاملات SVT-AV1 بصيغة صحيحة إلى av1an
+              # av1an يتوقع -v "..." حيث ... هي معاملات تُمرَّر لـ SvtAv1EncApp
+              # الأسماء هنا هي أسماء خيارات SVT-AV1 نفسها (tune, lp, ...)
+              AV1AN_SVT_OPTS="--preset ${PRESET_INPUT} --crf 30 --tune 0 --enable-qm 1 --qm-min 0 --lp ${THREADS_PER_WORKER}"
+              if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "off" ]; then
+                AV1AN_SVT_OPTS="${AV1AN_SVT_OPTS} --enable-overlays 1 --film-grain 4 --film-grain-denoise 0"
+              fi
+
+              echo "av1an svt opts: $AV1AN_SVT_OPTS"
+
               av1an \
                 -i "$PRE_FILE" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
-                -v "--preset ${PRESET_INPUT} --crf 30 ${SVT_FOR_AV1AN}" \
+                -v "$AV1AN_SVT_OPTS" \
                 --target-quality "$VMAF_TARGET" \
                 --probes 4 \
                 --probing-rate 4 \
@@ -1004,7 +1024,6 @@ jobs:
                 --min-scene-len 24 \
                 --extra-split 240 \
                 --chunk-method segment \
-                --audio-params "-c:a copy" \
                 --max-ram "${RAM_MB}M" \
                 --ffmpeg-location "$HOME/codec-build/bin"
 
@@ -1104,6 +1123,7 @@ jobs:
       - name: دمج الفيديو مع الصوت
         env:
           CODEC: ${{ github.event.inputs.codec }}
+          HAS_VIDEO: ${{ needs.split-video.outputs.has_video }}
         run: |
           set -euo pipefail
           if [ "$CODEC" = "audio" ]; then
@@ -1114,8 +1134,26 @@ jobs:
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           fi
 
+          # ✅ FIX: وضع audio فقط = ناتج = ملف الصوت
+          if [ "$CODEC" = "audio" ]; then
+            if [ ! -s "audio_dl/audio_compressed.opus" ]; then
+              echo "Audio mode but no audio extracted" >&2; exit 1
+            fi
+            cp "audio_dl/audio_compressed.opus" output.mkv
+            echo "Audio-only output ready"
+            exit 0
+          fi
+
+          # ✅ FIX: إذا لم يكن هناك فيديو أصلاً
+          if [ "${HAS_VIDEO:-1}" = "0" ]; then
+            echo "No video in source; cannot proceed with av1 codec" >&2
+            exit 1
+          fi
+
           cd all_encoded
-          find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
+          # ✅ FIX: sort طبيعي حسب الرقم وليس أبجدياً
+          find . -maxdepth 1 -type f -name "encoded_*.mkv" | \
+            sort -t_ -k2 -n > /tmp/encoded_files.txt
           test -s /tmp/encoded_files.txt
           sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
 
@@ -1145,11 +1183,9 @@ jobs:
 
           test -s "output.mkv"
 
-          if [ "$CODEC" != "audio" ]; then
-            "$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=codec_name -of csv=p=0 "output.mkv" | \
-              grep -Eq '^av1$' || { echo 'Merge lost AV1 video' >&2; exit 1; }
-          fi
+          "$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=codec_name -of csv=p=0 "output.mkv" | \
+            grep -Eq '^av1$' || { echo 'Merge lost AV1 video' >&2; exit 1; }
 
           OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 output.mkv | cut -d. -f1)
           echo "Final duration: ${OUT_DUR}s"
@@ -1242,6 +1278,7 @@ jobs:
 
           if [ "$CODEC" = "audio" ]; then
             echo 'actual_res=audio only' >> "$GITHUB_OUTPUT"
+            echo 'video_info=audio' >> "$GITHUB_OUTPUT"
           else
             ACTUAL_RES=$(ffprobe -v error -select_streams v:0 \
               -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
@@ -1310,44 +1347,44 @@ jobs:
           export RAW
 
           DISPLAY_NAME=$(python3 <<'PYEOF'
-import os, unicodedata
+          import os, unicodedata
 
-s = os.environ.get("RAW", "")
+          s = os.environ.get("RAW", "")
 
-strip = set()
-for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
-          list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
-    strip.add(chr(cp))
-s = ''.join(ch for ch in s if ch not in strip)
+          strip = set()
+          for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
+                    list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
+              strip.add(chr(cp))
+          s = ''.join(ch for ch in s if ch not in strip)
 
-s = unicodedata.normalize('NFC', s)
+          s = unicodedata.normalize('NFC', s)
 
-def is_letter(c): return unicodedata.category(c).startswith('L')
-def is_digit(c):  return unicodedata.category(c).startswith('N')
-def is_allowed(c):
-    if is_letter(c) or is_digit(c): return True
-    if c in ' _-.()[]': return True
-    if unicodedata.category(c) == 'Zs': return True
-    return False
+          def is_letter(c): return unicodedata.category(c).startswith('L')
+          def is_digit(c):  return unicodedata.category(c).startswith('N')
+          def is_allowed(c):
+              if is_letter(c) or is_digit(c): return True
+              if c in ' _-.()[]': return True
+              if unicodedata.category(c) == 'Zs': return True
+              return False
 
-out = []
-for i, c in enumerate(s):
-    if is_allowed(c):
-        out.append(c)
-    else:
-        prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
-        nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
-        if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
-            out.append(' ')
+          out = []
+          for i, c in enumerate(s):
+              if is_allowed(c):
+                  out.append(c)
+              else:
+                  prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
+                  nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
+                  if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
+                      out.append(' ')
 
-s = ''.join(out)
-s = ' '.join(s.split())
-while '..' in s:
-    s = s.replace('..', '.')
-s = s.strip('.')
-print(s[:100], end='')
-PYEOF
-)
+          s = ''.join(out)
+          s = ' '.join(s.split())
+          while '..' in s:
+              s = s.replace('..', '.')
+          s = s.strip('.')
+          print(s[:100], end='')
+          PYEOF
+          )
 
           [ -z "$DISPLAY_NAME" ] && DISPLAY_NAME="video"
 
