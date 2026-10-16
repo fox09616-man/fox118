@@ -34,12 +34,6 @@ on:
         default: 'filters'
         type: choice
         options: ['filters', 'nofilters', 'audio']
-      filter_profile:
-        description: 'نوع المحتوى: anime للأنمي، realistic للواقعي، none بدون.'
-        required: true
-        default: 'anime'
-        type: choice
-        options: ['anime', 'realistic', 'none']
       encode_method:
         description: 'طريقة الترميز: crf بجودة ثابتة، twopass بمعدل بت، auto بهدف VMAF.'
         required: true
@@ -58,6 +52,74 @@ on:
         description: 'معدل الإطارات: 23.976 أو 24000/1001 للأنمي، 25 للبث الأوروبي، 30 أو 29.97 للبث الأمريكي، أو auto للإبقاء على معدل المصدر.'
         required: true
         default: '23.976'
+
+      # ============ التنعيم ============
+      denoise_filter:
+        description: 'فلتر التنعيم: off للتعطيل، hqdn3d سريع مكاني، atadenoise زمني، hqdn3d+atadenoise للأنمي، nlmeans أعلى جودة.'
+        required: true
+        default: 'hqdn3d+atadenoise'
+        type: choice
+        options: ['off', 'hqdn3d', 'atadenoise', 'hqdn3d+atadenoise', 'nlmeans']
+      denoise_strength:
+        description: 'شدة التنعيم: light خفيف، medium متوسط، strong قوي.'
+        required: true
+        default: 'medium'
+        type: choice
+        options: ['light', 'medium', 'strong']
+
+      # ============ إزالة البانديج ============
+      deband_filter:
+        description: 'إزالة البانديج: off، deband بسيط، gradfun ذكي، deband+gradfun الأقوى.'
+        required: true
+        default: 'gradfun'
+        type: choice
+        options: ['off', 'deband', 'gradfun', 'deband+gradfun']
+
+      # ============ السطوع ============
+      brightness_curve:
+        description: 'السطوع: off، eq سريع، curves-* منحنيات ترفع الظلال دون إحراق المناطق الفاتحة.'
+        required: true
+        default: 'curves-medium'
+        type: choice
+        options: ['off', 'eq', 'curves-light', 'curves-medium', 'curves-strong']
+
+      # ============ التشبع ============
+      saturation_boost:
+        description: 'التشبع: off، eq موحد، colorbalance متوازن الألوان.'
+        required: true
+        default: 'colorbalance'
+        type: choice
+        options: ['off', 'eq', 'colorbalance']
+
+      # ============ الحدة ============
+      sharpen_filter:
+        description: 'الحدة: off، cas للأنمي، unsharp للواقعي.'
+        required: true
+        default: 'cas'
+        type: choice
+        options: ['off', 'cas', 'unsharp']
+
+      # ============ قيم مخصصة (اختيارية) ============
+      custom_denoise:
+        description: 'تنعيم مخصص يُضاف بعد الفلتر المختار. مثال: hqdn3d=1.5:1.0:2.0:1.5'
+        required: false
+        default: ''
+      custom_deband:
+        description: 'بانديج مخصص. مثال: gradfun=strength=2.0:radius=20'
+        required: false
+        default: ''
+      custom_brightness:
+        description: 'سطوع مخصص. مثال: eq=brightness=0.08'
+        required: false
+        default: ''
+      custom_saturation:
+        description: 'تشبع مخصص. مثال: eq=saturation=1.2'
+        required: false
+        default: ''
+      custom_sharpen:
+        description: 'حدة مخصصة. مثال: unsharp=luma_amount=0.8'
+        required: false
+        default: ''
 
 concurrency:
   group: video-compression-${{ github.event.inputs.chat_id }}
@@ -573,11 +635,21 @@ jobs:
           CODEC: ${{ github.event.inputs.codec }}
           PRESET_INPUT: ${{ github.event.inputs.preset }}
           ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
-          FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
           ENCODE_METHOD: ${{ github.event.inputs.encode_method }}
           TARGET_VALUE: ${{ github.event.inputs.target_value }}
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
+          DENOISE_FILTER: ${{ github.event.inputs.denoise_filter }}
+          DENOISE_STRENGTH: ${{ github.event.inputs.denoise_strength }}
+          DEBAND_FILTER: ${{ github.event.inputs.deband_filter }}
+          BRIGHTNESS_CURVE: ${{ github.event.inputs.brightness_curve }}
+          SATURATION_BOOST: ${{ github.event.inputs.saturation_boost }}
+          SHARPEN_FILTER: ${{ github.event.inputs.sharpen_filter }}
+          CUSTOM_DENOISE: ${{ github.event.inputs.custom_denoise }}
+          CUSTOM_DEBAND: ${{ github.event.inputs.custom_deband }}
+          CUSTOM_BRIGHTNESS: ${{ github.event.inputs.custom_brightness }}
+          CUSTOM_SATURATION: ${{ github.event.inputs.custom_saturation }}
+          CUSTOM_SHARPEN: ${{ github.event.inputs.custom_sharpen }}
           CHUNK_ID: ${{ matrix.chunk }}
           SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
         run: |
@@ -708,55 +780,115 @@ jobs:
             fi
           fi
 
-          # بناء سلسلة الفلاتر
+          # ============================================================
+          # بناء سلسلة الفلاتر من المدخلات المستقلة
+          # ============================================================
           FILTERS=("setpts=PTS-STARTPTS")
 
+          # القص أولاً
           [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
 
-          SCALE_ALGO="lanczos"
+          # التصغير
           if [ "$RESOLUTION" != "auto" ]; then
-            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=${SCALE_ALGO}+accurate_rnd+full_chroma_int")
+            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_pos")
           fi
 
           if [ "$ENCODE_MODE" = "filters" ]; then
-            case "$FILTER_PROFILE" in
-              anime)
-                case "$NOISE_CLASS" in
-                  noisy)
-                    echo "anime noisy: strong denoise and sharpen"
-                    FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0")
-                    FILTERS+=("cas=0.4")
-                    ;;
-                  medium)
-                    echo "anime medium: moderate denoise"
-                    FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0")
-                    FILTERS+=("cas=0.3")
-                    ;;
-                  clean)
-                    echo "anime clean: light denoise"
-                    FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0")
-                    ;;
-                esac
 
-                FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
-                ;;
+            # --------------------------------------------------------
+            # 1) التنعيم
+            # --------------------------------------------------------
+            case "${DENOISE_FILTER}:${DENOISE_STRENGTH}" in
+              "hqdn3d:light")          FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0") ;;
+              "hqdn3d:medium")         FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0") ;;
+              "hqdn3d:strong")         FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0") ;;
 
-              realistic)
-                case "$NOISE_CLASS" in
-                  noisy)
-                    echo "realistic noisy: edge-aware denoise"
-                    FILTERS+=("hqdn3d=1.5:1.0:2.0:1.5")
-                    ;;
-                  medium)
-                    echo "realistic medium: light denoise"
-                    FILTERS+=("hqdn3d=0.8:0.6:1.2:0.8")
-                    ;;
-                  clean)
-                    echo "realistic clean: no denoise"
-                    ;;
-                esac
-                ;;
+              "atadenoise:light")      FILTERS+=("atadenoise=s=0:0:0:p=0.01:v=0.02") ;;
+              "atadenoise:medium")     FILTERS+=("atadenoise=s=0:0:0:p=0.02:v=0.04") ;;
+              "atadenoise:strong")     FILTERS+=("atadenoise=s=0:0:0:p=0.04:v=0.08") ;;
+
+              "hqdn3d+atadenoise:light")
+                FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0")
+                FILTERS+=("atadenoise=s=0:0:0:p=0.01:v=0.02") ;;
+              "hqdn3d+atadenoise:medium")
+                FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0")
+                FILTERS+=("atadenoise=s=0:0:0:p=0.02:v=0.04") ;;
+              "hqdn3d+atadenoise:strong")
+                FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0")
+                FILTERS+=("atadenoise=s=0:0:0:p=0.04:v=0.08") ;;
+
+              "nlmeans:light")         FILTERS+=("nlmeans=s=0.6:p=5:r=11:rc=2") ;;
+              "nlmeans:medium")        FILTERS+=("nlmeans=s=1.0:p=7:r=15:rc=3") ;;
+              "nlmeans:strong")        FILTERS+=("nlmeans=s=1.5:p=7:r=17:rc=3") ;;
+
+              "off:"*)                 : ;;
+              *)                       echo "Unknown denoise combo: ${DENOISE_FILTER}:${DENOISE_STRENGTH}" >&2 ;;
             esac
+
+            # --------------------------------------------------------
+            # 2) البانديج
+            # --------------------------------------------------------
+            case "$DEBAND_FILTER" in
+              deband)
+                FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true") ;;
+              gradfun)
+                FILTERS+=("gradfun=strength=1.2:radius=16") ;;
+              deband+gradfun)
+                FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                FILTERS+=("gradfun=strength=1.2:radius=16") ;;
+              off) : ;;
+              *) echo "Unknown deband: $DEBAND_FILTER" >&2 ;;
+            esac
+
+            # --------------------------------------------------------
+            # 3) السطوع
+            # --------------------------------------------------------
+            case "$BRIGHTNESS_CURVE" in
+              eq)
+                FILTERS+=("eq=brightness=0.05:contrast=1.05") ;;
+              curves-light)
+                FILTERS+=("curves=all='0/0 0.2/0.24 0.5/0.53 1/1'") ;;
+              curves-medium)
+                FILTERS+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'") ;;
+              curves-strong)
+                FILTERS+=("curves=all='0/0 0.1/0.20 0.3/0.42 0.5/0.60 1/1'") ;;
+              off) : ;;
+              *) echo "Unknown brightness: $BRIGHTNESS_CURVE" >&2 ;;
+            esac
+
+            # --------------------------------------------------------
+            # 4) التشبع
+            # --------------------------------------------------------
+            case "$SATURATION_BOOST" in
+              eq)
+                FILTERS+=("eq=saturation=1.1") ;;
+              colorbalance)
+                FILTERS+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02") ;;
+              off) : ;;
+              *) echo "Unknown saturation: $SATURATION_BOOST" >&2 ;;
+            esac
+
+            # --------------------------------------------------------
+            # 5) الحدة
+            # --------------------------------------------------------
+            case "$SHARPEN_FILTER" in
+              cas)
+                FILTERS+=("cas=0.3") ;;
+              unsharp)
+                FILTERS+=("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5") ;;
+              off) : ;;
+              *) echo "Unknown sharpen: $SHARPEN_FILTER" >&2 ;;
+            esac
+
+            # --------------------------------------------------------
+            # 6) القيم المخصصة (تعمل فوق الاختيارات)
+            # --------------------------------------------------------
+            [ -n "${CUSTOM_DENOISE:-}" ]    && FILTERS+=("$CUSTOM_DENOISE")
+            [ -n "${CUSTOM_DEBAND:-}" ]     && FILTERS+=("$CUSTOM_DEBAND")
+            [ -n "${CUSTOM_BRIGHTNESS:-}" ] && FILTERS+=("$CUSTOM_BRIGHTNESS")
+            [ -n "${CUSTOM_SATURATION:-}" ] && FILTERS+=("$CUSTOM_SATURATION")
+            [ -n "${CUSTOM_SHARPEN:-}" ]    && FILTERS+=("$CUSTOM_SHARPEN")
+
           fi
 
           # معالجة الألوان
@@ -816,7 +948,8 @@ jobs:
 
           SVT_BASE="tune=0:enable-qm=1:qm-min=0:lp=${THREADS_PER_WORKER}"
 
-          if [ "$FILTER_PROFILE" = "anime" ] && [ "$ENCODE_MODE" = "filters" ]; then
+          # film-grain يُفعّل عندما يكون التنعيم نشطاً (بدل FILTER_PROFILE القديم)
+          if [ "$ENCODE_MODE" = "filters" ] && [ "$DENOISE_FILTER" != "off" ]; then
             SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
           fi
 
@@ -1228,9 +1361,60 @@ jobs:
         env:
           FILENAME: ${{ github.event.inputs.filename }}
         run: |
-          SAFE=$(printf '%s' "$FILENAME" | head -n1 | tr -d '\r' | \
-            sed 's#[/\\:*?"<>|]# #g; s/  */ /g; s/^ *//; s/ *$//')
-          echo "final_name=${SAFE:-video}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          RAW="${FILENAME:-}"
+
+          # إزالة CR/LF/Tab
+          RAW=$(printf '%s' "$RAW" | tr -d '\000-\010\013\014\016-\037\r\n\t')
+
+          # تنقية ذكية عبر python3
+          DISPLAY_NAME=$(printf '%s' "$RAW" | python3 -c "
+import sys, unicodedata
+s = sys.stdin.read()
+# إزالة BiDi
+strip = set()
+for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
+          list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
+    strip.add(chr(cp))
+s = ''.join(ch for ch in s if ch not in strip)
+# NFC
+s = unicodedata.normalize('NFC', s)
+# استبدال ذكي
+def is_letter(c): return unicodedata.category(c).startswith('L')
+def is_digit(c):  return unicodedata.category(c).startswith('N')
+def is_allowed(c):
+    if is_letter(c) or is_digit(c): return True
+    if c in ' _-.()[]': return True
+    if unicodedata.category(c) == 'Zs': return True
+    return False
+out = []
+for i, c in enumerate(s):
+    if is_allowed(c):
+        out.append(c)
+    else:
+        prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
+        nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
+        if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
+            out.append(' ')
+s = ''.join(out)
+s = ' '.join(s.split())
+while '..' in s: s = s.replace('..', '.')
+s = s.strip('.')
+sys.stdout.write(s[:100])
+")
+
+          [ -z "$DISPLAY_NAME" ] && DISPLAY_NAME="video"
+
+          TS=$(date -u +%Y%m%d-%H%M%S)
+          HASH=$(printf '%s' "$DISPLAY_NAME" | sha256sum | cut -c1-8)
+          SAFE_FILE="video-${TS}-${HASH}"
+
+          echo "display_name=$DISPLAY_NAME" >> "$GITHUB_OUTPUT"
+          echo "file_name=$SAFE_FILE" >> "$GITHUB_OUTPUT"
+
+          echo "Display name: $DISPLAY_NAME"
+          echo "File name:    $SAFE_FILE"
 
       - name: رفع الناتج وإشعار المستخدم
         env:
@@ -1240,19 +1424,25 @@ jobs:
           TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
-          FINAL_NAME: ${{ steps.naming.outputs.final_name }}
+          FINAL_NAME: ${{ steps.naming.outputs.display_name }}
+          FILE_NAME:  ${{ steps.naming.outputs.file_name }}
           DURATION_FMT: ${{ steps.videoinfo.outputs.duration_fmt }}
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
           VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
           QUALITY: ${{ steps.videoinfo.outputs.quality }}
           CODEC: ${{ github.event.inputs.codec }}
-          FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
+          DENOISE_FILTER: ${{ github.event.inputs.denoise_filter }}
+          DENOISE_STRENGTH: ${{ github.event.inputs.denoise_strength }}
+          DEBAND_FILTER: ${{ github.event.inputs.deband_filter }}
+          BRIGHTNESS_CURVE: ${{ github.event.inputs.brightness_curve }}
+          SATURATION_BOOST: ${{ github.event.inputs.saturation_boost }}
+          SHARPEN_FILTER: ${{ github.event.inputs.sharpen_filter }}
           NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
           IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
         run: |
           set -euo pipefail
-          UPLOAD_FILE="${FINAL_NAME}.mkv"
+          UPLOAD_FILE="${FILE_NAME}.mkv"
           mv "output.mkv" "$UPLOAD_FILE"
           FILE_SIZE=$(stat -c%s "$UPLOAD_FILE")
           SIZE_MB=$(awk -v s="$FILE_SIZE" 'BEGIN{printf "%.1f",s/1048576}')
@@ -1260,10 +1450,12 @@ jobs:
           COLOR_TAG=""
           [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | 🎨 BT.2020"
 
-          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s | ضجيج: %s%s' \
+          FILTERS_TAG="denoise=${DENOISE_FILTER}/${DENOISE_STRENGTH} deband=${DEBAND_FILTER} bright=${BRIGHTNESS_CURVE} sat=${SATURATION_BOOST} sharp=${SHARPEN_FILTER}"
+
+          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
             "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
             "$QUALITY" "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
-            "$FILTER_PROFILE" "$NOISE_CLASS" "$COLOR_TAG")
+            "$FILTERS_TAG" "$NOISE_CLASS" "$COLOR_TAG")
           export UPLOAD_FILE CAPTION
 
           python3 <<'PYEOF'
