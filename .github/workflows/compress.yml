@@ -1155,7 +1155,7 @@ jobs:
           [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
 
           if [ "$RESOLUTION" != "auto" ]; then
-            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_pos")
+            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
           fi
 
           # ============================================================
