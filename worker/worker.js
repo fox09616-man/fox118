@@ -38,8 +38,7 @@ const FILTER_PRESETS = [
 
 const FILTER_PRESET_DEFAULT = "anime-balanced";
 
-// امتدادات الوسائط فقط. لا نحذف أي "امتداد" عشوائي حتى لا نخسر أجزاء من الاسم
-// مثل ".E01" في "Show S02.E01" أو ".0" في "Movie 2.0".
+// امتدادات الوسائط فقط.
 const MEDIA_EXT_RE =
   /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mts|vob|3gp|3g2|ogv|mpeg|mpg|m3u8|mp3|m4a|aac|opus|ogg|wav|flac)$/i;
 
@@ -156,6 +155,7 @@ async function handleVideo(env, cfg, message) {
     return;
   }
 
+  // جلسة جديدة نظيفة — لا شيء مضبوط مسبقاً
   await setSession(env, chatId, {
     message_id: message.message_id,
     url: "",
@@ -283,6 +283,7 @@ async function handleText(env, cfg, message) {
     }
     session.custom_filters = value;
     session.awaiting_custom_filters = false;
+    session.awaiting_preset = true; // ← الانتقال لسرعة AV1
     await setSession(env, chatId, session);
     await sendMessage(
       cfg.botToken,
@@ -319,6 +320,7 @@ async function handleText(env, cfg, message) {
     return;
   }
 
+  // ============ سرعة AV1 ============
   if (session.awaiting_preset) {
     const codec = session.codec || "av1";
     if (!isValidPreset(codec, text)) {
@@ -334,6 +336,7 @@ async function handleText(env, cfg, message) {
     return;
   }
 
+  // ============ القيمة (CRF/بت/VMAF) ============
   if (session.awaiting_target_value) {
     const value = normalizeTargetValue(session.codec, session.encode_method, text);
     if (value === null) {
@@ -360,6 +363,7 @@ async function handleText(env, cfg, message) {
     return;
   }
 
+  // ============ الدقة ============
   if (session.awaiting_res) {
     if (!isValidResolution(text)) {
       await sendMessage(cfg.botToken, chatId, "أرسل ارتفاعاً صحيحاً بين 144 و2160، مثل 550:\n\nللإلغاء أرسل /cancel");
@@ -372,6 +376,7 @@ async function handleText(env, cfg, message) {
     return;
   }
 
+  // ============ الاسم النهائي ============
   if (session.awaiting_filename) {
     session.filename = cleanFileName(text) || cleanFileName(session.default_name) || "video";
     await askConfirmation(env, cfg, chatId, session);
@@ -453,14 +458,15 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ المرمّز ============
+  // ============ 1. المرمّز ============
   if (data.startsWith("codec_")) {
     const codec = data.split("_")[1];
     if (!["av1", "audio"].includes(codec)) return;
 
     session.codec = codec;
+
     if (codec === "audio") {
-      // قيم آمنة تتوافق مع YAML، ولا تُستخدم فعلاً في وضع الصوت
+      // مسار الصوت: لا فلاتر، لا دقة
       session.encode_mode = "audio";
       session.filter_preset = "off";
       session.custom_filters = "";
@@ -468,8 +474,9 @@ async function handleCallback(env, cfg, query) {
       session.encode_method = "crf";
       session.awaiting_target_value = true;
       await setSession(env, chatId, session);
-      await editMessage(cfg.botToken, chatId, messageId, "أرسل معدل بت الصوت (من 6k إلى 510k)، مثال: 32k أو 48k:");
+      await editMessage(cfg.botToken, chatId, messageId, "🎵 تم اختيار: صوت فقط\n\nأرسل معدل بت الصوت (من 6k إلى 510k)، مثال: 32k أو 48k:");
     } else {
+      // مسار AV1: اسأل عن وضع الصورة
       await setSession(env, chatId, session);
       await editMessage(cfg.botToken, chatId, messageId, "🎞️ المرمّز المختار: AV1");
       await sendEncodeModeKeyboard(cfg.botToken, chatId);
@@ -477,7 +484,7 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ وضع الصورة ============
+  // ============ 2. وضع الصورة ============
   if (data.startsWith("mode_")) {
     const mode = data.split("_")[1];
     if (!["filters", "nofilters"].includes(mode)) return;
@@ -485,6 +492,7 @@ async function handleCallback(env, cfg, query) {
     session.encode_mode = mode;
 
     if (mode === "filters") {
+      // 3. اختر التشكيلة
       await setSession(env, chatId, session);
       await editMessage(
         cfg.botToken,
@@ -494,16 +502,17 @@ async function handleCallback(env, cfg, query) {
         filterPresetKeyboardMarkup(),
       );
     } else {
+      // بدون فلاتر: انتقل مباشرة لسرعة AV1
       session.filter_preset = "off";
       session.custom_filters = "";
       session.awaiting_preset = true;
       await setSession(env, chatId, session);
-      await editMessage(cfg.botToken, chatId, messageId, presetPrompt());
+      await editMessage(cfg.botToken, chatId, messageId, "✨ تم اختيار: بدون فلاتر\n\n" + presetPrompt());
     }
     return;
   }
 
-  // ============ اختيار تشكيلة الفلاتر ============
+  // ============ 3. اختيار التشكيلة ============
   if (data.startsWith("fpreset_")) {
     const preset = data.slice("fpreset_".length);
     if (!FILTER_PRESETS.includes(preset)) return;
@@ -511,6 +520,7 @@ async function handleCallback(env, cfg, query) {
     session.filter_preset = preset;
 
     if (preset === "custom") {
+      // 3-أ. فلتر مخصص: اطلب النص
       session.awaiting_custom_filters = true;
       await setSession(env, chatId, session);
       await editMessage(
@@ -529,6 +539,8 @@ async function handleCallback(env, cfg, query) {
       return;
     }
 
+    // 3-ب. تشكيلة جاهزة: انتقل لسرعة AV1
+    session.awaiting_preset = true; // ← الإصلاح الجوهري
     await setSession(env, chatId, session);
     await editMessage(
       cfg.botToken,
@@ -539,7 +551,7 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ طريقة الترميز ============
+  // ============ 4. طريقة الترميز ============
   if (data.startsWith("encmethod_")) {
     const method = data.split("_")[1];
     if (!isValidEncodeMethod(session.codec, method)) return;
@@ -585,7 +597,7 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ التسمية التلقائية ============
+  // ============ 5. التسمية التلقائية (لوضع /setup) ============
   if (data === "autoname_keep") {
     session.auto_naming = "source";
     delete session.series_title;
@@ -609,7 +621,7 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ الدقة ============
+  // ============ 6. الدقة ============
   if (data === "custom_res") {
     session.awaiting_res = true;
     await setSession(env, chatId, session);
@@ -731,7 +743,6 @@ function formatEpisode(value) {
   return String(Number.parseInt(value, 10)).padStart(2, "0");
 }
 
-// صوت مسار AV1 ثابت: Opus بمعدل 16k أحادي.
 const VIDEO_AUDIO_LABEL = "Opus 16k أحادي";
 
 function resolutionText(resolution) {
