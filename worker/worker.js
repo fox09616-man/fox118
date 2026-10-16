@@ -21,30 +21,25 @@ const AUTH_LOCK_SECONDS = 900;
 const SESSION_TTL_SECONDS = 3600;
 const MAX_NAME_LENGTH = 120;
 
-// خيارات الفلاتر — يجب أن تطابق workflow_dispatch inputs في compress.yml
-const DENOISE_FILTERS = ["off", "hqdn3d", "atadenoise", "hqdn3d+atadenoise", "nlmeans"];
-const DENOISE_STRENGTHS = ["light", "medium", "strong"];
-const DEBAND_FILTERS = ["off", "deband", "gradfun", "deband+gradfun"];
-const BRIGHTNESS_CURVES = ["off", "eq", "curves-light", "curves-medium", "curves-strong"];
-const SATURATION_BOOSTS = ["off", "eq", "colorbalance"];
-const SHARPEN_FILTERS = ["off", "cas", "unsharp"];
+// ============================================================================
+// تشكيلات الفلاتر الجاهزة — يجب أن تطابق workflow_dispatch inputs في compress.yml
+// ============================================================================
+const FILTER_PRESETS = [
+  "off",
+  "clean-gentle",
+  "anime-balanced",
+  "anime-vibrant",
+  "anime-cinematic",
+  "movie-balanced",
+  "movie-vibrant",
+  "old-restoration",
+  "custom",
+];
 
-const FILTER_DEFAULTS = {
-  denoise_filter: "hqdn3d+atadenoise",
-  denoise_strength: "medium",
-  deband_filter: "gradfun",
-  brightness_curve: "curves-medium",
-  saturation_boost: "colorbalance",
-  sharpen_filter: "cas",
-  custom_denoise: "",
-  custom_deband: "",
-  custom_brightness: "",
-  custom_saturation: "",
-  custom_sharpen: "",
-};
+const FILTER_PRESET_DEFAULT = "anime-balanced";
 
-const CUSTOM_FILTER_RE = /^[a-zA-Z][a-zA-Z0-9_]*=.+$/;
-
+// امتدادات الوسائط فقط. لا نحذف أي "امتداد" عشوائي حتى لا نخسر أجزاء من الاسم
+// مثل ".E01" في "Show S02.E01" أو ".0" في "Movie 2.0".
 const MEDIA_EXT_RE =
   /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mts|vob|3gp|3g2|ogv|mpeg|mpg|m3u8|mp3|m4a|aac|opus|ogg|wav|flac)$/i;
 
@@ -96,6 +91,10 @@ export default {
   },
 };
 
+// ---------------------------------------------------------------------------
+// المعالجات الرئيسية
+// ---------------------------------------------------------------------------
+
 function isVideoMessage(message) {
   return Boolean(
     message.video ||
@@ -116,7 +115,7 @@ function isSetupBusy(session) {
       session.awaiting_filename ||
       session.awaiting_series_title ||
       session.awaiting_episode_start ||
-      session.awaiting_custom_filter_text ||
+      session.awaiting_custom_filters ||
       session.pending_confirmation,
   );
 }
@@ -267,51 +266,33 @@ async function handleText(env, cfg, message) {
     return;
   }
 
-  if (session.awaiting_custom_filter_text) {
-    const field = session.awaiting_custom_filter_text;
+  // ============ الفلاتر المخصصة (نص حر) ============
+  if (session.awaiting_custom_filters) {
     const value = String(text).trim();
-
-    if (value === "حذف" || value.toLowerCase() === "delete" || value === "-") {
-      session[field] = "";
-      session.awaiting_custom_filter_text = null;
-      await setSession(env, chatId, session);
+    if (!value) {
+      await sendMessage(cfg.botToken, chatId, "⚠️ أرسل سلسلة فلاتر صحيحة، أو /cancel للإلغاء.");
+      return;
+    }
+    if (/[;&|`$<>]/.test(value)) {
       await sendMessage(
         cfg.botToken,
         chatId,
-        `✅ تم حذف ${field}`,
-        customFiltersKeyboardMarkup(session),
+        "⚠️ السلسلة تحتوي على رموز غير مسموحة.\n\nأرسل سلسلة فلاتر FFmpeg فقط.\n\nللإلغاء أرسل /cancel",
       );
       return;
     }
-
-    if (!CUSTOM_FILTER_RE.test(value)) {
-      await sendMessage(
-        cfg.botToken,
-        chatId,
-        "⚠️ صيغة غير صحيحة. يجب أن تبدأ باسم الفلتر ثم =\n" +
-          "أمثلة صحيحة:\n" +
-          "• gradfun=strength=2.0:radius=20\n" +
-          "• eq=brightness=0.08\n" +
-          "• curves=all='0/0 0.2/0.30 1/1'\n" +
-          "• unsharp=luma_msize_x=5:luma_amount=0.5\n\n" +
-          "للإلغاء أرسل /cancel",
-      );
-      return;
-    }
-
-    session[field] = value;
-    session.awaiting_custom_filter_text = null;
+    session.custom_filters = value;
+    session.awaiting_custom_filters = false;
     await setSession(env, chatId, session);
-
     await sendMessage(
       cfg.botToken,
       chatId,
-      `✅ تم حفظ ${field}: ${value}`,
-      customFiltersKeyboardMarkup(session),
+      `✅ تم حفظ الفلاتر المخصصة:\n${value}\n\n${presetPrompt()}`,
     );
     return;
   }
 
+  // ============ مدخلات الإعداد النصية ============
   if (session.awaiting_series_title) {
     const seriesTitle = cleanFileName(text);
     if (!seriesTitle) {
@@ -472,14 +453,17 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
+  // ============ المرمّز ============
   if (data.startsWith("codec_")) {
     const codec = data.split("_")[1];
     if (!["av1", "audio"].includes(codec)) return;
 
     session.codec = codec;
     if (codec === "audio") {
-      // لا نرسل قيمًا غير موجودة في YAML؛ نستخدم قيمًا صحيحة تُهمل عند audio
+      // قيم آمنة تتوافق مع YAML، ولا تُستخدم فعلاً في وضع الصوت
       session.encode_mode = "audio";
+      session.filter_preset = "off";
+      session.custom_filters = "";
       session.preset = "6";
       session.encode_method = "crf";
       session.awaiting_target_value = true;
@@ -493,193 +477,69 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
+  // ============ وضع الصورة ============
   if (data.startsWith("mode_")) {
     const mode = data.split("_")[1];
     if (!["filters", "nofilters"].includes(mode)) return;
 
     session.encode_mode = mode;
-    await setSession(env, chatId, session);
 
     if (mode === "filters") {
+      await setSession(env, chatId, session);
       await editMessage(
         cfg.botToken,
         chatId,
         messageId,
-        denoisePrompt(),
-        denoiseFilterKeyboardMarkup(),
+        filterPresetPrompt(),
+        filterPresetKeyboardMarkup(),
       );
     } else {
-      Object.assign(session, {
-        denoise_filter: "off",
-        denoise_strength: "medium",
-        deband_filter: "off",
-        brightness_curve: "off",
-        saturation_boost: "off",
-        sharpen_filter: "off",
-        custom_denoise: "",
-        custom_deband: "",
-        custom_brightness: "",
-        custom_saturation: "",
-        custom_sharpen: "",
-        awaiting_preset: true,
-      });
+      session.filter_preset = "off";
+      session.custom_filters = "";
+      session.awaiting_preset = true;
       await setSession(env, chatId, session);
       await editMessage(cfg.botToken, chatId, messageId, presetPrompt());
     }
     return;
   }
 
-  if (data.startsWith("denoise_")) {
-    const filter = data.slice("denoise_".length);
-    if (!DENOISE_FILTERS.includes(filter)) return;
-    session.denoise_filter = filter;
-    await setSession(env, chatId, session);
+  // ============ اختيار تشكيلة الفلاتر ============
+  if (data.startsWith("fpreset_")) {
+    const preset = data.slice("fpreset_".length);
+    if (!FILTER_PRESETS.includes(preset)) return;
 
-    if (filter === "off") {
-      session.denoise_strength = "medium";
+    session.filter_preset = preset;
+
+    if (preset === "custom") {
+      session.awaiting_custom_filters = true;
       await setSession(env, chatId, session);
       await editMessage(
         cfg.botToken,
         chatId,
         messageId,
-        "✅ تم تعطيل التنعيم.\n\n" + debandPrompt(),
-        debandFilterKeyboardMarkup(),
+        "✏️ أرسل سلسلة الفلاتر المخصصة كاملة.\n\n" +
+          "أمثلة:\n" +
+          "• hqdn3d=2:1.5:3:2,gradfun=strength=1.2\n" +
+          "• hqdn3d=1.5:1.0:2.0:1.5,cas=0.3\n" +
+          "• eq=brightness=0.08:saturation=1.1\n" +
+          "• curves=all='0/0 0.15/0.22 1/1'\n\n" +
+          "للإلغاء أرسل /cancel",
+        cancelOnlyKeyboardMarkup(),
       );
-    } else {
-      await editMessage(
-        cfg.botToken,
-        chatId,
-        messageId,
-        `✅ التنعيم: ${filter}\n\n${denoiseStrengthPrompt()}`,
-        denoiseStrengthKeyboardMarkup(),
-      );
+      return;
     }
-    return;
-  }
 
-  if (data.startsWith("dstrength_")) {
-    const strength = data.slice("dstrength_".length);
-    if (!DENOISE_STRENGTHS.includes(strength)) return;
-    session.denoise_strength = strength;
     await setSession(env, chatId, session);
     await editMessage(
       cfg.botToken,
       chatId,
       messageId,
-      `✅ الشدة: ${strength}\n\n${debandPrompt()}`,
-      debandFilterKeyboardMarkup(),
+      `✅ التشكيلة: ${filterPresetLabel(preset)}\n\n${presetPrompt()}`,
     );
     return;
   }
 
-  if (data.startsWith("deband_")) {
-    const filter = data.slice("deband_".length);
-    if (!DEBAND_FILTERS.includes(filter)) return;
-    session.deband_filter = filter;
-    await setSession(env, chatId, session);
-    await editMessage(
-      cfg.botToken,
-      chatId,
-      messageId,
-      `✅ البانديج: ${filter}\n\n${brightnessPrompt()}`,
-      brightnessKeyboardMarkup(),
-    );
-    return;
-  }
-
-  if (data.startsWith("bright_")) {
-    const curve = data.slice("bright_".length);
-    if (!BRIGHTNESS_CURVES.includes(curve)) return;
-    session.brightness_curve = curve;
-    await setSession(env, chatId, session);
-    await editMessage(
-      cfg.botToken,
-      chatId,
-      messageId,
-      `✅ السطوع: ${curve}\n\n${saturationPrompt()}`,
-      saturationKeyboardMarkup(),
-    );
-    return;
-  }
-
-  if (data.startsWith("sat_")) {
-    const boost = data.slice("sat_".length);
-    if (!SATURATION_BOOSTS.includes(boost)) return;
-    session.saturation_boost = boost;
-    await setSession(env, chatId, session);
-    await editMessage(
-      cfg.botToken,
-      chatId,
-      messageId,
-      `✅ التشبع: ${boost}\n\n${sharpenPrompt()}`,
-      sharpenKeyboardMarkup(),
-    );
-    return;
-  }
-
-  if (data.startsWith("sharp_")) {
-    const filter = data.slice("sharp_".length);
-    if (!SHARPEN_FILTERS.includes(filter)) return;
-    session.sharpen_filter = filter;
-    await setSession(env, chatId, session);
-    await editMessage(
-      cfg.botToken,
-      chatId,
-      messageId,
-      `✅ الحدة: ${filter}\n\n${customFiltersPrompt()}`,
-      customFiltersKeyboardMarkup(session),
-    );
-    return;
-  }
-
-  if (data === "custom_skip") {
-    Object.assign(session, {
-      custom_denoise: "",
-      custom_deband: "",
-      custom_brightness: "",
-      custom_saturation: "",
-      custom_sharpen: "",
-    });
-    await setSession(env, chatId, session);
-
-    if (session.configuring_preset) {
-      await editMessage(cfg.botToken, chatId, messageId, "✅ تم تخطي الفلاتر المخصصة.");
-      await sendAutoNamingKeyboard(cfg.botToken, chatId);
-    } else {
-      session.awaiting_filename = true;
-      await setSession(env, chatId, session);
-      await promptFilename(cfg.botToken, chatId, messageId, session.default_name, true);
-    }
-    return;
-  }
-
-  if (data === "custom_done") {
-    if (session.configuring_preset) {
-      await sendAutoNamingKeyboard(cfg.botToken, chatId);
-    } else {
-      session.awaiting_filename = true;
-      await setSession(env, chatId, session);
-      await promptFilename(cfg.botToken, chatId, messageId, session.default_name, true);
-    }
-    return;
-  }
-
-  if (data.startsWith("custom_edit_")) {
-    const field = data.slice("custom_edit_".length);
-    const allowed = ["denoise", "deband", "brightness", "saturation", "sharpen"];
-    if (!allowed.includes(field)) return;
-    session.awaiting_custom_filter_text = `custom_${field}`;
-    await setSession(env, chatId, session);
-    await editMessage(
-      cfg.botToken,
-      chatId,
-      messageId,
-      customFilterHint(field),
-      cancelOnlyKeyboardMarkup(),
-    );
-    return;
-  }
-
+  // ============ طريقة الترميز ============
   if (data.startsWith("encmethod_")) {
     const method = data.split("_")[1];
     if (!isValidEncodeMethod(session.codec, method)) return;
@@ -725,6 +585,7 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
+  // ============ التسمية التلقائية ============
   if (data === "autoname_keep") {
     session.auto_naming = "source";
     delete session.series_title;
@@ -748,6 +609,7 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
+  // ============ الدقة ============
   if (data === "custom_res") {
     session.awaiting_res = true;
     await setSession(env, chatId, session);
@@ -780,6 +642,10 @@ async function handleCallback(env, cfg, query) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// أدوات الأمان
+// ---------------------------------------------------------------------------
+
 function safeEqual(a, b) {
   const encoder = new TextEncoder();
   const x = encoder.encode(String(a));
@@ -791,6 +657,10 @@ function safeEqual(a, b) {
   }
   return diff === 0;
 }
+
+// ---------------------------------------------------------------------------
+// الروابط والأسماء
+// ---------------------------------------------------------------------------
 
 function isAnyLink(text) {
   return /^https?:\/\/\S+$/i.test(text);
@@ -861,11 +731,16 @@ function formatEpisode(value) {
   return String(Number.parseInt(value, 10)).padStart(2, "0");
 }
 
+// صوت مسار AV1 ثابت: Opus بمعدل 16k أحادي.
 const VIDEO_AUDIO_LABEL = "Opus 16k أحادي";
 
 function resolutionText(resolution) {
   return resolution === "auto" ? "نفس جودة الفيديو الأصلية" : `${resolution}p (بلا رفع إن كان المصدر أقل)`;
 }
+
+// ---------------------------------------------------------------------------
+// الوضع التلقائي وحجز أرقام الحلقات
+// ---------------------------------------------------------------------------
 
 async function reserveAutoName(env, chatId, preset, sourceName) {
   if (
@@ -904,21 +779,12 @@ async function runAutomatic(env, cfg, chatId, preset, source, sourceName, label)
     url: source.url,
     codec: preset.codec || "av1",
     encode_mode: preset.encode_mode || "nofilters",
-    preset: preset.preset || preset.av1_preset || "8",
+    preset: preset.preset || preset.av1_preset || "6",
     encode_method: preset.encode_method || "crf",
     target_value: preset.target_value || "28",
     resolution: preset.resolution || "480",
-    denoise_filter: preset.denoise_filter || FILTER_DEFAULTS.denoise_filter,
-    denoise_strength: preset.denoise_strength || FILTER_DEFAULTS.denoise_strength,
-    deband_filter: preset.deband_filter || FILTER_DEFAULTS.deband_filter,
-    brightness_curve: preset.brightness_curve || FILTER_DEFAULTS.brightness_curve,
-    saturation_boost: preset.saturation_boost || FILTER_DEFAULTS.saturation_boost,
-    sharpen_filter: preset.sharpen_filter || FILTER_DEFAULTS.sharpen_filter,
-    custom_denoise: preset.custom_denoise || "",
-    custom_deband: preset.custom_deband || "",
-    custom_brightness: preset.custom_brightness || "",
-    custom_saturation: preset.custom_saturation || "",
-    custom_sharpen: preset.custom_sharpen || "",
+    filter_preset: preset.filter_preset || FILTER_PRESET_DEFAULT,
+    custom_filters: preset.custom_filters || "",
     filename: name,
     reserved_episode: episode,
     pending_confirmation: false,
@@ -927,6 +793,10 @@ async function runAutomatic(env, cfg, chatId, preset, source, sourceName, label)
   await sendMessage(cfg.botToken, chatId, `${label}: ${name}`);
   await finalizeAndTrigger(env, cfg, chatId, autoSession, false);
 }
+
+// ---------------------------------------------------------------------------
+// التأكيد والإرسال
+// ---------------------------------------------------------------------------
 
 function confirmKeyboardMarkup() {
   return {
@@ -1019,17 +889,8 @@ async function triggerGitHub(cfg, session, chatId) {
       target_value: String(session.target_value || "28"),
       resolution: session.resolution || "480",
       frame_rate: "24",
-      denoise_filter: session.denoise_filter || FILTER_DEFAULTS.denoise_filter,
-      denoise_strength: session.denoise_strength || FILTER_DEFAULTS.denoise_strength,
-      deband_filter: session.deband_filter || FILTER_DEFAULTS.deband_filter,
-      brightness_curve: session.brightness_curve || FILTER_DEFAULTS.brightness_curve,
-      saturation_boost: session.saturation_boost || FILTER_DEFAULTS.saturation_boost,
-      sharpen_filter: session.sharpen_filter || FILTER_DEFAULTS.sharpen_filter,
-      custom_denoise: session.custom_denoise || "",
-      custom_deband: session.custom_deband || "",
-      custom_brightness: session.custom_brightness || "",
-      custom_saturation: session.custom_saturation || "",
-      custom_sharpen: session.custom_sharpen || "",
+      filter_preset: session.filter_preset || FILTER_PRESET_DEFAULT,
+      custom_filters: session.custom_filters || "",
     },
   };
 
@@ -1066,20 +927,9 @@ async function triggerGitHub(cfg, session, chatId) {
   return true;
 }
 
-function filtersActive(session) {
-  return (
-    (session.denoise_filter && session.denoise_filter !== "off") ||
-    (session.deband_filter && session.deband_filter !== "off") ||
-    (session.brightness_curve && session.brightness_curve !== "off") ||
-    (session.saturation_boost && session.saturation_boost !== "off") ||
-    (session.sharpen_filter && session.sharpen_filter !== "off") ||
-    (session.custom_denoise && session.custom_denoise.length > 0) ||
-    (session.custom_deband && session.custom_deband.length > 0) ||
-    (session.custom_brightness && session.custom_brightness.length > 0) ||
-    (session.custom_saturation && session.custom_saturation.length > 0) ||
-    (session.custom_sharpen && session.custom_sharpen.length > 0)
-  );
-}
+// ---------------------------------------------------------------------------
+// النصوص والملخصات
+// ---------------------------------------------------------------------------
 
 function buildSummaryMessage(session) {
   const codecLabel = session.codec === "audio" ? "صوت فقط" : "AV1";
@@ -1105,26 +955,9 @@ function buildSummaryMessage(session) {
     lines.push(`🎯 الدقة: ${resolutionLabel}`);
 
     if (session.encode_mode === "filters") {
-      if (filtersActive(session)) {
-        lines.push("");
-        lines.push("🧩 الفلاتر:");
-        lines.push(`  • تنعيم: ${session.denoise_filter || "off"} / ${session.denoise_strength || "medium"}`);
-        lines.push(`  • بانديج: ${session.deband_filter || "off"}`);
-        lines.push(`  • سطوع: ${session.brightness_curve || "off"}`);
-        lines.push(`  • تشبع: ${session.saturation_boost || "off"}`);
-        lines.push(`  • حدة: ${session.sharpen_filter || "off"}`);
-
-        const customs = [];
-        if (session.custom_denoise) customs.push(`تنعيم=${session.custom_denoise}`);
-        if (session.custom_deband) customs.push(`بانديج=${session.custom_deband}`);
-        if (session.custom_brightness) customs.push(`سطوع=${session.custom_brightness}`);
-        if (session.custom_saturation) customs.push(`تشبع=${session.custom_saturation}`);
-        if (session.custom_sharpen) customs.push(`حدة=${session.custom_sharpen}`);
-        if (customs.length > 0) {
-          lines.push("  • مخصص: " + customs.join(" | "));
-        }
-      } else {
-        lines.push("🧩 الفلاتر: معطّلة فعلياً (كل الخيارات off)");
+      lines.push(`🧩 الفلاتر: ${filterPresetLabel(session.filter_preset || FILTER_PRESET_DEFAULT)}`);
+      if (session.filter_preset === "custom" && session.custom_filters) {
+        lines.push(`  • مخصص: ${session.custom_filters}`);
       }
     } else {
       lines.push("🖼️ الوضع: بدون فلاتر");
@@ -1159,19 +992,14 @@ function presetStatusText(preset) {
 
   if (preset.codec !== "audio") {
     lines.push(`الدقة: ${resolutionLabel}`);
-
     if (preset.encode_mode === "filters") {
-      lines.push(
-        `الفلاتر: تنعيم=${preset.denoise_filter || "off"}/${preset.denoise_strength || "medium"} ` +
-          `بانديج=${preset.deband_filter || "off"} ` +
-          `سطوع=${preset.brightness_curve || "off"} ` +
-          `تشبع=${preset.saturation_boost || "off"} ` +
-          `حدة=${preset.sharpen_filter || "off"}`,
-      );
+      lines.push(`الفلاتر: ${filterPresetLabel(preset.filter_preset || FILTER_PRESET_DEFAULT)}`);
+      if (preset.filter_preset === "custom" && preset.custom_filters) {
+        lines.push(`  • مخصص: ${preset.custom_filters}`);
+      }
     } else {
       lines.push("الوضع: بدون فلاتر");
     }
-
     lines.push(`الصوت: ${VIDEO_AUDIO_LABEL}`);
   }
 
@@ -1204,15 +1032,21 @@ function startMessage(preset) {
     "- دقة مخصصة",
     "- نفس جودة الفيديو الأصلية (auto)",
     "",
-    "🧩 فلاتر الصورة (عند اختيار «مع فلاتر»):",
-    "- 6 فلاتر رئيسية: تنعيم، بانديج، سطوع، تشبع، حدة",
-    "- و5 حقول مخصصة للتحكم اليدوي الكامل",
+    "🧩 تشكيلات الفلاتر الجاهزة (9 خيارات):",
+    "- 🌸 أنمي: متوازن، ألوان حية، سينمائي",
+    "- 🎬 أفلام: متوازن، ألوان غنية",
+    "- 📜 ترميز الفيديوهات القديمة",
+    "- 🧼 تنظيف خفيف، 🚫 بدون، ✏️ مخصص",
     preset?.active ? "" : null,
     preset?.active ? "▶️ الوضع التلقائي مفعّل حالياً." : null,
   ]
     .filter((line) => line !== null && line !== undefined)
     .join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// التحقق من القيم
+// ---------------------------------------------------------------------------
 
 function isValidPreset(codec, value) {
   if (codec === "av1") return /^(?:[0-9]|1[0-3])$/.test(value);
@@ -1267,100 +1101,6 @@ function presetPrompt() {
   return "أرسل رقم سرعة AV1 من 0 إلى 13، مثل 4 أو 8.";
 }
 
-function denoisePrompt() {
-  return (
-    "🧩 اختر فلتر التنعيم (Denoise):\n\n" +
-    "• 🚫 off — بلا تنعيم (للمصادر النظيفة أصلاً)\n" +
-    "• ⚡ hqdn3d — تنعيم مكاني سريع\n" +
-    "• 🎞️ atadenoise — تنعيم زمني بين الإطارات (يحفظ الخطوط)\n" +
-    "• 🌸 hqdn3d+atadenoise — الأفضل للأنمي (موصى به)\n" +
-    "• 💎 nlmeans — أعلى جودة لكن بطيء جداً"
-  );
-}
-
-function denoiseStrengthPrompt() {
-  return (
-    "🎚️ اختر شدة التنعيم:\n\n" +
-    "• 🌿 light — خفيف (مصدر نظيف نسبياً)\n" +
-    "• ⚖️ medium — متوسط (متوازن، موصى به)\n" +
-    "• 🔥 strong — قوي (مصدر ضجيج عالٍ)"
-  );
-}
-
-function debandPrompt() {
-  return (
-    "🧩 اختر فلتر إزالة البانديج (الطبقات اللونية):\n\n" +
-    "• 🚫 off — بلا إزالة\n" +
-    "• ⚡ deband — بسيط\n" +
-    "• 🎨 gradfun — ذكي مع dithering (موصى به)\n" +
-    "• 💎 deband+gradfun — الأقوى (الأبطأ)"
-  );
-}
-
-function brightnessPrompt() {
-  return (
-    "🧩 اختر منحنى السطوع:\n\n" +
-    "• 🚫 off — بلا تعديل\n" +
-    "• ⚡ eq — رفع بسيط موحد (سريع)\n" +
-    "• 🌤️ curves-light — رفع خفيف للظلال\n" +
-    "• ☀️ curves-medium — رفع متوسط (موصى به)\n" +
-    "• 🔥 curves-strong — رفع قوي للظلال"
-  );
-}
-
-function saturationPrompt() {
-  return (
-    "🧩 اختر زيادة التشبع اللوني:\n\n" +
-    "• 🚫 off — بلا تعديل\n" +
-    "• ⚡ eq — زيادة موحدة لكل الألوان\n" +
-    "• 🎨 colorbalance — متوازن الألوان (موصى به)"
-  );
-}
-
-function sharpenPrompt() {
-  return (
-    "🧩 اختر فلتر الحدة:\n\n" +
-    "• 🚫 off — بلا شحذ\n" +
-    "• 🌸 cas — شحذ متكيف (ممتاز للأنمي)\n" +
-    "• 🎬 unsharp — شحذ خطي (مناسب للواقعي)"
-  );
-}
-
-function customFiltersPrompt() {
-  return (
-    "🎨 هل تريد إضافة فلاتر مخصصة؟\n\n" +
-    "هذه حقول نصية تدعم أي فلتر FFmpeg. اضغط على أي حقل لإدخال قيمة.\n" +
-    "إن لم تكن بحاجة إليها، اضغط ✅ تم مباشرة."
-  );
-}
-
-function customFilterHint(field) {
-  const hints = {
-    denoise:
-      "🎨 أرسل فلتر التنعيم المخصص.\n" +
-      "مثال: hqdn3d=1.5:1.0:2.0:1.5\n" +
-      "أرسل «حذف» لإزالته.",
-    deband:
-      "🎨 أرسل فلتر البانديج المخصص.\n" +
-      "مثال: gradfun=strength=2.0:radius=20\n" +
-      "أرسل «حذف» لإزالته.",
-    brightness:
-      "🎨 أرسل فلتر السطوع المخصص.\n" +
-      "مثال: eq=brightness=0.08\n" +
-      "أو: curves=all='0/0 0.2/0.30 1/1'\n" +
-      "أرسل «حذف» لإزالته.",
-    saturation:
-      "🎨 أرسل فلتر التشبع المخصص.\n" +
-      "مثال: eq=saturation=1.2\n" +
-      "أرسل «حذف» لإزالته.",
-    sharpen:
-      "🎨 أرسل فلتر الحدة المخصص.\n" +
-      "مثال: unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5\n" +
-      "أرسل «حذف» لإزالته.",
-  };
-  return (hints[field] || "أرسل قيمة الفلتر:") + "\n\nللإلغاء أرسل /cancel";
-}
-
 function targetValueHint(codec, method) {
   if (codec === "audio") return "أرسل معدل بت بين 6k و510k، مثل 32k أو 48k (بدون وحدة تُعتبر k).";
   if (codec === "av1" && method === "crf") return "أرسل قيمة CRF من 0 إلى 63، مثل 28 أو 35.";
@@ -1380,6 +1120,10 @@ function encodeMethodPrompt(codec, method) {
   }
   return "أرسل معدل البت المستهدف، مثل 250k أو 1000k:";
 }
+
+// ---------------------------------------------------------------------------
+// الجلسات والإعدادات المحفوظة (KV)
+// ---------------------------------------------------------------------------
 
 function ok() {
   return new Response("OK", { status: 200 });
@@ -1430,17 +1174,8 @@ async function savePresetAndConfirm(env, botToken, chatId, session) {
     resolution: session.resolution || "480",
     auto_naming: session.auto_naming || "source",
     active: true,
-    denoise_filter: session.denoise_filter || FILTER_DEFAULTS.denoise_filter,
-    denoise_strength: session.denoise_strength || FILTER_DEFAULTS.denoise_strength,
-    deband_filter: session.deband_filter || FILTER_DEFAULTS.deband_filter,
-    brightness_curve: session.brightness_curve || FILTER_DEFAULTS.brightness_curve,
-    saturation_boost: session.saturation_boost || FILTER_DEFAULTS.saturation_boost,
-    sharpen_filter: session.sharpen_filter || FILTER_DEFAULTS.sharpen_filter,
-    custom_denoise: session.custom_denoise || "",
-    custom_deband: session.custom_deband || "",
-    custom_brightness: session.custom_brightness || "",
-    custom_saturation: session.custom_saturation || "",
-    custom_sharpen: session.custom_sharpen || "",
+    filter_preset: session.filter_preset || FILTER_PRESET_DEFAULT,
+    custom_filters: session.custom_filters || "",
   };
 
   if (session.auto_naming === "series") {
@@ -1456,6 +1191,10 @@ async function savePresetAndConfirm(env, botToken, chatId, session) {
     `✅ تم حفظ الإعداد وتفعيل الوضع التلقائي.\n${presetStatusText(preset)}\n⏸️ استخدم /auto_off لإيقافه.`,
   );
 }
+
+// ---------------------------------------------------------------------------
+// لوحات المفاتيح
+// ---------------------------------------------------------------------------
 
 async function promptFilename(botToken, chatId, editMessageId, defaultName, useEdit) {
   const text = defaultName
@@ -1501,105 +1240,44 @@ async function sendEncodeModeKeyboard(botToken, chatId) {
   await sendMessage(botToken, chatId, "🖼️ اختر وضع الصورة:", keyboard);
 }
 
-function denoiseFilterKeyboardMarkup() {
+function filterPresetPrompt() {
+  return (
+    "🧩 اختر تشكيلة الفلاتر الجاهزة:\n\n" +
+    "كل تشكيلة مضبوطة يدوياً حسب نوع المحتوى.\n" +
+    "التشكيلة الموصى بها للأنمي: 🌸 أنمي: متوازن."
+  );
+}
+
+function filterPresetKeyboardMarkup() {
   return {
     inline_keyboard: [
-      [{ text: "🚫 بلا تنعيم (off)", callback_data: "denoise_off" }],
-      [{ text: "⚡ سريع مكاني (hqdn3d)", callback_data: "denoise_hqdn3d" }],
-      [{ text: "🎞️ زمني (atadenoise)", callback_data: "denoise_atadenoise" }],
-      [{ text: "🌸 للأنمي (hqdn3d+atadenoise)", callback_data: "denoise_hqdn3d+atadenoise" }],
-      [{ text: "💎 أعلى جودة (nlmeans)", callback_data: "denoise_nlmeans" }],
+      [{ text: "🌸 أنمي: متوازن (موصى به)", callback_data: "fpreset_anime-balanced" }],
+      [{ text: "🎨 أنمي: ألوان حية وساطعة", callback_data: "fpreset_anime-vibrant" }],
+      [{ text: "💎 أنمي: جودة سينمائية فائقة", callback_data: "fpreset_anime-cinematic" }],
+      [{ text: "🎬 أفلام ومسلسلات: متوازن", callback_data: "fpreset_movie-balanced" }],
+      [{ text: "🔥 أفلام: ألوان غنية وعميقة", callback_data: "fpreset_movie-vibrant" }],
+      [{ text: "📜 ترميز الفيديوهات القديمة/الضعيفة", callback_data: "fpreset_old-restoration" }],
+      [{ text: "🧼 تنظيف خفيف جداً", callback_data: "fpreset_clean-gentle" }],
+      [{ text: "🚫 بدون فلاتر تماماً", callback_data: "fpreset_off" }],
+      [{ text: "✏️ مخصص يدوي (سلسلة FFmpeg)", callback_data: "fpreset_custom" }],
       [{ text: "🚫 إلغاء", callback_data: "cancel" }],
     ],
   };
 }
 
-function denoiseStrengthKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [{ text: "🌿 خفيف (light)", callback_data: "dstrength_light" }],
-      [{ text: "⚖️ متوسط (medium)", callback_data: "dstrength_medium" }],
-      [{ text: "🔥 قوي (strong)", callback_data: "dstrength_strong" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
+function filterPresetLabel(preset) {
+  const labels = {
+    off: "🚫 بدون فلاتر",
+    "clean-gentle": "🧼 تنظيف خفيف",
+    "anime-balanced": "🌸 أنمي: متوازن",
+    "anime-vibrant": "🎨 أنمي: ألوان حية",
+    "anime-cinematic": "💎 أنمي: سينمائي",
+    "movie-balanced": "🎬 أفلام: متوازن",
+    "movie-vibrant": "🔥 أفلام: ألوان غنية",
+    "old-restoration": "📜 ترميز فيديوهات قديمة",
+    custom: "✏️ مخصص يدوي",
   };
-}
-
-function debandFilterKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [{ text: "🚫 بلا (off)", callback_data: "deband_off" }],
-      [{ text: "⚡ بسيط (deband)", callback_data: "deband_deband" }],
-      [{ text: "🎨 ذكي (gradfun)", callback_data: "deband_gradfun" }],
-      [{ text: "💎 الأقوى (deband+gradfun)", callback_data: "deband_deband+gradfun" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-}
-
-function brightnessKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [{ text: "🚫 بلا (off)", callback_data: "bright_off" }],
-      [{ text: "⚡ سريع (eq)", callback_data: "bright_eq" }],
-      [{ text: "🌤️ خفيف (curves-light)", callback_data: "bright_curves-light" }],
-      [{ text: "☀️ متوسط (curves-medium)", callback_data: "bright_curves-medium" }],
-      [{ text: "🔥 قوي (curves-strong)", callback_data: "bright_curves-strong" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-}
-
-function saturationKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [{ text: "🚫 بلا (off)", callback_data: "sat_off" }],
-      [{ text: "⚡ موحد (eq)", callback_data: "sat_eq" }],
-      [{ text: "🎨 متوازن (colorbalance)", callback_data: "sat_colorbalance" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-}
-
-function sharpenKeyboardMarkup() {
-  return {
-    inline_keyboard: [
-      [{ text: "🚫 بلا (off)", callback_data: "sharp_off" }],
-      [{ text: "🌸 متكيف (cas)", callback_data: "sharp_cas" }],
-      [{ text: "🎬 خطي (unsharp)", callback_data: "sharp_unsharp" }],
-      [{ text: "🚫 إلغاء", callback_data: "cancel" }],
-    ],
-  };
-}
-
-function customFiltersKeyboardMarkup(session = {}) {
-  const rows = [];
-  const fields = [
-    ["denoise", "🎨 تنعيم مخصص"],
-    ["deband", "🎨 بانديج مخصص"],
-    ["brightness", "🎨 سطوع مخصص"],
-    ["saturation", "🎨 تشبع مخصص"],
-    ["sharpen", "🎨 حدة مخصصة"],
-  ];
-
-  for (const [key, label] of fields) {
-    const current = session[`custom_${key}`];
-    let text;
-    if (current) {
-      const preview = current.length > 28 ? current.slice(0, 25) + "..." : current;
-      text = `${label}: ${preview}`;
-      if (text.length > 60) text = text.slice(0, 57) + "...";
-    } else {
-      text = label;
-    }
-    rows.push([{ text, callback_data: `custom_edit_${key}` }]);
-  }
-
-  rows.push([{ text: "✅ تم", callback_data: "custom_done" }]);
-  rows.push([{ text: "⏭️ تخطي الفلاتر المخصصة", callback_data: "custom_skip" }]);
-  rows.push([{ text: "🚫 إلغاء", callback_data: "cancel" }]);
-
-  return { inline_keyboard: rows };
+  return labels[preset] || preset;
 }
 
 function cancelOnlyKeyboardMarkup() {
@@ -1654,6 +1332,10 @@ async function sendQualityKeyboard(botToken, chatId, resolutions) {
   rows.push([{ text: "🚫 إلغاء", callback_data: "cancel" }]);
   await sendMessage(botToken, chatId, "🎯 اختر الدقة النهائية:", { inline_keyboard: rows });
 }
+
+// ---------------------------------------------------------------------------
+// تيليجرام
+// ---------------------------------------------------------------------------
 
 async function sendTelegram(botToken, method, body) {
   const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
