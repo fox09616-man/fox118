@@ -54,8 +54,10 @@ on:
         description: 'معدل الإطارات: 23.976 أو 24000/1001 للأنمي، 25 للبث الأوروبي، 30 أو 29.97 للبث الأمريكي، أو auto للإبقاء على معدل المصدر.'
         required: true
         default: '23.976'
+
+      # ============ تشكيلات الفلاتر الجاهزة (أسماء عربية متوافقة مع البوت) ============
       filter_preset:
-        description: 'اختر تشكيلة الفلاتر الجاهزة بالأسماء المعبّرة أو الوضع اليدوي custom.'
+        description: 'اختر تشكيلة الفلاتر الجاهزة أو الوضع اليدوي custom.'
         required: true
         default: 'anime-balanced'
         type: choice
@@ -223,10 +225,7 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      # ============================================================
-      # ✅ كود التحميل الأصلي كما كان (بدون أي تعديل)
-      # ============================================================
-      - name: تحميل الفيديو المصدر (نظام شامل متعدد المستويات)
+      - name: تحميل الفيديو المصدر
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -238,9 +237,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 1. رسالة تيليجرام
           if [ -n "$MESSAGE_ID" ]; then
-            echo "📥 رسالة تيليجرام..."
+            echo "Downloading from Telegram message..."
             python3 <<'PYEOF'
           import asyncio, os, sys
           from telethon import TelegramClient
@@ -250,363 +248,49 @@ jobs:
               await client.start(bot_token=os.environ["BOT_TOKEN"])
               async with client:
                   message = await client.get_messages(int(os.environ["SOURCE_CHAT_ID"]), ids=int(os.environ["MESSAGE_ID"]))
-                  if message is None or not message.media: sys.exit("لا يوجد فيديو")
+                  if message is None or not message.media:
+                      sys.exit("Video not found.")
                   await client.download_media(message, file="raw_input.mp4")
           asyncio.run(main())
           PYEOF
 
-          # 2. رابط تيليجرام
-          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
-            echo "📥 رابط تيليجرام..."
-            python3 <<'PYEOF'
+          elif [ -n "$VIDEO_URL" ]; then
+            echo "Downloading from URL..."
+            if [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
+              python3 <<'PYEOF'
           import asyncio, os, sys, re
           from telethon import TelegramClient
           from telethon.sessions import StringSession
+          from telethon.tl.types import PeerChannel
           async def main():
               client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
               await client.start()
               url = os.environ["VIDEO_URL"]
               async with client:
-                  try:
-                      if re.search(r'\.(mp4|mkv|avi|mov|webm)$', url, re.IGNORECASE):
-                          await client.download_file(url, file="raw_input.mp4")
-                      else:
-                          entity = await client.get_entity(url)
-                          async for message in client.iter_messages(entity, limit=10):
-                              if message.media and hasattr(message.media, 'document'):
-                                  await client.download_media(message, file="raw_input.mp4"); break
-                          else: sys.exit("لا يوجد فيديو")
-                  except Exception as e:
-                      match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', url)
-                      if match:
-                          entity = await client.get_entity(match.group(1))
-                          message = await client.get_messages(entity, ids=int(match.group(2)))
-                          if message and message.media: await client.download_media(message, file="raw_input.mp4")
-                          else: sys.exit("لا يوجد فيديو")
-                      else: sys.exit(f"فشل: {e}")
+                  match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', url)
+                  if match:
+                      ident = match.group(1); msg_id = int(match.group(2))
+                      try:
+                          entity = await client.get_entity(PeerChannel(int(ident)) if ident.isdigit() else ident)
+                          message = await client.get_messages(entity, ids=msg_id)
+                          if message and message.media:
+                              await client.download_media(message, file="raw_input.mp4"); return
+                      except Exception as e:
+                          sys.exit(f"Failed: {e}")
+                  sys.exit("Unsupported URL")
           asyncio.run(main())
           PYEOF
-
-          # 3. رابط مباشر
-          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts|m3u8)(\?.*)?$ ]]; then
-            echo "📥 رابط مباشر..."
-            curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
-
-          # 4. نظام شامل مع تشخيص كامل
-          elif [ -n "$VIDEO_URL" ]; then
-            echo "📥 نظام شامل (تشخيص مفصل)..."
-            python3 <<'PYEOF'
-          import os, sys, re, json, base64, subprocess, shutil, time
-          import requests
-          from bs4 import BeautifulSoup
-          from urllib.parse import urljoin, urlparse, unquote
-
-          try:
-              from curl_cffi import requests as cffi_requests
-              HAS_CFFI = True
-              print("✅ curl_cffi متاح")
-          except ImportError:
-              HAS_CFFI = False
-              print("❌ curl_cffi غير متاح")
-
-          try:
-              from playwright.sync_api import sync_playwright
-              HAS_PLAYWRIGHT = True
-              print("✅ Playwright متاح")
-          except ImportError:
-              HAS_PLAYWRIGHT = False
-              print("❌ Playwright غير متاح")
-
-          url = os.environ["VIDEO_URL"]
-          print(f"\n{'='*60}\nURL: {url}\n{'='*60}")
-
-          USER_AGENTS = [
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          ]
-
-          def make_headers(ua_idx=0, ref=True):
-              h = {
-                  'User-Agent': USER_AGENTS[ua_idx % len(USER_AGENTS)],
-                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                  'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-                  'Accept-Encoding': 'gzip, deflate, br',
-                  'Connection': 'keep-alive',
-                  'Upgrade-Insecure-Requests': '1',
-              }
-              if ref: h['Referer'] = url
-              return h
-
-          # ========== الخطوة 1: تحميل الصفحة ==========
-          print("\n[1] تحميل الصفحة...")
-          html = ""
-          if HAS_CFFI:
-              try:
-                  print("  🔄 curl_cffi (impersonate=chrome120)...")
-                  r = cffi_requests.get(url, impersonate="chrome120", timeout=30)
-                  print(f"     Status: {r.status_code} | Length: {len(r.text)}")
-                  if r.status_code == 200 and len(r.text) > 500:
-                      html = r.text
-                      print("     ✅ نجح")
-              except Exception as e:
-                  print(f"     ❌ {str(e)[:150]}")
-
-          if not html:
-              for i in range(3):
-                  try:
-                      print(f"  🔄 requests (attempt {i+1})...")
-                      r = requests.get(url, headers=make_headers(i), timeout=30, allow_redirects=True)
-                      print(f"     Status: {r.status_code} | Length: {len(r.text)}")
-                      if r.status_code == 200 and len(r.text) > 500:
-                          html = r.text
-                          print("     ✅ نجح")
-                          break
-                  except Exception as e:
-                      print(f"     ❌ {str(e)[:150]}")
-                  time.sleep(2)
-
-          if not html:
-              print("  ❌ فشل تحميل الصفحة")
-
-          if html:
-              with open('debug_page.html', 'w', encoding='utf-8') as f:
-                  f.write(html)
-              print(f"  💾 تم حفظ الصفحة ({len(html)} حرف)")
-              print(f"\n  📄 عينة من الصفحة:\n{html[:500]}...\n")
-              indicators = {
-                  'm3u8': html.lower().count('m3u8'),
-                  'mp4': html.lower().count('.mp4'),
-                  '.ts': html.lower().count('.ts'),
-                  'video': html.lower().count('video'),
-                  'player': html.lower().count('player'),
-                  'jwplayer': html.lower().count('jwplayer'),
-                  'hls': html.lower().count('hls'),
-                  'cloudflare': html.lower().count('cloudflare'),
-                  'recaptcha': html.lower().count('recaptcha'),
-              }
-              print("  🔍 مؤشرات في الصفحة:")
-              for k, v in indicators.items():
-                  print(f"     {k}: {v}")
-
-          # ========== الخطوة 2: استخراج المدة ==========
-          exp_dur = 0
-          if html:
-              print("\n[2] استخراج المدة المتوقعة...")
-              for p in [r'"duration"\s*:\s*"?(\d+(?:\.\d+)?)"?',
-                        r'"durationSeconds"\s*:\s*"?(\d+)"?',
-                        r'"videoDuration"\s*:\s*"?(\d+)"?']:
-                  m = re.findall(p, html, re.IGNORECASE)
-                  if m:
-                      try:
-                          v = int(float(m[0]))
-                          if 30 < v < 86400:
-                              exp_dur = v
-                              print(f"     ✅ من JSON: {v}s")
-                              break
-                      except: pass
-              if not exp_dur:
-                  for m in re.findall(r'itemprop=["\']duration["\'][^>]*content=["\']([^"\']+)["\']', html, re.IGNORECASE):
-                      mm = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?', m, re.IGNORECASE)
-                      if mm:
-                          v = int(mm.group(1) or 0)*3600 + int(mm.group(2) or 0)*60 + int(float(mm.group(3) or 0))
-                          if 30 < v < 86400:
-                              exp_dur = v
-                              print(f"     ✅ من itemprop: {v}s")
-                              break
-              if not exp_dur:
-                  for m in re.findall(r'(\d{1,2}:\d{2}(?::\d{2})?)', html):
-                      parts = m.split(':')
-                      try:
-                          if len(parts) == 2: v = int(parts[0])*60 + int(parts[1])
-                          elif len(parts) == 3: v = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
-                          else: continue
-                          if v > 60:
-                              exp_dur = v
-                              print(f"     ✅ من نص: {v}s")
-                              break
-                      except: pass
-              if not exp_dur:
-                  print("     ❌ لم يتم العثور على مدة")
-
-          # ========== الخطوة 3: استخراج الروابط ==========
-          all_urls = []
-          if html:
-              print("\n[3] استخراج الروابط من HTML...")
-              soup = BeautifulSoup(html, 'html.parser')
-
-              for tag in soup.find_all(['video', 'source', 'audio']):
-                  for a in ['src', 'data-src', 'data-url', 'data-source', 'data-video']:
-                      val = tag.get(a)
-                      if val and isinstance(val, str):
-                          if val.startswith('//'): val = 'https:' + val
-                          elif val.startswith('/'): val = urljoin(url, val)
-                          if val.startswith('http'):
-                              all_urls.append(val)
-
-              for meta in soup.find_all('meta'):
-                  prop = (meta.get('property') or meta.get('name') or '').lower()
-                  if prop in ('og:video','og:video:url','og:video:secure_url','twitter:player:stream','video:url'):
-                      c = meta.get('content')
-                      if c and isinstance(c, str):
-                          if c.startswith('//'): c = 'https:' + c
-                          if c.startswith('http'): all_urls.append(c)
-
-              for a in soup.find_all('a', href=True):
-                  href = a['href']
-                  if href.startswith('http') and re.search(r'\.(mp4|m3u8|mpd|webm|flv|ts)', href, re.IGNORECASE):
-                      all_urls.append(href)
-
-              for p in [
-                  r'["\']((?:https?:)?//[^"\']+\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv)[^"\']*)["\']',
-                  r'(?:videoUrl|video_url|videoURL|videoSrc|video_src|sourceUrl|playUrl|mediaUrl|streamUrl|hlsUrl|dashUrl|file|src)\s*[:=]\s*["\']([^"\']+)["\']',
-                  r'data-(?:video|src|url|source|stream|file|hls|dash)\s*=\s*["\']([^"\']+)["\']',
-              ]:
-                  for m in re.findall(p, html, re.IGNORECASE):
-                      if isinstance(m, tuple): m = m[0] if m else ''
-                      if not isinstance(m, str) or not m.strip(): continue
-                      m = m.strip()
-                      if m.startswith('//'): m = 'https:' + m
-                      elif m.startswith('/'): m = urljoin(url, m)
-                      if m.startswith('http'): all_urls.append(m)
-
-              for p in [r'base64,([A-Za-z0-9+/=]{20,})', r'atob\(["\']([A-Za-z0-9+/=]{20,})["\']\)']:
-                  for m in re.findall(p, html):
-                      try:
-                          d = base64.b64decode(m).decode('utf-8', errors='ignore')
-                          for dm in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|mpd|webm|flv|ts)[^\s"\'<>]*', d):
-                              all_urls.append(dm)
-                      except: pass
-
-              all_urls = list(set([u for u in all_urls if u.startswith('http')]))
-              print(f"     🔗 تم العثور على {len(all_urls)} رابط")
-              for u in all_urls[:15]:
-                  print(f"       - {u[:120]}")
-
-          # ========== الخطوة 4: Playwright ==========
-          if HAS_PLAYWRIGHT and len(all_urls) < 5:
-              print("\n[4] تشغيل Playwright (لاكتشاف الشبكة)...")
-              try:
-                  with sync_playwright() as p:
-                      print("  🔄 فتح Chromium...")
-                      browser = p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage'])
-                      ctx = browser.new_context(user_agent=USER_AGENTS[0], viewport={'width':1920,'height':1080}, ignore_https_errors=True)
-                      page = ctx.new_page()
-
-                      captured = []
-                      def on_response(response):
-                          try:
-                              u = response.url
-                              ct = response.headers.get('content-type', '')
-                              if any(x in ct for x in ['video/', 'mpegurl', 'dash+xml']):
-                                  captured.append(u)
-                                  print(f"     🎯 شبكة (ct): {u[:120]}")
-                              elif re.search(r'\.(mp4|m3u8|mpd|webm|flv|ts)(\?|$)', u, re.IGNORECASE):
-                                  captured.append(u)
-                                  print(f"     🎯 شبكة (url): {u[:120]}")
-                          except: pass
-
-                      page.on('response', on_response)
-
-                      print("  🔄 تحميل الصفحة...")
-                      try:
-                          page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                      except Exception as e:
-                          print(f"     ⚠️ {str(e)[:100]}")
-
-                      print("  🔄 انتظار 10 ثوانٍ...")
-                      page.wait_for_timeout(10000)
-
-                      print("  🔄 محاولة تشغيل الفيديو...")
-                      try:
-                          page.evaluate("""() => {
-                              const v = document.querySelector('video');
-                              if (v) { v.muted = true; v.play().catch(()=>{}); }
-                              const iframes = document.querySelectorAll('iframe');
-                              iframes.forEach(f => { try { f.contentDocument && f.contentDocument.querySelectorAll('video').forEach(v => {v.muted=true; v.play().catch(()=>{});}); } catch(e){} });
-                          }""")
-                          page.wait_for_timeout(8000)
-                      except Exception as e:
-                          print(f"     ⚠️ {str(e)[:100]}")
-
-                      print(f"  📊 روابط الشبكة: {len(captured)}")
-                      all_urls.extend(captured)
-                      all_urls = list(set(all_urls))
-
-                      print(f"  📊 الإجمالي بعد Playwright: {len(all_urls)}")
-
-                      browser.close()
-              except Exception as e:
-                  print(f"  ❌ Playwright فشل: {str(e)[:200]}")
-
-          # ========== الخطوة 5: التجربة ==========
-          if all_urls:
-              print(f"\n[5] تجربة {len(all_urls)} رابط...")
-              hls_urls = [u for u in all_urls if re.search(r'\.(m3u8|mpd)', u, re.IGNORECASE)]
-              other_urls = [u for u in all_urls if u not in hls_urls]
-              print(f"  📺 HLS: {len(hls_urls)} | 🎬 مباشرة: {len(other_urls)}")
-
-              for idx, hls_url in enumerate(hls_urls):
-                  print(f"\n  🔄 HLS [{idx+1}]: {hls_url[:100]}")
-                  try:
-                      h = make_headers(0, True)
-                      headers_str = '\r\n'.join([f'{k}: {v}' for k, v in h.items()])
-                      cmd = ['ffmpeg', '-y', '-loglevel', 'error',
-                             '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-                             '-headers', headers_str, '-user_agent', h['User-Agent'],
-                             '-i', hls_url, '-c', 'copy', '-bsf:a', 'aac_adtstoasc',
-                             'raw_input.mp4']
-                      r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-                      if r.returncode == 0 and os.path.exists('raw_input.mp4') and os.path.getsize('raw_input.mp4') > 500000:
-                          fd = int(float(subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','csv=p=0','raw_input.mp4'], capture_output=True, text=True).stdout.strip() or 0))
-                          fs = os.path.getsize('raw_input.mp4')
-                          print(f"     ✅ نجح: {fd}s | {fs}B")
-                          if fd > 60:
-                              sys.exit(0)
-                          os.remove('raw_input.mp4')
-                      else:
-                          print(f"     ❌ فشل (rc={r.returncode})")
-                          if r.stderr: print(f"     {r.stderr[:150]}")
-                  except Exception as e:
-                      print(f"     ❌ {str(e)[:100]}")
-
-              for idx, vu in enumerate(other_urls):
-                  print(f"\n  🔄 Direct [{idx+1}]: {vu[:100]}")
-                  try:
-                      for ua_idx in range(2):
-                          h = make_headers(ua_idx, ua_idx > 0)
-                          r = requests.get(vu, headers=h, timeout=(30, 1800), stream=True, allow_redirects=True)
-                          if r.status_code == 200:
-                              total = int(r.headers.get('content-length', 0))
-                              ct = r.headers.get('content-type','')
-                              print(f"     Status: {r.status_code} | Size: {total}B | CT: {ct[:50]}")
-                              if total > 0 and total < 50000: break
-                              with open('raw_input.mp4', 'wb') as f:
-                                  for chunk in r.iter_content(chunk_size=262144):
-                                      if chunk: f.write(chunk)
-                              if os.path.getsize('raw_input.mp4') > 500000:
-                                  fd = int(float(subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','csv=p=0','raw_input.mp4'], capture_output=True, text=True).stdout.strip() or 0))
-                                  fs = os.path.getsize('raw_input.mp4')
-                                  print(f"     ✅ نجح: {fd}s | {fs}B")
-                                  if fd > 60:
-                                      sys.exit(0)
-                                  os.remove('raw_input.mp4')
-                              else:
-                                  os.remove('raw_input.mp4')
-                              break
-                  except Exception as e:
-                      print(f"     ❌ {str(e)[:100]}")
-
-          print("\n❌ فشل كل شيء")
-          sys.exit(1)
-          PYEOF
+            elif [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$ ]]; then
+              curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
+            else
+              yt-dlp --no-playlist -o raw_input.mp4 "$VIDEO_URL" || { echo 'Download failed' >&2; exit 1; }
+            fi
           else
-            echo '❌ لا يوجد مدخل' >&2
-            exit 1
+            echo 'No message or URL provided.' >&2; exit 1
           fi
 
-          if [ ! -s raw_input.mp4 ]; then echo "❌ فشل" >&2; exit 1; fi
-          echo "✅ الحجم: $(stat -c%s raw_input.mp4) بايت"
-          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 raw_input.mp4 >/dev/null
+          [ -s raw_input.mp4 ] || { echo "Download failed" >&2; exit 1; }
+          echo "File size: $(stat -c%s raw_input.mp4) bytes"
 
       - name: فحص المصدر التفصيلي
         id: probe_source
@@ -1029,14 +713,20 @@ jobs:
             fi
           fi
 
+          # ============================================================
+          # بناء سلسلة الفلاتر الأساسية
+          # ============================================================
           FILTERS=("setpts=PTS-STARTPTS")
 
           [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
 
           if [ "$RESOLUTION" != "auto" ]; then
-            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
+            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_pos")
           fi
 
+          # ============================================================
+          # فلاتر التشكيلة المختارة (محدثة بالكامل ومتوافقة مع البوت)
+          # ============================================================
           FILTERS_EXTRA=()
 
           if [ "$ENCODE_MODE" = "filters" ]; then
@@ -1056,7 +746,7 @@ jobs:
               anime-balanced)
                 echo "Preset: anime-balanced"
                 FILTERS_EXTRA+=("hqdn3d=2.0:1.5:3.0:2.0")
-                FILTERS_EXTRA+=("atadenoise=s0=0:s1=0:s2=0:p=0.02:v=0.04")
+                FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.02:v=0.04")
                 FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
                 FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
                 FILTERS_EXTRA+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02")
@@ -1075,7 +765,6 @@ jobs:
               anime-cinematic)
                 echo "Preset: anime-cinematic"
                 FILTERS_EXTRA+=("nlmeans=s=1.0:p=7:r=15:rc=3")
-                FILTERS_EXTRA+=("atadenoise=s0=0:s1=0:s2=0:p=0.02:v=0.04")
                 FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
                 FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
                 FILTERS_EXTRA+=("curves=all='0/0 0.08/0.20 0.25/0.42 0.5/0.65 1/1'")
@@ -1103,7 +792,7 @@ jobs:
               old-restoration)
                 echo "Preset: old-restoration"
                 FILTERS_EXTRA+=("hqdn3d=3.0:2.0:4.0:3.0")
-                FILTERS_EXTRA+=("atadenoise=s0=0:s1=0:s2=0:p=0.04:v=0.08")
+                FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.04:v=0.08")
                 FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
                 FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
                 FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
@@ -1133,6 +822,9 @@ jobs:
 
           fi
 
+          # ============================================================
+          # معالجة الألوان
+          # ============================================================
           COLOR_ARGS=()
           OUT_PIX_FMT="yuv420p10le"
 
@@ -1152,21 +844,10 @@ jobs:
             )
           elif [ "$IS_BT2020" = "true" ]; then
             echo "BT.2020 SDR source: keeping wide gamut"
-
-            case "$SRC_TRANSFER" in
-              ""|unknown|unspecified|reserved)
-                SAFE_TRC="bt709"
-                echo "color_transfer empty/unknown -> using $SAFE_TRC"
-                ;;
-              *)
-                SAFE_TRC="$SRC_TRANSFER"
-                ;;
-            esac
-
             COLOR_ARGS=(
               -colorspace bt2020nc
               -color_primaries bt2020
-              -color_trc "$SAFE_TRC"
+              -color_trc "$SRC_TRANSFER"
             )
           else
             echo "SDR BT.709 source"
@@ -1199,7 +880,10 @@ jobs:
 
           SVT_BASE="tune=0:enable-qm=1:qm-min=0:lp=${THREADS_PER_WORKER}"
 
-          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "off" ]; then
+          # film-grain يُفعّل تلقائياً إذا لم تكن التشكيلة فارغة أو تنظيفاً خفيفاً
+          if [ "$ENCODE_MODE" = "filters" ] && \
+             [ "$FILTER_PRESET" != "off" ] && \
+             [ "$FILTER_PRESET" != "clean-gentle" ]; then
             SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
           fi
 
@@ -1612,21 +1296,16 @@ jobs:
 
           RAW="${FILENAME:-}"
           RAW=$(printf '%s' "$RAW" | tr -d '\000-\010\013\014\016-\037\r\n\t')
-          export RAW
 
-          DISPLAY_NAME=$(python3 <<'PYEOF'
-import os, unicodedata
-
-s = os.environ.get("RAW", "")
-
+          DISPLAY_NAME=$(printf '%s' "$RAW" | python3 -c "
+import sys, unicodedata
+s = sys.stdin.read()
 strip = set()
 for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
           list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
     strip.add(chr(cp))
 s = ''.join(ch for ch in s if ch not in strip)
-
 s = unicodedata.normalize('NFC', s)
-
 def is_letter(c): return unicodedata.category(c).startswith('L')
 def is_digit(c):  return unicodedata.category(c).startswith('N')
 def is_allowed(c):
@@ -1634,7 +1313,6 @@ def is_allowed(c):
     if c in ' _-.()[]': return True
     if unicodedata.category(c) == 'Zs': return True
     return False
-
 out = []
 for i, c in enumerate(s):
     if is_allowed(c):
@@ -1644,15 +1322,12 @@ for i, c in enumerate(s):
         nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
         if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
             out.append(' ')
-
 s = ''.join(out)
 s = ' '.join(s.split())
-while '..' in s:
-    s = s.replace('..', '.')
+while '..' in s: s = s.replace('..', '.')
 s = s.strip('.')
-print(s[:100], end='')
-PYEOF
-)
+sys.stdout.write(s[:100])
+")
 
           [ -z "$DISPLAY_NAME" ] && DISPLAY_NAME="video"
 
