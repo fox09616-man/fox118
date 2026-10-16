@@ -21,9 +21,7 @@ const AUTH_LOCK_SECONDS = 900;
 const SESSION_TTL_SECONDS = 3600;
 const MAX_NAME_LENGTH = 120;
 
-// ============================================================================
 // خيارات الفلاتر — يجب أن تطابق workflow_dispatch inputs في compress.yml
-// ============================================================================
 const DENOISE_FILTERS = ["off", "hqdn3d", "atadenoise", "hqdn3d+atadenoise", "nlmeans"];
 const DENOISE_STRENGTHS = ["light", "medium", "strong"];
 const DEBAND_FILTERS = ["off", "deband", "gradfun", "deband+gradfun"];
@@ -31,7 +29,6 @@ const BRIGHTNESS_CURVES = ["off", "eq", "curves-light", "curves-medium", "curves
 const SATURATION_BOOSTS = ["off", "eq", "colorbalance"];
 const SHARPEN_FILTERS = ["off", "cas", "unsharp"];
 
-// الافتراضيات للأنمي
 const FILTER_DEFAULTS = {
   denoise_filter: "hqdn3d+atadenoise",
   denoise_strength: "medium",
@@ -46,11 +43,8 @@ const FILTER_DEFAULTS = {
   custom_sharpen: "",
 };
 
-// القيم المسموحة للفلاتر المخصصة (تسمح بـ = : ' " / + - . _ والأرقام والمسافات داخل الاقتباسات)
 const CUSTOM_FILTER_RE = /^[a-zA-Z][a-zA-Z0-9_]*=.+$/;
 
-// امتدادات الوسائط فقط. لا نحذف أي "امتداد" عشوائي حتى لا نخسر أجزاء من الاسم
-// مثل ".E01" في "Show S02.E01" أو ".0" في "Movie 2.0".
 const MEDIA_EXT_RE =
   /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mts|vob|3gp|3g2|ogv|mpeg|mpg|m3u8|mp3|m4a|aac|opus|ogg|wav|flac)$/i;
 
@@ -101,10 +95,6 @@ export default {
     return ok();
   },
 };
-
-// ---------------------------------------------------------------------------
-// المعالجات الرئيسية
-// ---------------------------------------------------------------------------
 
 function isVideoMessage(message) {
   return Boolean(
@@ -277,7 +267,6 @@ async function handleText(env, cfg, message) {
     return;
   }
 
-  // ============ مدخلات الفلتر المخصص ============
   if (session.awaiting_custom_filter_text) {
     const field = session.awaiting_custom_filter_text;
     const value = String(text).trim();
@@ -323,7 +312,6 @@ async function handleText(env, cfg, message) {
     return;
   }
 
-  // ============ مدخلات الإعداد النصية ============
   if (session.awaiting_series_title) {
     const seriesTitle = cleanFileName(text);
     if (!seriesTitle) {
@@ -484,16 +472,16 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ المرمّز ============
   if (data.startsWith("codec_")) {
     const codec = data.split("_")[1];
     if (!["av1", "audio"].includes(codec)) return;
 
     session.codec = codec;
     if (codec === "audio") {
+      // لا نرسل قيمًا غير موجودة في YAML؛ نستخدم قيمًا صحيحة تُهمل عند audio
       session.encode_mode = "audio";
-      session.preset = "none";
-      session.encode_method = "audio";
+      session.preset = "6";
+      session.encode_method = "crf";
       session.awaiting_target_value = true;
       await setSession(env, chatId, session);
       await editMessage(cfg.botToken, chatId, messageId, "أرسل معدل بت الصوت (من 6k إلى 510k)، مثال: 32k أو 48k:");
@@ -505,7 +493,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ وضع الصورة ============
   if (data.startsWith("mode_")) {
     const mode = data.split("_")[1];
     if (!["filters", "nofilters"].includes(mode)) return;
@@ -522,7 +509,6 @@ async function handleCallback(env, cfg, query) {
         denoiseFilterKeyboardMarkup(),
       );
     } else {
-      // بدون فلاتر: تعيين الكل إلى off
       Object.assign(session, {
         denoise_filter: "off",
         denoise_strength: "medium",
@@ -543,7 +529,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ التنعيم ============
   if (data.startsWith("denoise_")) {
     const filter = data.slice("denoise_".length);
     if (!DENOISE_FILTERS.includes(filter)) return;
@@ -572,7 +557,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ شدة التنعيم ============
   if (data.startsWith("dstrength_")) {
     const strength = data.slice("dstrength_".length);
     if (!DENOISE_STRENGTHS.includes(strength)) return;
@@ -588,7 +572,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ البانديج ============
   if (data.startsWith("deband_")) {
     const filter = data.slice("deband_".length);
     if (!DEBAND_FILTERS.includes(filter)) return;
@@ -604,7 +587,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ السطوع ============
   if (data.startsWith("bright_")) {
     const curve = data.slice("bright_".length);
     if (!BRIGHTNESS_CURVES.includes(curve)) return;
@@ -620,7 +602,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ التشبع ============
   if (data.startsWith("sat_")) {
     const boost = data.slice("sat_".length);
     if (!SATURATION_BOOSTS.includes(boost)) return;
@@ -636,7 +617,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ الحدة ============
   if (data.startsWith("sharp_")) {
     const filter = data.slice("sharp_".length);
     if (!SHARPEN_FILTERS.includes(filter)) return;
@@ -652,7 +632,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ الفلاتر المخصصة ============
   if (data === "custom_skip") {
     Object.assign(session, {
       custom_denoise: "",
@@ -701,7 +680,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ طريقة الترميز ============
   if (data.startsWith("encmethod_")) {
     const method = data.split("_")[1];
     if (!isValidEncodeMethod(session.codec, method)) return;
@@ -747,7 +725,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ التسمية التلقائية ============
   if (data === "autoname_keep") {
     session.auto_naming = "source";
     delete session.series_title;
@@ -771,7 +748,6 @@ async function handleCallback(env, cfg, query) {
     return;
   }
 
-  // ============ الدقة ============
   if (data === "custom_res") {
     session.awaiting_res = true;
     await setSession(env, chatId, session);
@@ -804,10 +780,6 @@ async function handleCallback(env, cfg, query) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// أدوات الأمان
-// ---------------------------------------------------------------------------
-
 function safeEqual(a, b) {
   const encoder = new TextEncoder();
   const x = encoder.encode(String(a));
@@ -819,10 +791,6 @@ function safeEqual(a, b) {
   }
   return diff === 0;
 }
-
-// ---------------------------------------------------------------------------
-// الروابط والأسماء
-// ---------------------------------------------------------------------------
 
 function isAnyLink(text) {
   return /^https?:\/\/\S+$/i.test(text);
@@ -893,16 +861,11 @@ function formatEpisode(value) {
   return String(Number.parseInt(value, 10)).padStart(2, "0");
 }
 
-// صوت مسار AV1 ثابت: Opus بمعدل 16k أحادي.
 const VIDEO_AUDIO_LABEL = "Opus 16k أحادي";
 
 function resolutionText(resolution) {
   return resolution === "auto" ? "نفس جودة الفيديو الأصلية" : `${resolution}p (بلا رفع إن كان المصدر أقل)`;
 }
-
-// ---------------------------------------------------------------------------
-// الوضع التلقائي وحجز أرقام الحلقات
-// ---------------------------------------------------------------------------
 
 async function reserveAutoName(env, chatId, preset, sourceName) {
   if (
@@ -964,10 +927,6 @@ async function runAutomatic(env, cfg, chatId, preset, source, sourceName, label)
   await sendMessage(cfg.botToken, chatId, `${label}: ${name}`);
   await finalizeAndTrigger(env, cfg, chatId, autoSession, false);
 }
-
-// ---------------------------------------------------------------------------
-// التأكيد والإرسال
-// ---------------------------------------------------------------------------
 
 function confirmKeyboardMarkup() {
   return {
@@ -1054,7 +1013,7 @@ async function triggerGitHub(cfg, session, chatId) {
       chat_id: String(chatId),
       filename: session.filename || "video",
       codec: session.codec || "av1",
-      preset: session.preset || "8",
+      preset: session.preset || "6",
       encode_mode: session.encode_mode || "nofilters",
       encode_method: session.encode_method || "crf",
       target_value: String(session.target_value || "28"),
@@ -1107,12 +1066,7 @@ async function triggerGitHub(cfg, session, chatId) {
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// النصوص والملخصات
-// ---------------------------------------------------------------------------
-
 function filtersActive(session) {
-  // هل هناك أي فلتر فعّال (ليس off)؟
   return (
     (session.denoise_filter && session.denoise_filter !== "off") ||
     (session.deband_filter && session.deband_filter !== "off") ||
@@ -1260,10 +1214,6 @@ function startMessage(preset) {
     .join("\n");
 }
 
-// ---------------------------------------------------------------------------
-// التحقق من القيم
-// ---------------------------------------------------------------------------
-
 function isValidPreset(codec, value) {
   if (codec === "av1") return /^(?:[0-9]|1[0-3])$/.test(value);
   return codec === "audio";
@@ -1271,7 +1221,7 @@ function isValidPreset(codec, value) {
 
 function isValidEncodeMethod(codec, method) {
   if (codec === "av1") return ["crf", "twopass", "auto"].includes(method);
-  if (codec === "audio") return method === "audio";
+  if (codec === "audio") return method === "audio" || method === "crf";
   return false;
 }
 
@@ -1431,10 +1381,6 @@ function encodeMethodPrompt(codec, method) {
   return "أرسل معدل البت المستهدف، مثل 250k أو 1000k:";
 }
 
-// ---------------------------------------------------------------------------
-// الجلسات والإعدادات المحفوظة (KV)
-// ---------------------------------------------------------------------------
-
 function ok() {
   return new Response("OK", { status: 200 });
 }
@@ -1478,7 +1424,7 @@ async function savePresetAndConfirm(env, botToken, chatId, session) {
   const preset = {
     codec: session.codec || "av1",
     encode_mode: session.encode_mode || "nofilters",
-    preset: session.preset || "8",
+    preset: session.preset || "6",
     encode_method: session.encode_method || "crf",
     target_value: session.target_value || "28",
     resolution: session.resolution || "480",
@@ -1510,10 +1456,6 @@ async function savePresetAndConfirm(env, botToken, chatId, session) {
     `✅ تم حفظ الإعداد وتفعيل الوضع التلقائي.\n${presetStatusText(preset)}\n⏸️ استخدم /auto_off لإيقافه.`,
   );
 }
-
-// ---------------------------------------------------------------------------
-// لوحات المفاتيح
-// ---------------------------------------------------------------------------
 
 async function promptFilename(botToken, chatId, editMessageId, defaultName, useEdit) {
   const text = defaultName
@@ -1644,7 +1586,6 @@ function customFiltersKeyboardMarkup(session = {}) {
     const current = session[`custom_${key}`];
     let text;
     if (current) {
-      // احترام حد تيليجرام لطول نص الزر (64 حرف)
       const preview = current.length > 28 ? current.slice(0, 25) + "..." : current;
       text = `${label}: ${preview}`;
       if (text.length > 60) text = text.slice(0, 57) + "...";
@@ -1713,10 +1654,6 @@ async function sendQualityKeyboard(botToken, chatId, resolutions) {
   rows.push([{ text: "🚫 إلغاء", callback_data: "cancel" }]);
   await sendMessage(botToken, chatId, "🎯 اختر الدقة النهائية:", { inline_keyboard: rows });
 }
-
-// ---------------------------------------------------------------------------
-// تيليجرام
-// ---------------------------------------------------------------------------
 
 async function sendTelegram(botToken, method, body) {
   const response = await fetch(`https://api.telegram.org/bot${botToken}/${method}`, {
