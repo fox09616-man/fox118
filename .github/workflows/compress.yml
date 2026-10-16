@@ -1294,38 +1294,40 @@ jobs:
 
           RAW="${FILENAME:-}"
           RAW=$(printf '%s' "$RAW" | tr -d '\000-\010\013\014\016-\037\r\n\t')
+          export RAW
 
-          DISPLAY_NAME=$(printf '%s' "$RAW" | python3 -c "
-import sys, unicodedata
-s = sys.stdin.read()
-strip = set()
-for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
-          list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
-    strip.add(chr(cp))
-s = ''.join(ch for ch in s if ch not in strip)
-s = unicodedata.normalize('NFC', s)
-def is_letter(c): return unicodedata.category(c).startswith('L')
-def is_digit(c):  return unicodedata.category(c).startswith('N')
-def is_allowed(c):
-    if is_letter(c) or is_digit(c): return True
-    if c in ' _-.()[]': return True
-    if unicodedata.category(c) == 'Zs': return True
-    return False
-out = []
-for i, c in enumerate(s):
-    if is_allowed(c):
-        out.append(c)
-    else:
-        prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
-        nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
-        if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
-            out.append(' ')
-s = ''.join(out)
-s = ' '.join(s.split())
-while '..' in s: s = s.replace('..', '.')
-s = s.strip('.')
-sys.stdout.write(s[:100])
-")
+          DISPLAY_NAME=$(python3 <<'PYEOF'
+          import os, sys, unicodedata
+          s = os.environ.get("RAW", "")
+          strip = set()
+          for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
+                    list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
+              strip.add(chr(cp))
+          s = ''.join(ch for ch in s if ch not in strip)
+          s = unicodedata.normalize('NFC', s)
+          def is_letter(c): return unicodedata.category(c).startswith('L')
+          def is_digit(c):  return unicodedata.category(c).startswith('N')
+          def is_allowed(c):
+              if is_letter(c) or is_digit(c): return True
+              if c in ' _-.()[]': return True
+              if unicodedata.category(c) == 'Zs': return True
+              return False
+          out = []
+          for i, c in enumerate(s):
+              if is_allowed(c):
+                  out.append(c)
+              else:
+                  prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
+                  nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
+                  if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
+                      out.append(' ')
+          s = ''.join(out)
+          s = ' '.join(s.split())
+          while '..' in s: s = s.replace('..', '.')
+          s = s.strip('.')
+          sys.stdout.write(s[:100])
+          PYEOF
+          )
 
           [ -z "$DISPLAY_NAME" ] && DISPLAY_NAME="video"
 
