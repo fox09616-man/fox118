@@ -313,8 +313,8 @@ jobs:
 
           case "$COLOR_PRIMARIES" in bt2020|bt2020*) is_bt2020=true ;; esac
           case "$COLOR_TRANSFER" in
-            smpte2084|arib-std-b67) is_hdr=true ;;
-            arib-std-b67) is_hlg=true ;;
+            smpte2084)     is_hdr=true ;;
+            arib-std-b67)  is_hdr=true; is_hlg=true ;;
           esac
 
           # تحديد مستوى عمق الألوان الحقيقي
@@ -386,16 +386,17 @@ jobs:
           set -euo pipefail
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
             FFMPEG="$HOME/codec-build/bin/ffmpeg"
+            FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           else
-            FFMPEG=ffmpeg
+            FFMPEG=ffmpeg; FFPROBE=ffprobe
           fi
 
           HAS_AUDIO=$("$FFMPEG" -v error -i raw_input.mp4 -map 0:a:0 -f null - 2>&1 | \
             grep -c 'Stream.*Audio' || true)
 
           if [ "${HAS_AUDIO:-0}" -gt 0 ] || \
-             ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+             "$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name \
                -of csv=p=0 raw_input.mp4 | grep -q .; then
             echo "🎵 ضغط الصوت..."
             "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 \
@@ -411,6 +412,25 @@ jobs:
             echo "⚠️ لا يوجد صوت في المصدر"
             touch audio_compressed.opus
           fi
+
+          # --------------------------------------------------------
+          # إنشاء عيّنة صغيرة من المصدر لقياس الجودة في مرحلة الدمج
+          # (نفس النافذة الزمنية المستخدمة لاحقاً: 90s من المنتصف)
+          # --------------------------------------------------------
+          SRC_DUR=$("$FFPROBE" -v error -show_entries format=duration \
+            -of csv=p=0 raw_input.mp4 | cut -d. -f1)
+          SAMPLE_START=$(( SRC_DUR / 2 - 45 ))
+          (( SAMPLE_START < 0 )) && SAMPLE_START=0
+          SAMPLE_DUR=90
+          (( SAMPLE_START + SAMPLE_DUR > SRC_DUR )) && SAMPLE_DUR=$(( SRC_DUR - SAMPLE_START ))
+          echo "🎯 عيّنة المصدر: من ${SAMPLE_START}s لمدة ${SAMPLE_DUR}s"
+          "$FFMPEG" -hide_banner -nostdin -y \
+            -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
+            -i raw_input.mp4 \
+            -map 0:v:0 -c:v copy \
+            source_sample.mkv
+          test -s source_sample.mkv
+          echo "✅ عيّنة المصدر: $(stat -c%s source_sample.mkv) بايت"
 
       - name: تقسيم المصدر إلى أجزاء
         id: segment
@@ -490,13 +510,14 @@ jobs:
           CHUNKS_JSON=$(sed 's#^.*/chunk_##; s#\.mkv$##' /tmp/chunks.txt | jq -R . | jq -s -c .)
           echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
 
-      - name: رفع الأجزاء الخام والصوت
+      - name: رفع الأجزاء الخام والصوت وعيّنة المصدر
         uses: actions/upload-artifact@v4
         with:
           name: raw-chunks
           path: |
             chunks_raw/
             audio_compressed.opus
+            source_sample.mkv
           retention-days: 1
           if-no-files-found: error
 
@@ -669,27 +690,19 @@ jobs:
           SRC_FPS_RAW=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=avg_frame_rate -of csv=p=0 "$IN")
 
-          # تطبيع معدل الإطارات المدخل إلى كسر دقيق
-          normalize_fps() {
-            local f="$1"
-            case "$f" in
-              23.976|23.97) echo "24000/1001" ;;
-              29.97)        echo "30000/1001" ;;
-              59.94)        echo "60000/1001" ;;
-              47.952)       echo "48000/1001" ;;
-              # كسر مباشر مثل 24000/1001
-              */*)          echo "$f" ;;
-              # عدد صحيح
-              *)            echo "${f%.*}/1" ;;
-            esac
-          }
-
+          # تطبيع معدل الإطارات المدخل إلى كسر دقيق (inline بدل دالة)
           if [ "$FRAME_RATE" = "auto" ]; then
-            # الإبقاء على معدل المصدر كما هو
             OUT_FPS="$SRC_FPS_RAW"
             echo "📽️ معدل الإطارات: auto → مصدر=$SRC_FPS_RAW"
           else
-            TARGET_FPS_FRAC=$(normalize_fps "$FRAME_RATE")
+            case "$FRAME_RATE" in
+              23.976|23.97) TARGET_FPS_FRAC="24000/1001" ;;
+              29.97)        TARGET_FPS_FRAC="30000/1001" ;;
+              59.94)        TARGET_FPS_FRAC="60000/1001" ;;
+              47.952)       TARGET_FPS_FRAC="48000/1001" ;;
+              */*)          TARGET_FPS_FRAC="$FRAME_RATE" ;;
+              *)            TARGET_FPS_FRAC="${FRAME_RATE%.*}/1" ;;
+            esac
             # حساب القيمة العددية للمقارنة
             SRC_FPS_VAL=$(awk -v f="$SRC_FPS_RAW" \
               'BEGIN{split(f,a,"/"); print (a[2]>0)?a[1]/a[2]:0}')
@@ -965,7 +978,7 @@ jobs:
                 --extra-split 240 \
                 --chunk-method segment \
                 --audio-params "-c:a copy" \
-                --max-ram "$RAM_MB" \
+                --max-ram "${RAM_MB}M" \
                 --ffmpeg-location "$HOME/codec-build/bin"
 
               # حذف الملف الوسيط فور الانتهاء لاسترجاع المساحة
@@ -1060,7 +1073,7 @@ jobs:
           path: all_encoded
           merge-multiple: true
 
-      - name: تنزيل الصوت المضغوط
+      - name: تنزيل الصوت المضغوط وعيّنة المصدر
         uses: actions/download-artifact@v4
         with:
           name: raw-chunks
@@ -1158,22 +1171,21 @@ jobs:
             -i output.mkv \
             -map 0:v:0 -c:v copy sample_out.mkv
 
-          # استخراج عينة المصدر بالدقة نفسها
-          # المصدر موجود في audio_dl (رُفع مع raw-chunks)
-          SRC_FILE="audio_dl/$(ls audio_dl/*.mp4 audio_dl/*.mkv 2>/dev/null | head -1 || echo '')"
-          if [ -z "$SRC_FILE" ] || [ ! -s "$SRC_FILE" ]; then
-            echo "⚠️ المصدر الأصلي غير متاح في مرحلة الدمج، تخطي VMAF"
+          # عيّنة المصدر مُرفَقة في artifact raw-chunks باسم source_sample.mkv
+          SRC_FILE="audio_dl/source_sample.mkv"
+          if [ ! -s "$SRC_FILE" ]; then
+            echo "⚠️ عيّنة المصدر غير متاحة ($SRC_FILE)، تخطي قياس الجودة"
             exit 0
           fi
 
           Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
-          [1:v]ss=${SAMPLE_START},setpts=PTS-STARTPTS,\
+          [1:v]setpts=PTS-STARTPTS,\
           scale=${Q_W}:${Q_H}:flags=lanczos+accurate_rnd+full_chroma_int,\
           format=yuv420p10le[r]"
 
           # SSIM
           SSIM=$("$FFMPEG" -hide_banner -nostdin \
-            -i sample_out.mkv -ss "$SAMPLE_START" -t "$SAMPLE_DUR" -i "$SRC_FILE" \
+            -i sample_out.mkv -i "$SRC_FILE" \
             -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | \
             grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2 || echo "NA")
 
@@ -1181,7 +1193,7 @@ jobs:
           VMAF_SCORE="NA"
           if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
             "$FFMPEG" -hide_banner -nostdin \
-              -i sample_out.mkv -ss "$SAMPLE_START" -t "$SAMPLE_DUR" -i "$SRC_FILE" \
+              -i sample_out.mkv -i "$SRC_FILE" \
               -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:\
           log_path=vmaf_final.json:n_threads=$(nproc):n_subsample=6" \
               -f null - >/dev/null 2>&1 || true
