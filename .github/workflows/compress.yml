@@ -136,10 +136,13 @@ jobs:
           make -j"$(nproc)"
           make install
 
-      - name: Install Av1an via Homebrew
-        if: github.event.inputs.codec != 'audio'
+      - name: Install av1an (only if encode_method is auto)
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_method == 'auto'
         run: |
           set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install av1an
           AV1AN_VER=$(av1an --version 2>/dev/null || true)
@@ -150,14 +153,18 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get install -y libdav1d-dev libopus0
-          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           export PATH="$HOME/codec-build/bin:$PATH"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
 
           echo "=== Tool versions ==="
           "$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1
           "$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || true
-          av1an --version 2>/dev/null | head -1
+
+          if [ "${{ github.event.inputs.encode_method }}" = "auto" ]; then
+            export HOMEBREW_NO_AUTO_UPDATE=1
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+            av1an --version 2>/dev/null | head -1 || echo "av1an unavailable"
+          fi
 
           echo "=== Encoders check ==="
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders 2>/dev/null | grep -q 'libsvtav1' \
@@ -326,9 +333,9 @@ jobs:
           echo "Resolution: ${SRC_W}x${SRC_H}"
           echo "Color: $COLOR_PRIMARIES / $COLOR_TRANSFER / $COLOR_SPACE"
           echo "Range: $COLOR_RANGE"
-          echo "Bit depth: ${BIT_DEPTH}-bit ($PIX_FMT)"
+          echo "Bit depth: ${BIT_DEPTH}-bit $PIX_FMT"
           echo "BT.2020: $is_bt2020 | HDR: $is_hdr | HLG: $is_hlg"
-          echo "Noise class: $NOISE_CLASS (PSNR=$NOISE_SCORE)"
+          echo "Noise class: $NOISE_CLASS psnr=$NOISE_SCORE"
 
           SOURCE_INFO=$(jq -cn \
             --arg w "$SRC_W" \
@@ -390,9 +397,9 @@ jobs:
           SAMPLE_START=$(( SRC_DUR / 2 - 45 ))
           [ "$SAMPLE_START" -lt 0 ] && SAMPLE_START=0
           SAMPLE_DUR=90
-          [ "$SAMPLE_START" -gt 0 ] && \
-            [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$SRC_DUR" ] && \
+          if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$SRC_DUR" ]; then
             SAMPLE_DUR=$(( SRC_DUR - SAMPLE_START ))
+          fi
           echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
           "$FFMPEG" -hide_banner -nostdin -y \
             -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
@@ -433,7 +440,7 @@ jobs:
             N_SAFETY=$(( (DURATION + MAX_CHUNK - 1) / MAX_CHUNK ))
             [ "$N_SAFETY" -gt "$N" ] && N=$N_SAFETY
             SEGMENT_TIME=$(( (DURATION + N - 1) / N ))
-            echo "Splitting into ~${N} chunks (~${SEGMENT_TIME}s each)"
+            echo "Splitting into ~${N} chunks, ${SEGMENT_TIME}s each"
 
             KF_EXPR=$(python3 -c "
           n=$N; t=$SEGMENT_TIME; dur=$DURATION
@@ -526,16 +533,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ffmpeg libdav1d-dev libopus0
           if [ "$CODEC" != "audio" ]; then
-            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-            brew install av1an
             export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
 
             echo "=== Tools check ==="
             echo "ffmpeg: $("$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1)"
             echo "SvtAv1EncApp: $("$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || echo 'unavailable')"
-            echo "av1an: $(av1an --version 2>/dev/null | head -1)"
           fi
+
+      - name: Install av1an (only if encode_method is auto)
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_method == 'auto'
+        run: |
+          set -euo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          brew install av1an
+          echo "av1an: $(av1an --version 2>/dev/null | head -1)"
 
       - name: Encode chunk
         env:
@@ -560,11 +575,15 @@ jobs:
           if [ "$CODEC" = "audio" ]; then
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           else
-            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
             export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
             FFMPEG="$HOME/codec-build/bin/ffmpeg"
             FFPROBE="$HOME/codec-build/bin/ffprobe"
+
+            if [ "$ENCODE_METHOD" = "auto" ]; then
+              export HOMEBREW_NO_AUTO_UPDATE=1
+              eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+            fi
           fi
 
           eval "$(echo "$SOURCE_INFO" | python3 -c "
@@ -581,7 +600,7 @@ jobs:
           print('SRC_TRANSFER=' + d.get('color_transfer','bt709'))
           print('SRC_COLORSPACE='+ d.get('color_space','bt709'))
           print('SRC_RANGE='    + d.get('color_range','tv'))
-          ")
+          ")"
 
           echo "=== Source info ==="
           echo "BT.2020=$IS_BT2020 | HDR=$IS_HDR | HLG=$IS_HLG | noise=$NOISE_CLASS"
@@ -641,7 +660,7 @@ jobs:
 
           if [ "$FRAME_RATE" = "auto" ]; then
             OUT_FPS="$SRC_FPS_RAW"
-            echo "FPS: auto -> source=$SRC_FPS_RAW"
+            echo "FPS auto source=$SRC_FPS_RAW"
           else
             case "$FRAME_RATE" in
               23.976|23.97) TARGET_FPS_FRAC="24000/1001" ;;
@@ -660,10 +679,10 @@ jobs:
               'BEGIN{print (s>0 && s <= c+0.01)?1:0}')
             if [ "$USE_SRC" = "1" ]; then
               OUT_FPS="$SRC_FPS_RAW"
-              echo "FPS: source ($SRC_FPS_RAW) <= target ($TARGET_FPS_FRAC) -> keep source"
+              echo "FPS src=$SRC_FPS_RAW tgt=$TARGET_FPS_FRAC keep-source"
             else
               OUT_FPS="$TARGET_FPS_FRAC"
-              echo "FPS: downscale from $SRC_FPS_RAW to $OUT_FPS"
+              echo "FPS downscale from $SRC_FPS_RAW to $OUT_FPS"
             fi
           fi
 
@@ -681,17 +700,17 @@ jobs:
               anime)
                 case "$NOISE_CLASS" in
                   noisy)
-                    echo "anime + noisy: strong denoise + sharpen"
+                    echo "anime noisy: strong denoise + sharpen"
                     FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0")
                     FILTERS+=("cas=0.4")
                     ;;
                   medium)
-                    echo "anime + medium: moderate denoise"
+                    echo "anime medium: moderate denoise"
                     FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0")
                     FILTERS+=("cas=0.3")
                     ;;
                   clean)
-                    echo "anime + clean: light denoise"
+                    echo "anime clean: light denoise"
                     FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0")
                     ;;
                 esac
@@ -702,15 +721,15 @@ jobs:
               realistic)
                 case "$NOISE_CLASS" in
                   noisy)
-                    echo "realistic + noisy: edge-aware denoise"
+                    echo "realistic noisy: edge-aware denoise"
                     FILTERS+=("hqdn3d=1.5:1.0:2.0:1.5")
                     ;;
                   medium)
-                    echo "realistic + medium: light denoise"
+                    echo "realistic medium: light denoise"
                     FILTERS+=("hqdn3d=0.8:0.6:1.2:0.8")
                     ;;
                   clean)
-                    echo "realistic + clean: no denoise"
+                    echo "realistic clean: no denoise"
                     ;;
                 esac
                 ;;
@@ -784,7 +803,7 @@ jobs:
           case "$ENCODE_METHOD" in
             crf)
               [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
-                { echo 'Invalid CRF (0-63)' >&2; exit 1; }
+                { echo 'Invalid CRF range 0-63' >&2; exit 1; }
 
               "$FFMPEG" -hide_banner -nostdin -hwaccel none \
                 "${DECODER_ARGS[@]}" -y -i "$IN" \
@@ -1069,7 +1088,7 @@ jobs:
 
           SRC_FILE="audio_dl/source_sample.mkv"
           if [ ! -s "$SRC_FILE" ]; then
-            echo "Source sample not available ($SRC_FILE), skipping quality"
+            echo "Source sample not available, skipping quality"
             exit 0
           fi
 
@@ -1167,7 +1186,7 @@ jobs:
                if(c!="NA"&&c!=""){cc=c}}
               END{out="";
                 if(ns>0)add(sprintf("SSIM %.4f",ss/ns));
-                if(nv>0)add(sprintf("VMAF %.1f (min %.1f)",vv/nv,mv));
+                if(nv>0)add(sprintf("VMAF %.1f min %.1f",vv/nv,mv));
                 if(cc!="")add("CRF "cc);
                 if(out=="")out="NA";print out}')
           fi
