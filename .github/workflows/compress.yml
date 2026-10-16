@@ -55,71 +55,24 @@ on:
         required: true
         default: '23.976'
 
-      # ============ التنعيم ============
-      denoise_filter:
-        description: 'فلتر التنعيم: off للتعطيل، hqdn3d سريع مكاني، atadenoise زمني، hqdn3d+atadenoise للأنمي، nlmeans أعلى جودة.'
+      # ============ تشكيلات الفلاتر الجاهزة ============
+      filter_preset:
+        description: 'اختر تشكيلة الفلاتر الجاهزة بالأسماء المعبّرة أو الوضع اليدوي custom.'
         required: true
-        default: 'hqdn3d+atadenoise'
+        default: 'anime-balanced'
         type: choice
-        options: ['off', 'hqdn3d', 'atadenoise', 'hqdn3d+atadenoise', 'nlmeans']
-      denoise_strength:
-        description: 'شدة التنعيم: light خفيف، medium متوسط، strong قوي.'
-        required: true
-        default: 'medium'
-        type: choice
-        options: ['light', 'medium', 'strong']
-
-      # ============ إزالة البانديج ============
-      deband_filter:
-        description: 'إزالة البانديج: off، deband بسيط، gradfun ذكي، deband+gradfun الأقوى.'
-        required: true
-        default: 'gradfun'
-        type: choice
-        options: ['off', 'deband', 'gradfun', 'deband+gradfun']
-
-      # ============ السطوع ============
-      brightness_curve:
-        description: 'السطوع: off، eq سريع، curves-* منحنيات ترفع الظلال دون إحراق المناطق الفاتحة.'
-        required: true
-        default: 'curves-medium'
-        type: choice
-        options: ['off', 'eq', 'curves-light', 'curves-medium', 'curves-strong']
-
-      # ============ التشبع ============
-      saturation_boost:
-        description: 'التشبع: off، eq موحد، colorbalance متوازن الألوان.'
-        required: true
-        default: 'colorbalance'
-        type: choice
-        options: ['off', 'eq', 'colorbalance']
-
-      # ============ الحدة ============
-      sharpen_filter:
-        description: 'الحدة: off، cas للأنمي، unsharp للواقعي.'
-        required: true
-        default: 'cas'
-        type: choice
-        options: ['off', 'cas', 'unsharp']
-
-      # ============ قيم مخصصة (اختيارية) ============
-      custom_denoise:
-        description: 'تنعيم مخصص يُضاف بعد الفلتر المختار. مثال: hqdn3d=1.5:1.0:2.0:1.5'
-        required: false
-        default: ''
-      custom_deband:
-        description: 'بانديج مخصص. مثال: gradfun=strength=2.0:radius=20'
-        required: false
-        default: ''
-      custom_brightness:
-        description: 'سطوع مخصص. مثال: eq=brightness=0.08'
-        required: false
-        default: ''
-      custom_saturation:
-        description: 'تشبع مخصص. مثال: eq=saturation=1.2'
-        required: false
-        default: ''
-      custom_sharpen:
-        description: 'حدة مخصصة. مثال: unsharp=luma_amount=0.8'
+        options:
+          - 'off'
+          - 'clean-gentle'
+          - 'anime-balanced'
+          - 'anime-vibrant'
+          - 'anime-cinematic'
+          - 'movie-balanced'
+          - 'movie-vibrant'
+          - 'old-restoration'
+          - 'custom'
+      custom_filters:
+        description: 'سلسلة فلاتر FFmpeg مخصصة بالكامل (تُستخدم حصرياً عند اختيار filter_preset=custom).'
         required: false
         default: ''
 
@@ -634,17 +587,8 @@ jobs:
           TARGET_VALUE: ${{ github.event.inputs.target_value }}
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
-          DENOISE_FILTER: ${{ github.event.inputs.denoise_filter }}
-          DENOISE_STRENGTH: ${{ github.event.inputs.denoise_strength }}
-          DEBAND_FILTER: ${{ github.event.inputs.deband_filter }}
-          BRIGHTNESS_CURVE: ${{ github.event.inputs.brightness_curve }}
-          SATURATION_BOOST: ${{ github.event.inputs.saturation_boost }}
-          SHARPEN_FILTER: ${{ github.event.inputs.sharpen_filter }}
-          CUSTOM_DENOISE: ${{ github.event.inputs.custom_denoise }}
-          CUSTOM_DEBAND: ${{ github.event.inputs.custom_deband }}
-          CUSTOM_BRIGHTNESS: ${{ github.event.inputs.custom_brightness }}
-          CUSTOM_SATURATION: ${{ github.event.inputs.custom_saturation }}
-          CUSTOM_SHARPEN: ${{ github.event.inputs.custom_sharpen }}
+          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
+          CUSTOM_FILTERS: ${{ github.event.inputs.custom_filters }}
           CHUNK_ID: ${{ matrix.chunk }}
           SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
         run: |
@@ -770,7 +714,7 @@ jobs:
           fi
 
           # ============================================================
-          # بناء سلسلة الفلاتر من المدخلات المستقلة
+          # بناء سلسلة الفلاتر الأساسية
           # ============================================================
           FILTERS=("setpts=PTS-STARTPTS")
 
@@ -780,86 +724,107 @@ jobs:
             FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_pos")
           fi
 
+          # ============================================================
+          # فلاتر التشكيلة المختارة
+          # ============================================================
+          FILTERS_EXTRA=()
+
           if [ "$ENCODE_MODE" = "filters" ]; then
 
-            case "${DENOISE_FILTER}:${DENOISE_STRENGTH}" in
-              "hqdn3d:light")          FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0") ;;
-              "hqdn3d:medium")         FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0") ;;
-              "hqdn3d:strong")         FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0") ;;
+            case "$FILTER_PRESET" in
 
-              "atadenoise:light")      FILTERS+=("atadenoise=s=0:0:0:p=0.01:v=0.02") ;;
-              "atadenoise:medium")     FILTERS+=("atadenoise=s=0:0:0:p=0.02:v=0.04") ;;
-              "atadenoise:strong")     FILTERS+=("atadenoise=s=0:0:0:p=0.04:v=0.08") ;;
+              off)
+                echo "Preset: off (no filters)"
+                ;;
 
-              "hqdn3d+atadenoise:light")
-                FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0")
-                FILTERS+=("atadenoise=s=0:0:0:p=0.01:v=0.02") ;;
-              "hqdn3d+atadenoise:medium")
-                FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0")
-                FILTERS+=("atadenoise=s=0:0:0:p=0.02:v=0.04") ;;
-              "hqdn3d+atadenoise:strong")
-                FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0")
-                FILTERS+=("atadenoise=s=0:0:0:p=0.04:v=0.08") ;;
+              clean-gentle)
+                echo "Preset: clean-gentle"
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                FILTERS_EXTRA+=("cas=0.2")
+                ;;
 
-              "nlmeans:light")         FILTERS+=("nlmeans=s=0.6:p=5:r=11:rc=2") ;;
-              "nlmeans:medium")        FILTERS+=("nlmeans=s=1.0:p=7:r=15:rc=3") ;;
-              "nlmeans:strong")        FILTERS+=("nlmeans=s=1.5:p=7:r=17:rc=3") ;;
+              anime-balanced)
+                echo "Preset: anime-balanced"
+                FILTERS_EXTRA+=("hqdn3d=2.0:1.5:3.0:2.0")
+                FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.02:v=0.04")
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
+                FILTERS_EXTRA+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02")
+                FILTERS_EXTRA+=("cas=0.3")
+                ;;
 
-              "off:"*)                 : ;;
-              *)                       echo "Unknown denoise combo: ${DENOISE_FILTER}:${DENOISE_STRENGTH}" >&2 ;;
+              anime-vibrant)
+                echo "Preset: anime-vibrant"
+                FILTERS_EXTRA+=("hqdn3d=2.0:1.5:3.0:2.0")
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                FILTERS_EXTRA+=("curves=all='0/0 0.1/0.20 0.3/0.42 0.5/0.60 1/1'")
+                FILTERS_EXTRA+=("colorbalance=rs=0.08:gs=0.04:bs=-0.04")
+                FILTERS_EXTRA+=("cas=0.3")
+                ;;
+
+              anime-cinematic)
+                echo "Preset: anime-cinematic"
+                FILTERS_EXTRA+=("nlmeans=s=1.0:p=7:r=15:rc=3")
+                FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                FILTERS_EXTRA+=("curves=all='0/0 0.08/0.20 0.25/0.42 0.5/0.65 1/1'")
+                FILTERS_EXTRA+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02")
+                FILTERS_EXTRA+=("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5")
+                ;;
+
+              movie-balanced)
+                echo "Preset: movie-balanced"
+                FILTERS_EXTRA+=("hqdn3d=1.0:0.8:1.5:1.0")
+                FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                FILTERS_EXTRA+=("curves=all='0/0 0.2/0.24 0.5/0.53 1/1'")
+                FILTERS_EXTRA+=("cas=0.3")
+                ;;
+
+              movie-vibrant)
+                echo "Preset: movie-vibrant"
+                FILTERS_EXTRA+=("hqdn3d=1.0:0.8:1.5:1.0")
+                FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                FILTERS_EXTRA+=("curves=all='0/0 0.1/0.20 0.3/0.42 0.5/0.60 1/1'")
+                FILTERS_EXTRA+=("colorbalance=rs=0.08:gs=0.04:bs=-0.04")
+                FILTERS_EXTRA+=("cas=0.3")
+                ;;
+
+              old-restoration)
+                echo "Preset: old-restoration"
+                FILTERS_EXTRA+=("hqdn3d=3.0:2.0:4.0:3.0")
+                FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.04:v=0.08")
+                FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
+                FILTERS_EXTRA+=("colorbalance=rs=0.02:gs=0.01:bs=-0.01")
+                FILTERS_EXTRA+=("cas=0.2")
+                ;;
+
+              custom)
+                if [ -z "${CUSTOM_FILTERS:-}" ]; then
+                  echo "custom preset selected but custom_filters is empty" >&2
+                  exit 1
+                fi
+                echo "Preset: custom -> $CUSTOM_FILTERS"
+                FILTERS_EXTRA+=("$CUSTOM_FILTERS")
+                ;;
+
+              *)
+                echo "Unknown filter_preset: $FILTER_PRESET" >&2
+                exit 1
+                ;;
+
             esac
 
-            case "$DEBAND_FILTER" in
-              deband)
-                FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true") ;;
-              gradfun)
-                FILTERS+=("gradfun=strength=1.2:radius=16") ;;
-              deband+gradfun)
-                FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
-                FILTERS+=("gradfun=strength=1.2:radius=16") ;;
-              off) : ;;
-              *) echo "Unknown deband: $DEBAND_FILTER" >&2 ;;
-            esac
-
-            case "$BRIGHTNESS_CURVE" in
-              eq)
-                FILTERS+=("eq=brightness=0.05:contrast=1.05") ;;
-              curves-light)
-                FILTERS+=("curves=all='0/0 0.2/0.24 0.5/0.53 1/1'") ;;
-              curves-medium)
-                FILTERS+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'") ;;
-              curves-strong)
-                FILTERS+=("curves=all='0/0 0.1/0.20 0.3/0.42 0.5/0.60 1/1'") ;;
-              off) : ;;
-              *) echo "Unknown brightness: $BRIGHTNESS_CURVE" >&2 ;;
-            esac
-
-            case "$SATURATION_BOOST" in
-              eq)
-                FILTERS+=("eq=saturation=1.1") ;;
-              colorbalance)
-                FILTERS+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02") ;;
-              off) : ;;
-              *) echo "Unknown saturation: $SATURATION_BOOST" >&2 ;;
-            esac
-
-            case "$SHARPEN_FILTER" in
-              cas)
-                FILTERS+=("cas=0.3") ;;
-              unsharp)
-                FILTERS+=("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5") ;;
-              off) : ;;
-              *) echo "Unknown sharpen: $SHARPEN_FILTER" >&2 ;;
-            esac
-
-            [ -n "${CUSTOM_DENOISE:-}" ]    && FILTERS+=("$CUSTOM_DENOISE")
-            [ -n "${CUSTOM_DEBAND:-}" ]     && FILTERS+=("$CUSTOM_DEBAND")
-            [ -n "${CUSTOM_BRIGHTNESS:-}" ] && FILTERS+=("$CUSTOM_BRIGHTNESS")
-            [ -n "${CUSTOM_SATURATION:-}" ] && FILTERS+=("$CUSTOM_SATURATION")
-            [ -n "${CUSTOM_SHARPEN:-}" ]    && FILTERS+=("$CUSTOM_SHARPEN")
+            for f in "${FILTERS_EXTRA[@]}"; do
+              FILTERS+=("$f")
+            done
 
           fi
 
+          # ============================================================
+          # معالجة الألوان
+          # ============================================================
           COLOR_ARGS=()
           OUT_PIX_FMT="yuv420p10le"
 
@@ -915,8 +880,8 @@ jobs:
 
           SVT_BASE="tune=0:enable-qm=1:qm-min=0:lp=${THREADS_PER_WORKER}"
 
-          # film-grain يُفعّل عندما يكون التنعيم نشطاً
-          if [ "$ENCODE_MODE" = "filters" ] && [ "$DENOISE_FILTER" != "off" ]; then
+          # film-grain يُفعّل عندما تكون الفلاتر فعلية (ليست off)
+          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "off" ]; then
             SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
           fi
 
@@ -1390,12 +1355,7 @@ sys.stdout.write(s[:100])
           VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
           QUALITY: ${{ steps.videoinfo.outputs.quality }}
           CODEC: ${{ github.event.inputs.codec }}
-          DENOISE_FILTER: ${{ github.event.inputs.denoise_filter }}
-          DENOISE_STRENGTH: ${{ github.event.inputs.denoise_strength }}
-          DEBAND_FILTER: ${{ github.event.inputs.deband_filter }}
-          BRIGHTNESS_CURVE: ${{ github.event.inputs.brightness_curve }}
-          SATURATION_BOOST: ${{ github.event.inputs.saturation_boost }}
-          SHARPEN_FILTER: ${{ github.event.inputs.sharpen_filter }}
+          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
           NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
           IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
         run: |
@@ -1408,7 +1368,7 @@ sys.stdout.write(s[:100])
           COLOR_TAG=""
           [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | 🎨 BT.2020"
 
-          FILTERS_TAG="denoise=${DENOISE_FILTER}/${DENOISE_STRENGTH} deband=${DEBAND_FILTER} bright=${BRIGHTNESS_CURVE} sat=${SATURATION_BOOST} sharp=${SHARPEN_FILTER}"
+          FILTERS_TAG="preset=${FILTER_PRESET}"
 
           CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
             "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
