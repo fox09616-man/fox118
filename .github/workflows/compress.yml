@@ -354,8 +354,8 @@ jobs:
           echo "BT.2020: $is_bt2020 | HDR: $is_hdr | HLG: $is_hlg"
           echo "تصنيف الضجيج: $NOISE_CLASS (PSNR=$NOISE_SCORE)"
 
-          # حفظ المعلومات
-          SOURCE_INFO=$(jq -n \
+          # حفظ المعلومات - jq -c يضمن سطراً واحداً مضغوطاً بلا مسافات
+          SOURCE_INFO=$(jq -cn \
             --arg w "$SRC_W" \
             --arg h "$SRC_H" \
             --arg fps "$SRC_FPS" \
@@ -372,7 +372,14 @@ jobs:
             --arg noise_score "$NOISE_SCORE" \
             '{w:$w,h:$h,fps:$fps,color_space:$cs,color_primaries:$cp,color_transfer:$ct,color_range:$cr,pix_fmt:$pf,bit_depth:$bd,is_bt2020:$bt2020,is_hdr:$hdr,is_hlg:$hlg,noise_class:$noise,noise_score:$noise_score}')
 
-          echo "source_info=$SOURCE_INFO" >> "$GITHUB_OUTPUT"
+          echo "✅ source_info: $SOURCE_INFO"
+
+          # استخدام heredoc لتجنب مشاكل الأسطر في GITHUB_OUTPUT
+          {
+            echo "source_info<<__EOF__"
+            echo "$SOURCE_INFO"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: ضغط الصوت من المصدر الكامل (مرة واحدة)
         run: |
@@ -573,16 +580,23 @@ jobs:
           fi
 
           # ============================================================
-          # قراءة معلومات المصدر
+          # قراءة معلومات المصدر (استدعاء python3 واحد فقط)
           # ============================================================
-          IS_BT2020=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('is_bt2020','false'))")
-          IS_HDR=$(echo "$SOURCE_INFO"    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('is_hdr','false'))")
-          IS_HLG=$(echo "$SOURCE_INFO"    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('is_hlg','false'))")
-          NOISE_CLASS=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('noise_class','medium'))")
-          SRC_PRIMARIES=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_primaries','bt709'))")
-          SRC_TRANSFER=$(echo "$SOURCE_INFO"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_transfer','bt709'))")
-          SRC_COLORSPACE=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_space','bt709'))")
-          SRC_RANGE=$(echo "$SOURCE_INFO"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_range','tv'))")
+          eval "$(echo "$SOURCE_INFO" | python3 -c "
+          import json, sys
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              d = {}
+          print('IS_BT2020='    + str(d.get('is_bt2020','false')).lower())
+          print('IS_HDR='       + str(d.get('is_hdr','false')).lower())
+          print('IS_HLG='       + str(d.get('is_hlg','false')).lower())
+          print('NOISE_CLASS='  + d.get('noise_class','medium'))
+          print('SRC_PRIMARIES='+ d.get('color_primaries','bt709'))
+          print('SRC_TRANSFER=' + d.get('color_transfer','bt709'))
+          print('SRC_COLORSPACE='+ d.get('color_space','bt709'))
+          print('SRC_RANGE='    + d.get('color_range','tv'))
+          ")
 
           echo "=== معلومات المصدر ==="
           echo "BT.2020=$IS_BT2020 | HDR=$IS_HDR | HLG=$IS_HLG | ضجيج=$NOISE_CLASS"
@@ -597,7 +611,9 @@ jobs:
             RESOLUTION=$((10#$RESOLUTION))
             (( RESOLUTION >= 144 && RESOLUTION <= 2160 )) || { echo 'الدقة خارج النطاق' >&2; exit 1; }
           fi
-          [[ "$FRAME_RATE" =~ ^([1-9]|[1-5][0-9])$ ]] || { echo 'معدل الإطارات غير صحيح' >&2; exit 1; }
+          # التحقق من معدل الإطارات: يقبل عدداً صحيحاً أو عشرياً أو كسراً أو auto
+          [[ "$FRAME_RATE" =~ ^(auto|[0-9]+(\.[0-9]+)?|[0-9]+/[0-9]+)$ ]] || \
+            { echo 'معدل الإطارات غير صحيح (أمثلة: 23.976 أو 24000/1001 أو 30 أو auto)' >&2; exit 1; }
           [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'preset غير صحيح' >&2; exit 1; }
 
           # ============================================================
