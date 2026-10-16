@@ -721,7 +721,8 @@ jobs:
           [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
 
           if [ "$RESOLUTION" != "auto" ]; then
-            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_pos")
+            # ملاحظة: full_chroma_pos ليس خياراً صالحاً في flags=
+            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
           fi
 
           # ============================================================
@@ -746,7 +747,7 @@ jobs:
               anime-balanced)
                 echo "Preset: anime-balanced"
                 FILTERS_EXTRA+=("hqdn3d=2.0:1.5:3.0:2.0")
-                FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.02:v=0.04")
+                FILTERS_EXTRA+=("atadenoise=s0=0:s1=0:s2=0:p=0.02:v=0.04")
                 FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
                 FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
                 FILTERS_EXTRA+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02")
@@ -765,6 +766,7 @@ jobs:
               anime-cinematic)
                 echo "Preset: anime-cinematic"
                 FILTERS_EXTRA+=("nlmeans=s=1.0:p=7:r=15:rc=3")
+                FILTERS_EXTRA+=("atadenoise=s0=0:s1=0:s2=0:p=0.02:v=0.04")
                 FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
                 FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
                 FILTERS_EXTRA+=("curves=all='0/0 0.08/0.20 0.25/0.42 0.5/0.65 1/1'")
@@ -792,7 +794,7 @@ jobs:
               old-restoration)
                 echo "Preset: old-restoration"
                 FILTERS_EXTRA+=("hqdn3d=3.0:2.0:4.0:3.0")
-                FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.04:v=0.08")
+                FILTERS_EXTRA+=("atadenoise=s0=0:s1=0:s2=0:p=0.04:v=0.08")
                 FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
                 FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
                 FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
@@ -844,10 +846,22 @@ jobs:
             )
           elif [ "$IS_BT2020" = "true" ]; then
             echo "BT.2020 SDR source: keeping wide gamut"
+
+            # حماية من color_transfer غير معروف
+            case "$SRC_TRANSFER" in
+              ""|unknown|unspecified|reserved)
+                SAFE_TRC="bt709"
+                echo "color_transfer empty/unknown -> using $SAFE_TRC"
+                ;;
+              *)
+                SAFE_TRC="$SRC_TRANSFER"
+                ;;
+            esac
+
             COLOR_ARGS=(
               -colorspace bt2020nc
               -color_primaries bt2020
-              -color_trc "$SRC_TRANSFER"
+              -color_trc "$SAFE_TRC"
             )
           else
             echo "SDR BT.709 source"
@@ -880,7 +894,6 @@ jobs:
 
           SVT_BASE="tune=0:enable-qm=1:qm-min=0:lp=${THREADS_PER_WORKER}"
 
-          # film-grain يُفعّل عندما تكون الفلاتر فعلية (ليست off)
           if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "off" ]; then
             SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
           fi
@@ -1297,37 +1310,44 @@ jobs:
           export RAW
 
           DISPLAY_NAME=$(python3 <<'PYEOF'
-          import os, sys, unicodedata
-          s = os.environ.get("RAW", "")
-          strip = set()
-          for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
-                    list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
-              strip.add(chr(cp))
-          s = ''.join(ch for ch in s if ch not in strip)
-          s = unicodedata.normalize('NFC', s)
-          def is_letter(c): return unicodedata.category(c).startswith('L')
-          def is_digit(c):  return unicodedata.category(c).startswith('N')
-          def is_allowed(c):
-              if is_letter(c) or is_digit(c): return True
-              if c in ' _-.()[]': return True
-              if unicodedata.category(c) == 'Zs': return True
-              return False
-          out = []
-          for i, c in enumerate(s):
-              if is_allowed(c):
-                  out.append(c)
-              else:
-                  prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
-                  nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
-                  if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
-                      out.append(' ')
-          s = ''.join(out)
-          s = ' '.join(s.split())
-          while '..' in s: s = s.replace('..', '.')
-          s = s.strip('.')
-          sys.stdout.write(s[:100])
-          PYEOF
-          )
+import os, unicodedata
+
+s = os.environ.get("RAW", "")
+
+strip = set()
+for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
+          list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
+    strip.add(chr(cp))
+s = ''.join(ch for ch in s if ch not in strip)
+
+s = unicodedata.normalize('NFC', s)
+
+def is_letter(c): return unicodedata.category(c).startswith('L')
+def is_digit(c):  return unicodedata.category(c).startswith('N')
+def is_allowed(c):
+    if is_letter(c) or is_digit(c): return True
+    if c in ' _-.()[]': return True
+    if unicodedata.category(c) == 'Zs': return True
+    return False
+
+out = []
+for i, c in enumerate(s):
+    if is_allowed(c):
+        out.append(c)
+    else:
+        prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
+        nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
+        if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
+            out.append(' ')
+
+s = ''.join(out)
+s = ' '.join(s.split())
+while '..' in s:
+    s = s.replace('..', '.')
+s = s.strip('.')
+print(s[:100], end='')
+PYEOF
+)
 
           [ -z "$DISPLAY_NAME" ] && DISPLAY_NAME="video"
 
