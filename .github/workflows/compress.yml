@@ -57,7 +57,7 @@ on:
 
       # ============ تشكيلات الفلاتر الجاهزة ============
       filter_preset:
-        description: 'اختر تشكيلة الفلاتر الجاهزة أو الوضع اليدوي custom.'
+        description: 'اختر تشكيلة الفلاتر الجاهزة بالأسماء المعبّرة أو الوضع اليدوي custom.'
         required: true
         default: 'anime-balanced'
         type: choice
@@ -225,6 +225,18 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
+      - name: تجهيز Playwright و curl_cffi (للروابط العامة فقط)
+        if: >-
+          github.event.inputs.url != '' &&
+          github.event.inputs.message_id == '' &&
+          !contains(github.event.inputs.url, 't.me/') &&
+          !contains(github.event.inputs.url, 'telegram.')
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user curl_cffi playwright
+          python3 -m playwright install --with-deps chromium \
+            || echo "Playwright browser install failed (non-fatal)"
+
       - name: تحميل الفيديو المصدر
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
@@ -237,54 +249,476 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ -n "$MESSAGE_ID" ]; then
-            echo "Downloading from Telegram message..."
-            python3 <<'PYEOF'
-          import asyncio, os, sys
-          from telethon import TelegramClient
-          from telethon.sessions import StringSession
-          async def main():
-              client = TelegramClient(StringSession(), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
-              await client.start(bot_token=os.environ["BOT_TOKEN"])
-              async with client:
-                  message = await client.get_messages(int(os.environ["SOURCE_CHAT_ID"]), ids=int(os.environ["MESSAGE_ID"]))
-                  if message is None or not message.media:
-                      sys.exit("Video not found.")
-                  await client.download_media(message, file="raw_input.mp4")
-          asyncio.run(main())
-          PYEOF
+          TG_LINK_RE='^https?://(t\.me|telegram\.me|telegram\.dog)/'
+          HLS_RE='\.(m3u8|mpd)(\?.*)?$'
+          DIRECT_RE='\.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$'
 
-          elif [ -n "$VIDEO_URL" ]; then
-            echo "Downloading from URL..."
-            if [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
-              python3 <<'PYEOF'
-          import asyncio, os, sys, re
+          # 1+2. تيليجرام (رسالة أو رابط): البوت أولاً، ثم الجلسة إن فشل
+          if [ -n "$MESSAGE_ID" ] || { [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $TG_LINK_RE ]]; }; then
+            echo "Downloading from Telegram (bot first, then user session)..."
+            cat > tg_fetch.py <<'PYEOF'
+          import asyncio, os, sys
+          from urllib.parse import urlparse
           from telethon import TelegramClient
           from telethon.sessions import StringSession
           from telethon.tl.types import PeerChannel
-          async def main():
-              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
-              await client.start()
-              url = os.environ["VIDEO_URL"]
-              async with client:
-                  match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', url)
-                  if match:
-                      ident = match.group(1); msg_id = int(match.group(2))
+
+          API_ID = int(os.environ["TG_API_ID"])
+          API_HASH = os.environ["TG_API_HASH"]
+          BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+          TG_SESSION = os.environ.get("TG_SESSION", "")
+          MESSAGE_ID = os.environ.get("MESSAGE_ID", "").strip()
+          URL = os.environ.get("VIDEO_URL", "").strip()
+          CHAT_ID = os.environ.get("SOURCE_CHAT_ID", "").strip()
+          OUT = "raw_input.mp4"
+
+
+          def parse_link(link):
+              parts = [p for p in urlparse(link).path.split("/") if p]
+              if len(parts) < 2 or not parts[-1].isdigit():
+                  return None, None
+              msg_id = int(parts[-1])
+              if parts[0] == "c" and len(parts) >= 3 and parts[1].isdigit():
+                  return PeerChannel(int(parts[1])), msg_id
+              return parts[0], msg_id
+
+
+          def targets_for(kind):
+              if MESSAGE_ID:
+                  mid = int(MESSAGE_ID)
+                  chat = int(CHAT_ID)
+                  if kind == "bot":
+                      return [(chat, mid)]
+                  if chat < 0:
+                      return [(chat, mid)]
+                  print("[tg] session skipped: in private chats message ids differ between the bot and the user account")
+                  return []
+              peer, mid = parse_link(URL)
+              if peer is None:
+                  print("[tg] could not parse the Telegram link")
+                  return []
+              return [(peer, mid)]
+
+
+          async def attempt(kind):
+              targets = targets_for(kind)
+              if not targets:
+                  return False
+              if kind == "bot":
+                  if not BOT_TOKEN:
+                      print("[tg] bot: BOT_TOKEN missing")
+                      return False
+                  client = TelegramClient(StringSession(), API_ID, API_HASH)
+              else:
+                  if not TG_SESSION:
+                      print("[tg] session: TG_SESSION missing")
+                      return False
+                  client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
+              try:
+                  if kind == "bot":
+                      await client.start(bot_token=BOT_TOKEN)
+                  else:
+                      await client.connect()
+                      if not await client.is_user_authorized():
+                          print("[tg] session: not authorized")
+                          return False
                       try:
-                          entity = await client.get_entity(PeerChannel(int(ident)) if ident.isdigit() else ident)
-                          message = await client.get_messages(entity, ids=msg_id)
-                          if message and message.media:
-                              await client.download_media(message, file="raw_input.mp4"); return
+                          await client.get_dialogs(limit=200)
+                      except Exception:
+                          pass
+                  for peer, mid in targets:
+                      try:
+                          message = await client.get_messages(peer, ids=mid)
+                          if message is None or not message.media:
+                              print(f"[tg] {kind}: message {mid} not found or has no media")
+                              continue
+                          await client.download_media(message, file=OUT)
+                          if os.path.exists(OUT) and os.path.getsize(OUT) > 0:
+                              print(f"[tg] {kind}: download OK")
+                              return True
                       except Exception as e:
-                          sys.exit(f"Failed: {e}")
-                  sys.exit("Unsupported URL")
-          asyncio.run(main())
+                          print(f"[tg] {kind}: {type(e).__name__}: {str(e)[:150]}")
+                      if os.path.exists(OUT):
+                          os.remove(OUT)
+                  return False
+              except Exception as e:
+                  print(f"[tg] {kind}: {type(e).__name__}: {str(e)[:150]}")
+                  return False
+              finally:
+                  try:
+                      await client.disconnect()
+                  except Exception:
+                      pass
+
+
+          async def main():
+              for kind in ("bot", "session"):
+                  if await attempt(kind):
+                      return 0
+                  print(f"[tg] {kind} attempt failed")
+              return 1
+
+
+          sys.exit(asyncio.run(main()))
           PYEOF
-            elif [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$ ]]; then
-              curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
-            else
-              yt-dlp --no-playlist -o raw_input.mp4 "$VIDEO_URL" || { echo 'Download failed' >&2; exit 1; }
+            python3 tg_fetch.py || { echo 'Telegram download failed (bot and session)' >&2; exit 1; }
+
+          # 3. رابط HLS / DASH مباشر
+          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $HLS_RE ]]; then
+            echo "Downloading HLS/DASH stream via ffmpeg..."
+            ffmpeg -hide_banner -nostdin -y -loglevel error \
+              -protocol_whitelist file,http,https,tcp,tls,crypto \
+              -i "$VIDEO_URL" -c copy raw_input.mp4 \
+              || yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
+              || { echo 'Download failed' >&2; exit 1; }
+
+          # 4. رابط ملف مباشر
+          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $DIRECT_RE ]]; then
+            echo "Downloading direct file..."
+            curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
+
+          # 5. صفحة ويب: استخراج متعدد المستويات، ثم yt-dlp كاحتياط
+          elif [ -n "$VIDEO_URL" ]; then
+            echo "Downloading from web page (multi-level extraction)..."
+            cat > fetch_page.py <<'PYEOF'
+          import os, sys, re, base64, subprocess, time
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+
+          try:
+              from curl_cffi import requests as cffi_requests
+              HAS_CFFI = True
+          except ImportError:
+              HAS_CFFI = False
+
+          try:
+              from playwright.sync_api import sync_playwright
+              HAS_PLAYWRIGHT = True
+          except ImportError:
+              HAS_PLAYWRIGHT = False
+
+          print(f"curl_cffi available: {HAS_CFFI} | playwright available: {HAS_PLAYWRIGHT}")
+
+          url = os.environ["VIDEO_URL"]
+          print("=" * 60)
+          print("URL:", url)
+          print("=" * 60)
+
+          USER_AGENTS = [
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          ]
+          VIDEO_URL_RE = re.compile(r'\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv)(?=$|[?#&/"\'])', re.IGNORECASE)
+          HLS_RE = re.compile(r'\.(?:m3u8|mpd)(?=$|[?#&/"\'])', re.IGNORECASE)
+          CANDIDATE = "candidate.mp4"
+          MIN_DUR = 61
+          tried = set()
+
+
+          def make_headers(i=0, ref=True):
+              h = {
+                  'User-Agent': USER_AGENTS[i % len(USER_AGENTS)],
+                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                  'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
+                  'Upgrade-Insecure-Requests': '1',
+              }
+              if ref:
+                  h['Referer'] = url
+              return h
+
+
+          def probe_duration(path):
+              try:
+                  out = subprocess.run(
+                      ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path],
+                      capture_output=True, text=True, timeout=120).stdout.strip()
+                  return int(float(out)) if out else 0
+              except Exception:
+                  return 0
+
+
+          def fetch_html():
+              if HAS_CFFI:
+                  try:
+                      r = cffi_requests.get(url, impersonate="chrome120", timeout=30)
+                      print(f"[page] curl_cffi status={r.status_code} len={len(r.text)}")
+                      if r.status_code == 200 and len(r.text) > 500:
+                          return r.text
+                  except Exception as e:
+                      print(f"[page] curl_cffi failed: {str(e)[:150]}")
+              for i in range(3):
+                  try:
+                      r = requests.get(url, headers=make_headers(i), timeout=30, allow_redirects=True)
+                      print(f"[page] requests attempt {i + 1} status={r.status_code} len={len(r.text)}")
+                      if r.status_code == 200 and len(r.text) > 500:
+                          return r.text
+                  except Exception as e:
+                      print(f"[page] requests attempt {i + 1} failed: {str(e)[:150]}")
+                  time.sleep(2)
+              print("[page] could not load page")
+              return ""
+
+
+          def print_indicators(html):
+              low = html.lower()
+              keys = ['m3u8', '.mp4', '.ts', 'video', 'player', 'jwplayer', 'hls', 'cloudflare', 'recaptcha']
+              print("[page] indicators: " + " | ".join(f"{k}={low.count(k)}" for k in keys))
+
+
+          def expected_duration(html):
+              for p in [r'"duration"\s*:\s*"?(\d+(?:\.\d+)?)"?',
+                        r'"durationSeconds"\s*:\s*"?(\d+)"?',
+                        r'"videoDuration"\s*:\s*"?(\d+)"?']:
+                  m = re.findall(p, html, re.IGNORECASE)
+                  if m:
+                      try:
+                          v = int(float(m[0]))
+                          if 30 < v < 86400:
+                              return v, 'json'
+                      except Exception:
+                          pass
+              for m in re.findall(r'itemprop=["\']duration["\'][^>]*content=["\']([^"\']+)["\']', html, re.IGNORECASE):
+                  mm = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?', m, re.IGNORECASE)
+                  if mm:
+                      v = int(mm.group(1) or 0) * 3600 + int(mm.group(2) or 0) * 60 + int(float(mm.group(3) or 0))
+                      if 30 < v < 86400:
+                          return v, 'itemprop'
+              for m in re.findall(r'(\d{1,2}:\d{2}(?::\d{2})?)', html):
+                  parts = m.split(':')
+                  try:
+                      if len(parts) == 2:
+                          v = int(parts[0]) * 60 + int(parts[1])
+                      elif len(parts) == 3:
+                          v = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                      else:
+                          continue
+                      if v > 60:
+                          return v, 'text'
+                  except Exception:
+                      pass
+              return 0, ''
+
+
+          def norm(u):
+              if isinstance(u, list):
+                  u = u[0] if u else ''
+              u = (u or '').strip()
+              if not u:
+                  return ''
+              if u.startswith('//'):
+                  u = 'https:' + u
+              elif u.startswith('/'):
+                  u = urljoin(url, u)
+              return u if u.startswith('http') else ''
+
+
+          def extract_urls(html):
+              soup = BeautifulSoup(html, 'html.parser')
+              strong, weak = [], []
+
+              for tag in soup.find_all(['video', 'source', 'audio']):
+                  for a in ['src', 'data-src', 'data-url', 'data-source', 'data-video']:
+                      v = norm(tag.get(a))
+                      if v:
+                          strong.append(v)
+
+              for meta in soup.find_all('meta'):
+                  prop = (meta.get('property') or meta.get('name') or '').lower()
+                  if prop in ('og:video', 'og:video:url', 'og:video:secure_url', 'twitter:player:stream', 'video:url'):
+                      v = norm(meta.get('content'))
+                      if v:
+                          strong.append(v)
+
+              for a in soup.find_all('a', href=True):
+                  v = norm(a['href'])
+                  if v and VIDEO_URL_RE.search(v):
+                      strong.append(v)
+
+              patterns = [
+                  r'["\']((?:https?:)?//[^"\']+\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv)[^"\']*)["\']',
+                  r'(?:videoUrl|video_url|videoURL|videoSrc|video_src|sourceUrl|playUrl|mediaUrl|streamUrl|hlsUrl|dashUrl|file|src)\s*[:=]\s*["\']([^"\']+)["\']',
+                  r'data-(?:video|src|url|source|stream|file|hls|dash)\s*=\s*["\']([^"\']+)["\']',
+              ]
+              for p in patterns:
+                  for m in re.findall(p, html, re.IGNORECASE):
+                      v = norm(m)
+                      if v:
+                          weak.append(v)
+
+              for p in [r'base64,([A-Za-z0-9+/=]{20,})', r'atob\(["\']([A-Za-z0-9+/=]{20,})["\']\)']:
+                  for m in re.findall(p, html):
+                      try:
+                          d = base64.b64decode(m).decode('utf-8', errors='ignore')
+                          for dm in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|mpd|webm|flv|ts)[^\s"\'<>]*', d):
+                              weak.append(dm)
+                      except Exception:
+                          pass
+
+              weak = [u for u in weak if VIDEO_URL_RE.search(u)]
+              return list(dict.fromkeys(strong + weak))
+
+
+          def capture_with_playwright():
+              captured = []
+              if not HAS_PLAYWRIGHT:
+                  return captured
+              print("[playwright] starting")
+              try:
+                  with sync_playwright() as p:
+                      browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                      try:
+                          ctx = browser.new_context(user_agent=USER_AGENTS[0],
+                                                    viewport={'width': 1920, 'height': 1080},
+                                                    ignore_https_errors=True)
+                          page = ctx.new_page()
+
+                          def on_response(resp):
+                              try:
+                                  u = resp.url
+                                  ct = resp.headers.get('content-type', '')
+                                  if any(x in ct for x in ['video/', 'mpegurl', 'dash+xml']) or VIDEO_URL_RE.search(u):
+                                      captured.append(u)
+                                      print(f"[playwright] network: {u[:120]}")
+                              except Exception:
+                                  pass
+
+                          page.on('response', on_response)
+                          try:
+                              page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                          except Exception as e:
+                              print(f"[playwright] goto warning: {str(e)[:100]}")
+                          page.wait_for_timeout(10000)
+                          try:
+                              page.evaluate("""() => {
+                                  document.querySelectorAll('video').forEach(v => {
+                                      v.muted = true;
+                                      v.play().catch(() => {});
+                                  });
+                              }""")
+                              page.wait_for_timeout(8000)
+                          except Exception as e:
+                              print(f"[playwright] play warning: {str(e)[:100]}")
+                      finally:
+                          browser.close()
+              except Exception as e:
+                  print(f"[playwright] failed: {str(e)[:200]}")
+              captured = list(dict.fromkeys(captured))
+              if any(HLS_RE.search(u) for u in captured):
+                  captured = [u for u in captured if not re.search(r'\.(?:ts|m4s)(?=$|[?#])', u, re.IGNORECASE)]
+              print(f"[playwright] captured {len(captured)} urls")
+              return captured
+
+
+          def accept_candidate():
+              if not os.path.exists(CANDIDATE):
+                  return False
+              size = os.path.getsize(CANDIDATE)
+              dur = probe_duration(CANDIDATE) if size > 500000 else 0
+              print(f"     size={size}B duration={dur}s (need >= {MIN_DUR}s)")
+              if dur >= MIN_DUR:
+                  os.replace(CANDIDATE, "raw_input.mp4")
+                  return True
+              os.remove(CANDIDATE)
+              return False
+
+
+          def download_hls(u):
+              h = make_headers(0, True)
+              hdrs = f"Referer: {h['Referer']}\r\nAccept-Language: {h['Accept-Language']}\r\n"
+              cmd = ['ffmpeg', '-y', '-hide_banner', '-nostdin', '-loglevel', 'error',
+                     '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+                     '-headers', hdrs, '-user_agent', h['User-Agent'],
+                     '-i', u, '-c', 'copy', CANDIDATE]
+              try:
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+              except Exception as e:
+                  print(f"     ffmpeg error: {str(e)[:100]}")
+                  return False
+              if r.returncode != 0:
+                  print(f"     ffmpeg rc={r.returncode} {r.stderr[:150]}")
+                  return False
+              return True
+
+
+          def download_direct(u):
+              for ua_idx in range(2):
+                  h = make_headers(ua_idx, ua_idx > 0)
+                  try:
+                      with requests.get(u, headers=h, timeout=(30, 1800), stream=True, allow_redirects=True) as r:
+                          if r.status_code != 200:
+                              print(f"     status={r.status_code}")
+                              continue
+                          total = int(r.headers.get('content-length', 0) or 0)
+                          ct = r.headers.get('content-type', '')
+                          print(f"     status=200 size={total}B type={ct[:50]}")
+                          if ct.startswith('text/') or 'html' in ct:
+                              return False
+                          if 0 < total < 50000:
+                              return False
+                          with open(CANDIDATE, 'wb') as f:
+                              for chunk in r.iter_content(chunk_size=262144):
+                                  if chunk:
+                                      f.write(chunk)
+                          return True
+                  except Exception as e:
+                      print(f"     error: {str(e)[:100]}")
+              return False
+
+
+          def try_candidates(urls):
+              hls = [u for u in urls if HLS_RE.search(u)]
+              rest = [u for u in urls if u not in hls]
+              ordered = [u for u in hls + rest if u not in tried][:40]
+              print(f"[try] {len(ordered)} candidates (HLS: {len([u for u in ordered if u in hls])})")
+              for idx, u in enumerate(ordered, 1):
+                  tried.add(u)
+                  print(f"  [{idx}/{len(ordered)}] {u[:110]}")
+                  ok = download_hls(u) if u in hls else download_direct(u)
+                  if ok and accept_candidate():
+                      print("     OK: accepted")
+                      return True
+                  if os.path.exists(CANDIDATE):
+                      os.remove(CANDIDATE)
+              return False
+
+
+          html = fetch_html()
+          urls = []
+          exp, src = 0, ''
+          if html:
+              html = html.replace('\\/', '/')
+              with open('debug_page.html', 'w', encoding='utf-8') as f:
+                  f.write(html)
+              print_indicators(html)
+              exp, src = expected_duration(html)
+              urls = extract_urls(html)
+
+          if exp and src in ('json', 'itemprop'):
+              MIN_DUR = max(61, int(exp * 0.8))
+          print(f"[page] expected duration: {exp}s (source: {src or 'unknown'}) -> minimum accepted: {MIN_DUR}s")
+          print(f"[page] extracted {len(urls)} urls")
+          for u in urls[:15]:
+              print(f"   - {u[:120]}")
+
+          if try_candidates(urls):
+              sys.exit(0)
+
+          if HAS_PLAYWRIGHT:
+              extra = [u for u in capture_with_playwright() if u not in tried]
+              if try_candidates(extra):
+                  sys.exit(0)
+
+          print("All methods failed")
+          sys.exit(1)
+          PYEOF
+            if ! python3 fetch_page.py; then
+              echo "Page extraction failed, falling back to yt-dlp..."
+              rm -f raw_input.mp4 candidate.mp4
+              yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
+                || { echo 'Download failed' >&2; exit 1; }
             fi
+
           else
             echo 'No message or URL provided.' >&2; exit 1
           fi
@@ -880,10 +1314,8 @@ jobs:
 
           SVT_BASE="tune=0:enable-qm=1:qm-min=0:lp=${THREADS_PER_WORKER}"
 
-          # film-grain يُفعّل تلقائياً إذا لم تكن التشكيلة فارغة أو تنظيفاً خفيفاً
-          if [ "$ENCODE_MODE" = "filters" ] && \
-             [ "$FILTER_PRESET" != "off" ] && \
-             [ "$FILTER_PRESET" != "clean-gentle" ]; then
+          # film-grain يُفعّل عندما تكون الفلاتر فعلية (ليست off)
+          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "off" ]; then
             SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
           fi
 
@@ -1296,38 +1728,40 @@ jobs:
 
           RAW="${FILENAME:-}"
           RAW=$(printf '%s' "$RAW" | tr -d '\000-\010\013\014\016-\037\r\n\t')
+          export RAW
 
-          DISPLAY_NAME=$(printf '%s' "$RAW" | python3 -c "
-import sys, unicodedata
-s = sys.stdin.read()
-strip = set()
-for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
-          list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
-    strip.add(chr(cp))
-s = ''.join(ch for ch in s if ch not in strip)
-s = unicodedata.normalize('NFC', s)
-def is_letter(c): return unicodedata.category(c).startswith('L')
-def is_digit(c):  return unicodedata.category(c).startswith('N')
-def is_allowed(c):
-    if is_letter(c) or is_digit(c): return True
-    if c in ' _-.()[]': return True
-    if unicodedata.category(c) == 'Zs': return True
-    return False
-out = []
-for i, c in enumerate(s):
-    if is_allowed(c):
-        out.append(c)
-    else:
-        prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
-        nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
-        if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
-            out.append(' ')
-s = ''.join(out)
-s = ' '.join(s.split())
-while '..' in s: s = s.replace('..', '.')
-s = s.strip('.')
-sys.stdout.write(s[:100])
-")
+          DISPLAY_NAME=$(python3 <<'PYEOF'
+          import os, sys, unicodedata
+          s = os.environ.get("RAW", "")
+          strip = set()
+          for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
+                    list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
+              strip.add(chr(cp))
+          s = ''.join(ch for ch in s if ch not in strip)
+          s = unicodedata.normalize('NFC', s)
+          def is_letter(c): return unicodedata.category(c).startswith('L')
+          def is_digit(c):  return unicodedata.category(c).startswith('N')
+          def is_allowed(c):
+              if is_letter(c) or is_digit(c): return True
+              if c in ' _-.()[]': return True
+              if unicodedata.category(c) == 'Zs': return True
+              return False
+          out = []
+          for i, c in enumerate(s):
+              if is_allowed(c):
+                  out.append(c)
+              else:
+                  prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
+                  nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
+                  if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
+                      out.append(' ')
+          s = ''.join(out)
+          s = ' '.join(s.split())
+          while '..' in s: s = s.replace('..', '.')
+          s = s.strip('.')
+          sys.stdout.write(s[:100])
+          PYEOF
+          )
 
           [ -z "$DISPLAY_NAME" ] && DISPLAY_NAME="video"
 
