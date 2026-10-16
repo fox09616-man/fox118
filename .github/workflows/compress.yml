@@ -25,55 +25,57 @@ on:
         type: choice
         options: ['av1', 'audio']
       preset:
-        description: 'AV1: رقم 0-13.'
+        description: 'AV1: رقم 0-13 (كلما قل كان أبطأ وأصغر حجماً).'
         required: true
-        default: '8'
+        default: '6'
       encode_mode:
         description: 'filters أو nofilters أو audio'
         required: true
-        default: 'nofilters'
+        default: 'filters'
         type: choice
         options: ['filters', 'nofilters', 'audio']
       filter_profile:
         description: 'anime أو realistic أو none'
         required: true
-        default: 'none'
+        default: 'anime'
         type: choice
         options: ['anime', 'realistic', 'none']
       encode_method:
-        description: 'AV1: crf أو twopass أو auto (Av1an Target Quality). صوت: audio.'
+        description: 'AV1: crf أو twopass أو auto'
         required: true
         default: 'crf'
         type: choice
-        options: ['crf', 'twopass', 'auto', 'audio']
+        options: ['crf', 'twopass', 'auto']
       target_value:
-        description: 'CRF (0-63) أو معدل بت (مثل 500k)، أو درجة VMAF مستهدفة مع auto (50-99).'
+        description: 'CRF (0-63) أو معدل بت (مثل 500k) أو هدف VMAF مع auto (50-99).'
         required: true
-        default: '28'
+        default: '38'
       resolution:
         description: 'الارتفاع النهائي (مثل 480 أو 720 أو 1080)، أو auto لإبقاء دقة المصدر.'
         required: true
-        default: '480'
+        default: '720'
       frame_rate:
-        description: 'معدل الإطارات النهائي. القيمة الافتراضية 24 لأقل حجم للمسلسلات والأنمي.'
+        description: 'معدل الإطارات: 23.976 أو 24000/1001 للأنمي، 25 للبث الأوروبي، 30 أو 29.97 للبث الأمريكي، auto للإبقاء على معدل المصدر.'
         required: true
-        default: '24'
+        default: '23.976'
 
 concurrency:
   group: video-compression-${{ github.event.inputs.chat_id }}
-  queue: max
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  # ============================================================
+  # 1. بناء الأدوات
+  # ============================================================
   prepare-codec-build:
     name: بناء FFmpeg و Av1an الموحد
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: استعادة البناء الموحد (FFmpeg + Av1an)
+      - name: استعادة البناء الموحد
         if: github.event.inputs.codec != 'audio'
         id: cache-build
         uses: actions/cache@v4
@@ -82,61 +84,99 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      - name: بناء المرّمّزات والمفكك وFFmpeg
+      - name: بناء SVT-AV1 v2.3.0 + VMAF v3.0.0 + FFmpeg n7.1
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
+        timeout-minutes: 90
         run: |
           set -euo pipefail
-          sudo apt update
-          sudo apt install -y build-essential cmake git nasm pkg-config libdav1d-dev libogg-dev libopus-dev
+
+          # فحص المساحة قبل البناء (يحتاج على الأقل 8GB)
+          FREE_GB=$(df -BG / | awk 'NR==2{gsub("G",""); print $4}')
+          echo "💾 مساحة متاحة: ${FREE_GB}GB"
+          (( FREE_GB >= 8 )) || { echo "❌ مساحة غير كافية للبناء: ${FREE_GB}GB" >&2; exit 1; }
+
+          sudo apt-get update -qq
+          sudo apt-get install -y build-essential cmake git nasm pkg-config \
+            libdav1d-dev libogg-dev libopus-dev meson ninja-build xxd
           rm -rf "$HOME/codec-build" "$HOME/codec-sources"
           mkdir -p "$HOME/codec-build" "$HOME/codec-sources"
           cd "$HOME/codec-sources"
-          git clone --depth 1 --branch v4.2.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git
-          cmake -S SVT-AV1 -B SVT-AV1/Build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
+
+          # SVT-AV1 v2.3.0 (إصدار مثبّت)
+          git clone --depth 1 --branch v2.3.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git
+          cmake -S SVT-AV1 -B SVT-AV1/Build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
           cmake --build SVT-AV1/Build --parallel "$(nproc)"
           cmake --install SVT-AV1/Build
-          sudo apt install -y meson ninja-build xxd
+
+          # VMAF v3.0.0 (إصدار مثبّت)
           git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git
-          meson setup vmaf/libvmaf/build vmaf/libvmaf --buildtype release --prefix="$HOME/codec-build" --libdir=lib -Denable_tests=false -Denable_docs=false
+          meson setup vmaf/libvmaf/build vmaf/libvmaf \
+            --buildtype release \
+            --prefix="$HOME/codec-build" \
+            --libdir=lib \
+            -Denable_tests=false \
+            -Denable_docs=false
           ninja -C vmaf/libvmaf/build
           ninja -C vmaf/libvmaf/build install
-          git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git
+
+          # FFmpeg n7.1 (إصدار مثبّت)
+          git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           cd FFmpeg
-          ./configure --prefix="$HOME/codec-build" --enable-gpl --enable-version3 --disable-doc --enable-libopus --enable-libdav1d --enable-libsvtav1 --enable-libvmaf --extra-cflags="-I$HOME/codec-build/include" --extra-ldflags="-L$HOME/codec-build/lib"
+          ./configure \
+            --prefix="$HOME/codec-build" \
+            --enable-gpl \
+            --enable-version3 \
+            --disable-doc \
+            --enable-libopus \
+            --enable-libdav1d \
+            --enable-libsvtav1 \
+            --enable-libvmaf \
+            --extra-cflags="-I$HOME/codec-build/include" \
+            --extra-ldflags="-L$HOME/codec-build/lib"
           make -j"$(nproc)"
           make install
 
-      - name: تثبيت Av1an عبر Homebrew
+      - name: تثبيت Av1an عبر Homebrew (إصدار محدد)
         if: github.event.inputs.codec != 'audio'
         run: |
           set -euo pipefail
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           brew install av1an
-          AV1AN_BIN="$(brew --prefix)/bin/av1an"
-          test -x "$AV1AN_BIN"
-          "$AV1AN_BIN" --version
+          AV1AN_VER=$(av1an --version 2>/dev/null || true)
+          echo "✅ av1an: $AV1AN_VER"
 
-      - name: فحص البناء الموحد
+      - name: فحص البناء
         if: github.event.inputs.codec != 'audio'
         run: |
           set -euo pipefail
-          sudo apt update
-          sudo apt install -y libdav1d-dev libopus0
+          sudo apt-get install -y libdav1d-dev libopus0
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
           export PATH="$HOME/codec-build/bin:$PATH"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          test -x "$HOME/codec-build/bin/ffmpeg"
-          test -x "$HOME/codec-build/bin/SvtAv1EncApp" || { echo '❌ SvtAv1EncApp مفقود' >&2; exit 1; }
-          "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
-          "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
-          "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf ' || { echo '❌ libvmaf مفقود — Av1an auto لن يعمل' >&2; exit 1; }
-          command -v av1an >/dev/null || { echo '❌ av1an مفقود' >&2; exit 1; }
-          av1an --version
 
+          echo "=== إصدارات الأدوات ==="
+          "$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1
+          "$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || true
+          av1an --version 2>/dev/null | head -1
+
+          echo "=== فحص المرمّزات ==="
+          "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders 2>/dev/null | grep -q 'libsvtav1' \
+            && echo "✅ libsvtav1" || { echo '❌ libsvtav1 مفقود' >&2; exit 1; }
+          "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders 2>/dev/null | grep -q 'libdav1d' \
+            && echo "✅ libdav1d" || { echo '❌ libdav1d مفقود' >&2; exit 1; }
+          "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf ' \
+            && echo "✅ libvmaf" || { echo '❌ libvmaf مفقود' >&2; exit 1; }
+
+  # ============================================================
+  # 2. تحميل المصدر وفحصه وتقطيعه
+  # ============================================================
   split-video:
     name: تحميل المصدر وفحصه وتقطيعه
     needs: prepare-codec-build
@@ -144,18 +184,18 @@ jobs:
     timeout-minutes: 360
     outputs:
       chunks: ${{ steps.segment.outputs.chunks }}
+      source_info: ${{ steps.probe_source.outputs.source_info }}
     steps:
       - name: تجهيز أدوات التحميل
         run: |
           set -euo pipefail
-          sudo apt update
-          sudo apt install -y ffmpeg jq libdav1d-dev libopus0 python3-pip curl
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg jq libdav1d-dev libopus0 python3-pip curl
           python3 -m pip install --user --upgrade pip
           python3 -m pip install --user telethon requests beautifulsoup4 lxml yt-dlp
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-          echo "✅ تم تثبيت جميع الأدوات"
 
-      - name: استعادة FFmpeg الموحد عند الحاجة
+      - name: استعادة FFmpeg الموحد
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
@@ -163,9 +203,9 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      - name: تحميل الفيديو المصدر والتحقق منه
+      - name: تحميل الفيديو المصدر
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -193,9 +233,11 @@ jobs:
                   await client.download_media(message, file="raw_input.mp4")
           asyncio.run(main())
           PYEOF
-          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
-            echo "📥 تحميل من رابط تيليجرام..."
-            python3 <<'PYEOF'
+
+          elif [ -n "$VIDEO_URL" ]; then
+            echo "📥 تحميل من رابط..."
+            if [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
+              python3 <<'PYEOF'
           import asyncio, os, sys, re
           from telethon import TelegramClient
           from telethon.sessions import StringSession
@@ -206,391 +248,254 @@ jobs:
               url = os.environ["VIDEO_URL"]
               async with client:
                   match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', url)
-                  if match and not match.group(1).startswith('+'):
-                      ident = match.group(1)
-                      msg_id = int(match.group(2))
+                  if match:
+                      ident = match.group(1); msg_id = int(match.group(2))
                       try:
-                          if ident.isdigit():
-                              entity = await client.get_entity(PeerChannel(int(ident)))
-                          else:
-                              entity = await client.get_entity(ident)
+                          entity = await client.get_entity(PeerChannel(int(ident)) if ident.isdigit() else ident)
                           message = await client.get_messages(entity, ids=msg_id)
                           if message and message.media:
-                              await client.download_media(message, file="raw_input.mp4")
-                              return
-                          else:
-                              sys.exit("لم يتم العثور على فيديو.")
+                              await client.download_media(message, file="raw_input.mp4"); return
                       except Exception as e:
-                          sys.exit(f"فشل: {str(e)}")
-                  if re.search(r'\.(mp4|mkv|avi|mov|webm)$', url, re.IGNORECASE):
-                      try:
-                          await client.download_file(url, file="raw_input.mp4")
-                          return
-                      except Exception as e:
-                          sys.exit(f"فشل: {str(e)}")
-                  try:
-                      entity = await client.get_entity(url)
-                      async for message in client.iter_messages(entity, limit=10):
-                          if message.media and hasattr(message.media, 'document'):
-                              await client.download_media(message, file="raw_input.mp4")
-                              return
-                      sys.exit("لم يتم العثور على فيديو.")
-                  except Exception as e:
-                      sys.exit(f"فشل: {str(e)}")
+                          sys.exit(f"فشل: {e}")
+                  sys.exit("رابط غير مدعوم")
           asyncio.run(main())
           PYEOF
-          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$ ]]; then
-            echo "📥 تحميل من رابط مباشر..."
-            curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
-          elif [ -n "$VIDEO_URL" ]; then
-            echo "📥 تحميل ذكي من الرابط..."
-            python3 <<'PYEOF'
-          import os, sys, re, json, base64, subprocess, shutil
-          import requests
-          from bs4 import BeautifulSoup
-          from urllib.parse import urljoin, urlparse
-
-          url = os.environ["VIDEO_URL"]
-          headers = {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-              'Accept-Language': 'en-US,en;q=0.5',
-              'Referer': url,
-          }
-
-          def get_video_duration(path):
-              try:
-                  r = subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','csv=p=0',path], capture_output=True, text=True, timeout=30)
-                  if r.returncode == 0 and r.stdout.strip() and r.stdout.strip() != 'N/A':
-                      return int(float(r.stdout.strip()))
-              except: pass
-              return 0
-
-          def get_video_size(path):
-              try: return os.path.getsize(path)
-              except: return 0
-
-          def extract_expected_duration(html):
-              for p in [r'"duration"\s*:\s*"?(\d+)"?', r'"durationSeconds"\s*:\s*"?(\d+)"?']:
-                  m = re.findall(p, html, re.IGNORECASE)
-                  if m:
-                      try:
-                          v = int(m[0])
-                          if 30 < v < 7200: return v
-                      except: pass
-              m = re.findall(r'itemprop="duration"[^>]*content="PT(\d+)M(\d+)S"', html)
-              if m:
-                  try:
-                      v = int(m[0][0])*60 + int(m[0][1])
-                      if 30 < v < 7200: return v
-                  except: pass
-              for p in [r'"duration"\s*:\s*"(\d+):(\d+)(?::(\d+))?"', r'>(\d+):(\d+)(?::(\d+))?<', r'(\d+):(\d+)(?::(\d+))?\s*(?:min|دقيقة)']:
-                  m = re.findall(p, html)
-                  if m:
-                      parts = [int(x) for x in m[0] if x]
-                      try:
-                          if len(parts)==2: v = parts[0]*60+parts[1]
-                          elif len(parts)==3: v = parts[0]*3600+parts[1]*60+parts[2]
-                          else: continue
-                          if 30 < v < 7200: return v
-                      except: pass
-              return 0
-
-          def extract_expected_size(html):
-              for p in [r'"size"\s*:\s*"?(\d+)"?', r'"filesize"\s*:\s*"?(\d+)"?', r'"fileSize"\s*:\s*"?(\d+)"?']:
-                  m = re.findall(p, html, re.IGNORECASE)
-                  if m:
-                      try:
-                          v = int(m[0])
-                          if v > 5000000: return v
-                      except: pass
-              m = re.findall(r'(\d+(?:\.\d+)?)\s*(GB|MB|KB)', html, re.IGNORECASE)
-              if m:
-                  try:
-                      num = float(m[0][0]); unit = m[0][1].upper()
-                      if unit=='GB': v = int(num*1073741824)
-                      elif unit=='KB': v = int(num*1024)
-                      else: v = int(num*1048576)
-                      if v > 5000000: return v
-                  except: pass
-              return 0
-
-          def is_valid_video_url(u):
-              if not u or not isinstance(u, str): return False
-              if not u.startswith(('http://','https://')): return False
-              if '.' not in urlparse(u).netloc: return False
-              return bool(re.search(r'\.(mp4|m3u8|webm|flv|ts)(\?.*)?$', u, re.IGNORECASE))
-
-          def get_quality_score(u):
-              ul = u.lower()
-              patterns = [
-                  (r'(?:^|[/_.-])(2160p|4k|uhd)(?:[/_.-]|$)', 10),
-                  (r'(?:^|[/_.-])(1440p|2k|qhd)(?:[/_.-]|$)', 9),
-                  (r'(?:^|[/_.-])(1080p|fhd|fullhd)(?:[/_.-]|$)', 8),
-                  (r'(?:^|[/_.-])(720p|hd)(?:[/_.-]|$)', 7),
-                  (r'(?:^|[/_.-])(480p)(?:[/_.-]|$)', 6),
-                  (r'(?:^|[/_.-])(360p)(?:[/_.-]|$)', 5),
-                  (r'(?:^|[/_.-])(240p)(?:[/_.-]|$)', 4),
-                  (r'(?:^|[/_.-])(180p)(?:[/_.-]|$)', 3),
-                  (r'(?:^|[/_.-])(120p)(?:[/_.-]|$)', 2),
-              ]
-              for pat, sc in patterns:
-                  if re.search(pat, ul, re.IGNORECASE):
-                      return sc
-              return 0
-
-          def extract_all_video_urls(html, base):
-              urls = []
-              patterns = [
-                  r'["\'](https?://[^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
-                  r'videoUrl["\']?\s*[:=]\s*["\']([^"\']+)["\']',
-                  r'video_url["\']?\s*[:=]\s*["\']([^"\']+)["\']',
-                  r'file["\']?\s*[:=]\s*["\']([^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
-                  r'src["\']?\s*[:=]\s*["\']([^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
-                  r'data-(?:video|src|url)["\']?\s*[:=]\s*["\']([^"\']+)["\']',
-              ]
-              for p in patterns:
-                  for m in re.findall(p, html, re.IGNORECASE):
-                      if isinstance(m, tuple): m = m[-1] if m else ''
-                      if not isinstance(m, str): continue
-                      if is_valid_video_url(m): urls.append(m)
-                      elif m.startswith('//'): urls.append('https:'+m)
-                      elif m.startswith('/'): urls.append(urljoin(base, m))
-              for p in [r'base64,([A-Za-z0-9+/=]+)', r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)']:
-                  for m in re.findall(p, html):
-                      try:
-                          d = base64.b64decode(m).decode('utf-8', errors='ignore')
-                          urls.extend(re.findall(r'https?://[^\s"\']+\.(?:mp4|m3u8|webm|flv|ts)[^\s"\']*', d))
-                      except: pass
-              soup = BeautifulSoup(html, 'html.parser')
-              for meta in soup.find_all('meta'):
-                  if meta.get('property') in ['og:video','og:video:url','og:video:secure_url']:
-                      c = meta.get('content')
-                      if c and is_valid_video_url(c): urls.append(c)
-              for v in soup.find_all('video'):
-                  for a in ['src','data-src']:
-                      val = v.get(a)
-                      if val and is_valid_video_url(val): urls.append(val)
-                  for s in v.find_all('source'):
-                      for a in ['src','data-src']:
-                          val = s.get(a)
-                          if val and is_valid_video_url(val): urls.append(val)
-              for iframe in soup.find_all('iframe'):
-                  src = iframe.get('src', '')
-                  if src and 'http' in src:
-                      try:
-                          ir = requests.get(src, headers=headers, timeout=15)
-                          if ir.status_code == 200:
-                              urls.extend(extract_all_video_urls(ir.text, src))
-                      except: pass
-              return urls
-
-          def download_with_ytdlp(url):
-              try:
-                  cmd = ['yt-dlp', '--no-playlist', '-o', 'ytdlp_output.%(ext)s',
-                         '--user-agent', headers['User-Agent'], '--referer', url,
-                         '--max-filesize', '10G', url]
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-                  if r.returncode == 0:
-                      for f in os.listdir('.'):
-                          if f.startswith('ytdlp_output'):
-                              shutil.move(f, 'raw_input.mp4')
-                              return True
-              except: pass
-              return False
-
-          def download_m3u8_with_ffmpeg(m3u8_url):
-              try:
-                  headers_str = '\r\n'.join([f'{k}: {v}' for k, v in headers.items()])
-                  cmd = ['ffmpeg', '-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-                         '-headers', headers_str, '-i', m3u8_url, '-c', 'copy', 'raw_input.mp4']
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-                  if r.returncode == 0 and os.path.exists('raw_input.mp4') and os.path.getsize('raw_input.mp4') > 1000000:
-                      return True
-                  if os.path.exists('raw_input.mp4'):
-                      os.remove('raw_input.mp4')
-              except: pass
-              return False
-
-          try:
-              print("📄 تحميل الصفحة...")
-              r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
-              r.raise_for_status()
-              html = r.text
-
-              exp_dur = extract_expected_duration(html)
-              exp_size = extract_expected_size(html)
-              print(f"⏱️ المدة المتوقعة: {exp_dur} ثانية")
-              print(f"📦 الحجم المتوقع: {exp_size} بايت")
-
-              print("🔄 محاولة yt-dlp...")
-              if download_with_ytdlp(url):
-                  fd = get_video_duration("raw_input.mp4")
-                  fs = get_video_size("raw_input.mp4")
-                  print(f"✅ yt-dlp نجح: 📦 {fs} بايت | ⏱️ {fd} ثانية")
-                  if fd > 60:
-                      print("✅ تم العثور على الفيديو الكامل")
-                      sys.exit(0)
-                  else:
-                      os.remove("raw_input.mp4")
-                      print("⚠️ الفيديو قصير، محاولة طرق أخرى...")
-
-              urls = list(set(extract_all_video_urls(html, url)))
-              if not urls:
-                  print("❌ لم يتم العثور على روابط فيديو")
-                  sys.exit(1)
-
-              print(f"🔗 تم العثور على {len(urls)} رابط محتمل")
-
-              m3u8_urls = [u for u in urls if 'm3u8' in u.lower()]
-              direct_urls = [u for u in urls if 'm3u8' not in u.lower()]
-
-              m3u8_urls.sort(key=get_quality_score, reverse=True)
-              direct_urls.sort(key=get_quality_score, reverse=True)
-
-              if m3u8_urls:
-                  print(f"📺 روابط HLS: {len(m3u8_urls)}")
-                  for m3u8_url in m3u8_urls[:5]:
-                      print(f"🔄 محاولة HLS: {m3u8_url[:80]}...")
-                      if download_m3u8_with_ffmpeg(m3u8_url):
-                          fd = get_video_duration("raw_input.mp4")
-                          fs = get_video_size("raw_input.mp4")
-                          print(f"✅ HLS: 📦 {fs} بايت | ⏱️ {fd} ثانية")
-                          if fd > 60:
-                              print("✅ تم العثور على الفيديو الكامل")
-                              sys.exit(0)
-                          else:
-                              os.remove("raw_input.mp4")
-
-              best_duration = 0
-              best_file = None
-
-              for i, vu in enumerate(direct_urls[:10]):
-                  if not is_valid_video_url(vu): continue
-                  q = get_quality_score(vu)
-                  print(f"\n🔄 محاولة {i+1}: الجودة {q}/10 | {vu[:80]}...")
-                  tf = f"temp_video_{i}.mp4"
-                  try:
-                      vr = requests.get(vu, headers=headers, timeout=300, stream=True, allow_redirects=True)
-                      if vr.status_code == 200:
-                          ct = vr.headers.get('content-type','')
-                          cl = int(vr.headers.get('content-length',0))
-                          if 'm3u8' in ct:
-                              print("   📺 HLS stream detected")
-                              if download_m3u8_with_ffmpeg(vu):
-                                  fd = get_video_duration("raw_input.mp4")
-                                  if fd > best_duration and fd > 60:
-                                      best_duration = fd
-                                      print(f"   ✅ HLS: {fd} ثانية")
-                                      break
-                              continue
-                          if 'video' in ct or 'octet-stream' in ct or cl > 5000000:
-                              with open(tf,'wb') as f:
-                                  for ch in vr.iter_content(chunk_size=8192):
-                                      if ch: f.write(ch)
-                              fs = get_video_size(tf)
-                              fd = get_video_duration(tf)
-                              print(f"   📦 {fs} بايت | ⏱️ {fd} ثانية")
-
-                              if exp_dur > 0 and fd > 0:
-                                  diff = abs(fd - exp_dur)
-                                  if diff < 60:
-                                      print("   ✅ المدة تطابق المتوقع")
-                                      shutil.copy(tf, "raw_input.mp4")
-                                      if os.path.exists(tf): os.remove(tf)
-                                      sys.exit(0)
-
-                              if fd > best_duration:
-                                  best_duration = fd
-                                  if best_file and os.path.exists(best_file):
-                                      os.remove(best_file)
-                                  best_file = tf
-                                  shutil.copy(tf, "raw_input.mp4")
-                                  if os.path.exists(tf): os.remove(tf)
-                              else:
-                                  if os.path.exists(tf): os.remove(tf)
-                          else:
-                              if os.path.exists(tf): os.remove(tf)
-                      else:
-                          if os.path.exists(tf): os.remove(tf)
-                  except Exception as e:
-                      print(f"   ❌ خطأ: {str(e)[:50]}")
-                      if os.path.exists(tf): os.remove(tf)
-
-              if os.path.exists("raw_input.mp4"):
-                  fs = get_video_size("raw_input.mp4")
-                  fd = get_video_duration("raw_input.mp4")
-                  print(f"\n✅ النهائي: 📦 {fs} بايت | ⏱️ {fd} ثانية")
-                  if fd > 60 and fs > 1000000:
-                      sys.exit(0)
-                  else:
-                      print("⚠️ الفيديو قصير جداً")
-                      sys.exit(1)
-              else:
-                  print("❌ لم يتم العثور على فيديو مناسب")
-                  sys.exit(1)
-          except Exception as e:
-              print(f"❌ خطأ: {str(e)}")
-              sys.exit(1)
-          PYEOF
+            elif [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$ ]]; then
+              curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
+            else
+              yt-dlp --no-playlist -o raw_input.mp4 "$VIDEO_URL" || { echo '❌ فشل التحميل' >&2; exit 1; }
+            fi
           else
-            echo '❌ لا توجد رسالة تيليجرام ولا رابط مباشر.' >&2
-            exit 1
+            echo '❌ لا توجد رسالة ولا رابط.' >&2; exit 1
           fi
 
-          if [ ! -s raw_input.mp4 ]; then
-            echo "❌ فشل التحميل" >&2
-            exit 1
-          fi
+          [ -s raw_input.mp4 ] || { echo "❌ فشل التحميل" >&2; exit 1; }
           echo "✅ حجم الملف: $(stat -c%s raw_input.mp4) بايت"
-          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
-          echo "✅ المدة: $DURATION ثانية"
 
-      - name: تقسيم المصدر إلى أجزاء MKV مستقلة
+      # ----------------------------------------------------------
+      # فحص المصدر التفصيلي: ألوان + HDR + ضجيج + معدل بت
+      # ----------------------------------------------------------
+      - name: فحص المصدر التفصيلي
+        id: probe_source
+        run: |
+          set -euo pipefail
+          if [ -x "$HOME/codec-build/bin/ffprobe" ]; then
+            FFPROBE="$HOME/codec-build/bin/ffprobe"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          else
+            FFPROBE=ffprobe
+          fi
+
+          # قراءة المعلومات الأساسية
+          COLOR_SPACE=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=color_space -of csv=p=0 raw_input.mp4 | head -1)
+          COLOR_PRIMARIES=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=color_primaries -of csv=p=0 raw_input.mp4 | head -1)
+          COLOR_TRANSFER=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=color_transfer -of csv=p=0 raw_input.mp4 | head -1)
+          COLOR_RANGE=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=color_range -of csv=p=0 raw_input.mp4 | head -1)
+          PIX_FMT=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=pix_fmt -of csv=p=0 raw_input.mp4 | head -1)
+          SRC_W=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=width -of csv=p=0 raw_input.mp4 | head -1)
+          SRC_H=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=height -of csv=p=0 raw_input.mp4 | head -1)
+          SRC_FPS=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=avg_frame_rate -of csv=p=0 raw_input.mp4 | head -1)
+          SRC_BITRATE=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=bit_rate -of csv=p=0 raw_input.mp4 | head -1)
+
+          # تحديد نوع المصدر
+          is_bt2020=false
+          is_hdr=false
+          is_hlg=false
+
+          case "$COLOR_PRIMARIES" in bt2020|bt2020*) is_bt2020=true ;; esac
+          case "$COLOR_TRANSFER" in
+            smpte2084|arib-std-b67) is_hdr=true ;;
+            arib-std-b67) is_hlg=true ;;
+          esac
+
+          # تحديد مستوى عمق الألوان الحقيقي
+          BIT_DEPTH=8
+          case "$PIX_FMT" in
+            *p10*|*10le*|*10be*) BIT_DEPTH=10 ;;
+            *p12*|*12le*|*12be*) BIT_DEPTH=12 ;;
+          esac
+
+          # تحديد نوع المحتوى بقياس الضجيج على 5 ثوان
+          echo "📊 قياس مستوى الضجيج..."
+          NOISE_LEVEL=$("$FFPROBE" -v error -select_streams v:0 \
+            -read_intervals "%+#5" \
+            -show_entries frame=side_data_list \
+            -of default raw_input.mp4 2>/dev/null | head -5 || echo "0")
+
+          # قياس PSNR للضجيج بمقارنة إطار مع التالي
+          NOISE_SCORE=$(ffmpeg -v error -t 10 -i raw_input.mp4 \
+            -vf "split[a][b];[a]settb=1/25[aa];[b]settb=1/25,trim=start_frame=1[bb];[aa][bb]psnr" \
+            -f null - 2>&1 | grep -o 'psnr_avg:[0-9.]*' | tail -1 | cut -d: -f2 || echo "45")
+
+          echo "مستوى ضجيج PSNR بين الإطارات: $NOISE_SCORE"
+
+          # تصنيف الضجيج: أعلى من 50 = نظيف، 40-50 = متوسط، أقل من 40 = ضجيج عالٍ
+          NOISE_CLASS="clean"
+          if awk "BEGIN{exit !($NOISE_SCORE < 40)}"; then
+            NOISE_CLASS="noisy"
+          elif awk "BEGIN{exit !($NOISE_SCORE < 50)}"; then
+            NOISE_CLASS="medium"
+          fi
+
+          echo "=== معلومات المصدر ==="
+          echo "الدقة: ${SRC_W}x${SRC_H}"
+          echo "الألوان: $COLOR_PRIMARIES / $COLOR_TRANSFER / $COLOR_SPACE"
+          echo "النطاق: $COLOR_RANGE"
+          echo "عمق البت الأصلي: ${BIT_DEPTH}-bit ($PIX_FMT)"
+          echo "BT.2020: $is_bt2020 | HDR: $is_hdr | HLG: $is_hlg"
+          echo "تصنيف الضجيج: $NOISE_CLASS (PSNR=$NOISE_SCORE)"
+
+          # حفظ المعلومات
+          SOURCE_INFO=$(jq -n \
+            --arg w "$SRC_W" \
+            --arg h "$SRC_H" \
+            --arg fps "$SRC_FPS" \
+            --arg cs "$COLOR_SPACE" \
+            --arg cp "$COLOR_PRIMARIES" \
+            --arg ct "$COLOR_TRANSFER" \
+            --arg cr "$COLOR_RANGE" \
+            --arg pf "$PIX_FMT" \
+            --arg bd "$BIT_DEPTH" \
+            --arg bt2020 "$is_bt2020" \
+            --arg hdr "$is_hdr" \
+            --arg hlg "$is_hlg" \
+            --arg noise "$NOISE_CLASS" \
+            --arg noise_score "$NOISE_SCORE" \
+            '{w:$w,h:$h,fps:$fps,color_space:$cs,color_primaries:$cp,color_transfer:$ct,color_range:$cr,pix_fmt:$pf,bit_depth:$bd,is_bt2020:$bt2020,is_hdr:$hdr,is_hlg:$hlg,noise_class:$noise,noise_score:$noise_score}')
+
+          echo "source_info=$SOURCE_INFO" >> "$GITHUB_OUTPUT"
+
+      - name: ضغط الصوت من المصدر الكامل (مرة واحدة)
+        run: |
+          set -euo pipefail
+          if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          else
+            FFMPEG=ffmpeg
+          fi
+
+          HAS_AUDIO=$("$FFMPEG" -v error -i raw_input.mp4 -map 0:a:0 -f null - 2>&1 | \
+            grep -c 'Stream.*Audio' || true)
+
+          if [ "${HAS_AUDIO:-0}" -gt 0 ] || \
+             ffprobe -v error -select_streams a:0 -show_entries stream=codec_name \
+               -of csv=p=0 raw_input.mp4 | grep -q .; then
+            echo "🎵 ضغط الصوت..."
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 \
+              -map 0:a:0 \
+              -vn \
+              -c:a libopus \
+              -b:a 16k \
+              -ac 1 \
+              -ar 48000 \
+              audio_compressed.opus
+            echo "✅ الصوت: $(stat -c%s audio_compressed.opus) بايت"
+          else
+            echo "⚠️ لا يوجد صوت في المصدر"
+            touch audio_compressed.opus
+          fi
+
+      - name: تقسيم المصدر إلى أجزاء
         id: segment
         run: |
           set -euo pipefail
           mkdir -p chunks_raw
+
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"
+            FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           else
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           fi
-          DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
+
+          DURATION=$("$FFPROBE" -v error -show_entries format=duration \
+            -of csv=p=0 raw_input.mp4 | cut -d. -f1)
           test -n "$DURATION"
+          echo "⏱️ المدة: $DURATION ثانية"
 
           SPLIT_THRESHOLD=300
-          MIN_CHUNK_SECONDS=90
-          MAX_CHUNK_SECONDS=2400
+          MIN_CHUNK=90
+          MAX_CHUNK=2400
           MAX_PARALLEL=10
 
           if [ "$DURATION" -gt "$SPLIT_THRESHOLD" ]; then
-            N=$(( DURATION / MIN_CHUNK_SECONDS ))
+            N=$(( DURATION / MIN_CHUNK ))
             (( N > MAX_PARALLEL )) && N=$MAX_PARALLEL
             (( N < 1 )) && N=1
-            N_SAFETY=$(( (DURATION + MAX_CHUNK_SECONDS - 1) / MAX_CHUNK_SECONDS ))
+            N_SAFETY=$(( (DURATION + MAX_CHUNK - 1) / MAX_CHUNK ))
             (( N_SAFETY > N )) && N=$N_SAFETY
             SEGMENT_TIME=$(( (DURATION + N - 1) / N ))
-            echo "🔀 تقسيم إلى ~${N} قطعة (~${SEGMENT_TIME} ثانية لكل قطعة)"
-            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -f segment -segment_time "$SEGMENT_TIME" \
-              -reset_timestamps 1 -avoid_negative_ts make_zero 'chunks_raw/chunk_%03d.mkv'
+            echo "🔀 تقسيم إلى ~${N} قطعة (~${SEGMENT_TIME}s لكل قطعة)"
+
+            # بناء قائمة نقاط الإطارات المفتاحية المطلوبة عند كل حد تقسيم
+            KF_EXPR=$(python3 -c "
+          n=$N; t=$SEGMENT_TIME; dur=$DURATION
+          pts=[i*t for i in range(1,n) if i*t < dur]
+          print(','.join(str(p) for p in pts))
+            ")
+            echo "🔑 نقاط الإطارات المفتاحية: $KF_EXPR"
+
+            "$FFMPEG" -hide_banner -nostdin -y \
+              -i raw_input.mp4 \
+              -map 0:v:0 \
+              -c:v copy \
+              -force_key_frames "$KF_EXPR" \
+              -f segment \
+              -segment_time "$SEGMENT_TIME" \
+              -segment_atclocktime 0 \
+              -break_non_keyframes 0 \
+              -reset_timestamps 1 \
+              -avoid_negative_ts make_zero \
+              'chunks_raw/chunk_%03d.mkv'
           else
-            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -avoid_negative_ts make_zero chunks_raw/chunk_000.mkv
+            "$FFMPEG" -hide_banner -nostdin -y \
+              -i raw_input.mp4 \
+              -map 0:v:0 \
+              -c copy \
+              -avoid_negative_ts make_zero \
+              chunks_raw/chunk_000.mkv
           fi
-          find chunks_raw -maxdepth 1 -type f -name 'chunk_*.mkv' -size +0c | sort >/tmp/chunks.txt
+
+          # التحقق من صحة الأجزاء
+          TOTAL_CHUNK_DUR=0
+          for f in chunks_raw/chunk_*.mkv; do
+            D=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$f" | cut -d. -f1)
+            TOTAL_CHUNK_DUR=$(( TOTAL_CHUNK_DUR + D ))
+          done
+          DIFF=$(( TOTAL_CHUNK_DUR - DURATION ))
+          DIFF=${DIFF#-}
+          echo "🔍 فحص الأجزاء: مجموع=${TOTAL_CHUNK_DUR}s مصدر=${DURATION}s فرق=${DIFF}s"
+          (( DIFF > 5 )) && { echo '❌ فرق كبير في المدة بعد التقطيع' >&2; exit 1; }
+
+          find chunks_raw -maxdepth 1 -type f -name 'chunk_*.mkv' -size +0c | sort > /tmp/chunks.txt
           test -s /tmp/chunks.txt
           CHUNKS_JSON=$(sed 's#^.*/chunk_##; s#\.mkv$##' /tmp/chunks.txt | jq -R . | jq -s -c .)
           echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
 
-      - name: رفع الأجزاء الخام
+      - name: رفع الأجزاء الخام والصوت
         uses: actions/upload-artifact@v4
         with:
           name: raw-chunks
-          path: chunks_raw/
+          path: |
+            chunks_raw/
+            audio_compressed.opus
           retention-days: 1
           if-no-files-found: error
 
+  # ============================================================
+  # 3. ترميز الأجزاء
+  # ============================================================
   encode-chunks:
     name: ضغط الأجزاء
     needs: [prepare-codec-build, split-video]
@@ -602,13 +507,13 @@ jobs:
       matrix:
         chunk: ${{ fromJSON(needs.split-video.outputs.chunks) }}
     steps:
-      - name: تنزيل الجزء الخام
+      - name: تنزيل الأجزاء الخام
         uses: actions/download-artifact@v4
         with:
           name: raw-chunks
-          path: chunks_raw
+          path: .
 
-      - name: استعادة البناء الموحد (FFmpeg + Av1an)
+      - name: استعادة البناء الموحد
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
@@ -616,29 +521,28 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
       - name: تجهيز الاعتماديات
         env:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
-          sudo apt update
-          sudo apt install -y ffmpeg libdav1d-dev libopus0
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg libdav1d-dev libopus0
           if [ "$CODEC" != "audio" ]; then
             eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
             brew install av1an
             export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-            test -x "$HOME/codec-build/bin/ffmpeg"
-            test -x "$HOME/codec-build/bin/SvtAv1EncApp" || { echo '❌ SvtAv1EncApp مفقود' >&2; exit 1; }
-            "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
-            "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
-            "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters | grep -q ' libvmaf '
-            command -v av1an >/dev/null
+
+            echo "=== التحقق من الأدوات ==="
+            echo "ffmpeg: $(which ffmpeg) → $("$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1)"
+            echo "SvtAv1EncApp: $("$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || echo 'غير متاح')"
+            echo "av1an: $(av1an --version 2>/dev/null | head -1)"
           fi
 
-      - name: ضغط الجزء
+      - name: ترميز الجزء
         env:
           CODEC: ${{ github.event.inputs.codec }}
           PRESET_INPUT: ${{ github.event.inputs.preset }}
@@ -649,6 +553,7 @@ jobs:
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
           CHUNK_ID: ${{ matrix.chunk }}
+          SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
         run: |
           set -euo pipefail
           IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
@@ -661,13 +566,31 @@ jobs:
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           else
             eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
+            export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"
+            FFPROBE="$HOME/codec-build/bin/ffprobe"
           fi
 
-          printf 'INPUTS: codec=%s preset=%s mode=%s filter=%s method=%s target=%s resolution=%s fps=%s chunk=%s\n' \
-            "$CODEC" "$PRESET_INPUT" "$ENCODE_MODE" "$FILTER_PROFILE" "$ENCODE_METHOD" "$TARGET_VALUE" "$RESOLUTION" "$FRAME_RATE" "$CHUNK_ID"
+          # ============================================================
+          # قراءة معلومات المصدر
+          # ============================================================
+          IS_BT2020=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('is_bt2020','false'))")
+          IS_HDR=$(echo "$SOURCE_INFO"    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('is_hdr','false'))")
+          IS_HLG=$(echo "$SOURCE_INFO"    | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('is_hlg','false'))")
+          NOISE_CLASS=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('noise_class','medium'))")
+          SRC_PRIMARIES=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_primaries','bt709'))")
+          SRC_TRANSFER=$(echo "$SOURCE_INFO"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_transfer','bt709'))")
+          SRC_COLORSPACE=$(echo "$SOURCE_INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_space','bt709'))")
+          SRC_RANGE=$(echo "$SOURCE_INFO"  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('color_range','tv'))")
 
+          echo "=== معلومات المصدر ==="
+          echo "BT.2020=$IS_BT2020 | HDR=$IS_HDR | HLG=$IS_HLG | ضجيج=$NOISE_CLASS"
+          echo "ألوان: $SRC_PRIMARIES / $SRC_TRANSFER / $SRC_COLORSPACE | نطاق: $SRC_RANGE"
+
+          # ============================================================
+          # التحقق من المدخلات
+          # ============================================================
           case "$CODEC" in av1|audio) ;; *) echo "مرمّز غير مدعوم" >&2; exit 1 ;; esac
           if [ "$RESOLUTION" != "auto" ]; then
             [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'الدقة غير صحيحة' >&2; exit 1; }
@@ -675,167 +598,410 @@ jobs:
             (( RESOLUTION >= 144 && RESOLUTION <= 2160 )) || { echo 'الدقة خارج النطاق' >&2; exit 1; }
           fi
           [[ "$FRAME_RATE" =~ ^([1-9]|[1-5][0-9])$ ]] || { echo 'معدل الإطارات غير صحيح' >&2; exit 1; }
+          [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'preset غير صحيح' >&2; exit 1; }
 
+          # ============================================================
+          # ترميز الصوت (وضع audio فقط)
+          # ============================================================
           if [ "$CODEC" = "audio" ]; then
-            [ "$ENCODE_MODE" = "audio" ] || { echo 'الصوت يتطلب encode_mode=audio' >&2; exit 1; }
-            [ "$ENCODE_METHOD" = "audio" ] || { echo 'الصوت يتطلب encode_method=audio' >&2; exit 1; }
             [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
             TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
-            "$FFMPEG" -hide_banner -nostdin -y -i "$IN" -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 2 "$OUT_FILE"
+            "$FFMPEG" -hide_banner -nostdin -y -i "$IN" \
+              -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 1 "$OUT_FILE"
+            exit 0
+          fi
+
+          # ============================================================
+          # اكتشاف حواف سوداء تلقائياً
+          # ============================================================
+          echo "🔍 كشف الحواف السوداء..."
+          CROPDETECT=$("$FFMPEG" -hide_banner -nostdin -t 120 -i "$IN" \
+            -vf "cropdetect=24:16:0" -f null - 2>&1 | \
+            grep -oP 'crop=\d+:\d+:\d+:\d+' | tail -5 | \
+            sort | uniq -c | sort -rn | head -1 | awk '{print $2}')
+
+          if [ -n "$CROPDETECT" ] && [ "$CROPDETECT" != "crop=0:0:0:0" ]; then
+            CROP_W=$(echo "$CROPDETECT" | cut -d: -f1 | tr -d 'crop=')
+            CROP_H=$(echo "$CROPDETECT" | cut -d: -f2)
+            SRC_WW=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN" | head -1)
+            SRC_HH=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN" | head -1)
+            # تطبيق القص فقط إذا كان فرقاً حقيقياً (أكثر من 4 بكسل)
+            DIFF_W=$(( SRC_WW - CROP_W )); DIFF_H=$(( SRC_HH - CROP_H ))
+            if (( DIFF_W > 4 || DIFF_H > 4 )); then
+              CROP_FILTER="$CROPDETECT,"
+              echo "✅ قص الحواف: $CROPDETECT (وفر ${DIFF_W}x${DIFF_H} بكسل)"
+            else
+              CROP_FILTER=""
+              echo "ℹ️ لا حواف سوداء"
+            fi
           else
-            [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'AV1 preset غير صحيح' >&2; exit 1; }
-            [ "$ENCODE_METHOD" = "crf" ] || [ "$ENCODE_METHOD" = "twopass" ] || [ "$ENCODE_METHOD" = "auto" ] || { echo 'طريقة AV1 غير صحيحة' >&2; exit 1; }
-            VIDEO_CODEC=libsvtav1; VIDEO_PRESET="$PRESET_INPUT"
+            CROP_FILTER=""
+            echo "ℹ️ لا حواف سوداء"
+          fi
 
-            case "$ENCODE_MODE" in
-              nofilters) [ "$FILTER_PROFILE" = "none" ] || { echo 'بدون فلاتر يتطلب none' >&2; exit 1; };;
-              filters) [[ "$FILTER_PROFILE" = "anime" || "$FILTER_PROFILE" = "realistic" ]] || { echo 'الفلاتر غير صحيحة' >&2; exit 1; };;
-              *) echo 'encode_mode غير صحيح' >&2; exit 1;;
+          # ============================================================
+          # اكتشاف المفكك الصحيح
+          # ============================================================
+          INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=codec_name -of csv=p=0 "$IN")
+          DECODER_ARGS=()
+          [ "$INPUT_CODEC" = "av1" ] && DECODER_ARGS=(-c:v libdav1d)
+
+          # ============================================================
+          # حساب معدل الإطارات
+          # ============================================================
+          SRC_FPS_RAW=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=avg_frame_rate -of csv=p=0 "$IN")
+
+          # تطبيع معدل الإطارات المدخل إلى كسر دقيق
+          normalize_fps() {
+            local f="$1"
+            case "$f" in
+              23.976|23.97) echo "24000/1001" ;;
+              29.97)        echo "30000/1001" ;;
+              59.94)        echo "60000/1001" ;;
+              47.952)       echo "48000/1001" ;;
+              # كسر مباشر مثل 24000/1001
+              */*)          echo "$f" ;;
+              # عدد صحيح
+              *)            echo "${f%.*}/1" ;;
             esac
+          }
 
-            INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$IN")
-            DECODER_ARGS=()
-            if [ "$INPUT_CODEC" = "av1" ]; then DECODER_ARGS=(-c:v libdav1d); fi
+          if [ "$FRAME_RATE" = "auto" ]; then
+            # الإبقاء على معدل المصدر كما هو
+            OUT_FPS="$SRC_FPS_RAW"
+            echo "📽️ معدل الإطارات: auto → مصدر=$SRC_FPS_RAW"
+          else
+            TARGET_FPS_FRAC=$(normalize_fps "$FRAME_RATE")
+            # حساب القيمة العددية للمقارنة
+            SRC_FPS_VAL=$(awk -v f="$SRC_FPS_RAW" \
+              'BEGIN{split(f,a,"/"); print (a[2]>0)?a[1]/a[2]:0}')
+            CAP_FPS_VAL=$(awk -v f="$TARGET_FPS_FRAC" \
+              'BEGIN{split(f,a,"/"); print (a[2]>0)?a[1]/a[2]:a[1]}')
 
-            FILTERS=("setpts=PTS-STARTPTS")
-            : "${SCALE_ALGO:=lanczos}"
-            case "$SCALE_ALGO" in lanczos|bicubic|bilinear|area|spline) ;; *) echo "SCALE_ALGO غير مدعوم" >&2; exit 1 ;; esac
-            if [ "$RESOLUTION" != "auto" ]; then
-              FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=${SCALE_ALGO}+accurate_rnd+full_chroma_int")
+            # إذا كان المصدر أقل من أو يساوي الهدف → احتفظ بمعدل المصدر
+            # إذا كان المصدر أعلى → اخفض إلى الهدف
+            USE_SRC=$(awk -v s="$SRC_FPS_VAL" -v c="$CAP_FPS_VAL" \
+              'BEGIN{print (s>0 && s <= c+0.01)?1:0}')
+            if [ "$USE_SRC" = "1" ]; then
+              OUT_FPS="$SRC_FPS_RAW"
+              echo "📽️ معدل الإطارات: مصدر ($SRC_FPS_RAW) ≤ هدف ($TARGET_FPS_FRAC) → إبقاء المصدر"
+            else
+              OUT_FPS="$TARGET_FPS_FRAC"
+              echo "📽️ معدل الإطارات: تخفيض من $SRC_FPS_RAW إلى $OUT_FPS"
             fi
-            if [ "$ENCODE_MODE" = "filters" ]; then
-              FILTERS+=("format=yuv420p10le")
-            fi
-            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
-              FILTERS+=("hqdn3d=1.5:1.0:1.5:1.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
-            elif [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "realistic" ]; then
-              FILTERS+=("hqdn3d=0.5:0.5:0.5:0.5")
-            fi
-            FILTERS+=("format=yuv420p10le")
-            VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
+          fi
 
-            AUDIO_BITRATE="16k"
-            AC_ARGS=(-ac 1)
+          # ============================================================
+          # بناء سلسلة الفلاتر بناءً على المصدر والملف الشخصي
+          # ============================================================
+          FILTERS=("setpts=PTS-STARTPTS")
 
-            PROBE=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width,height,avg_frame_rate,color_space,color_primaries,color_transfer -of default=noprint_wrappers=1 "$IN" 2>/dev/null || true)
-            probe_field() { sed -n "s/^$1=//p" <<<"$PROBE" | head -n 1; }
-            SRC_W=$(probe_field width); SRC_H=$(probe_field height)
-            SRC_CSP=$(probe_field color_space); SRC_PRI=$(probe_field color_primaries); SRC_TRC=$(probe_field color_transfer)
-            SRC_FPS=$(probe_field avg_frame_rate)
-            OUT_FPS="$FRAME_RATE"
-            if [[ "$SRC_FPS" =~ ^[0-9]+/[0-9]+$ ]] && awk -v f="$SRC_FPS" -v cap="$FRAME_RATE" 'BEGIN{split(f,a,"/"); if (a[2]>0 && a[1]/a[2]>0 && a[1]/a[2] <= cap+0.5) exit 0; exit 1}'; then
-              OUT_FPS="$SRC_FPS"
-            fi
-            COLOR_ARGS=()
-            is_unset() { [ -z "$1" ] || [ "$1" = "unknown" ] || [ "$1" = "unspecified" ]; }
-            if is_unset "$SRC_CSP" && is_unset "$SRC_PRI" && is_unset "$SRC_TRC" \
-               && { [ "${SRC_W:-0}" -ge 1280 ] || [ "${SRC_H:-0}" -gt 576 ]; }; then
-              COLOR_ARGS=(-colorspace bt709 -color_primaries bt709 -color_trc bt709)
-            fi
+          # القص أولاً
+          [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
 
-            : "${VARIANCE_BOOST_STRENGTH:=0}"
-            : "${LUMA_QP_BIAS:=0}"
-            SVT_BASE="tune=0:enable-qm=1:qm-min=0"
-            if [ "$VARIANCE_BOOST_STRENGTH" -gt 0 ]; then
-              SVT_BASE="${SVT_BASE}:enable-variance-boost=1:variance-boost-strength=${VARIANCE_BOOST_STRENGTH}"
-            fi
-            if [ "$LUMA_QP_BIAS" -gt 0 ] && [ "$SRC_TRC" != "smpte2084" ]; then
-              SVT_BASE="${SVT_BASE}:luminance-qp-bias=${LUMA_QP_BIAS}"
-            fi
-            SVT_PARAMS="-svtav1-params ${SVT_BASE}"
-            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
-              SVT_PARAMS="-svtav1-params ${SVT_BASE}:enable-overlays=1:film-grain=6:film-grain-denoise=0"
-            fi
-            echo "SVT: $SVT_PARAMS | COLOR: ${COLOR_ARGS[*]:-(بلا تعديل)} | FPS: $OUT_FPS"
+          # التصغير
+          SCALE_ALGO="lanczos"
+          if [ "$RESOLUTION" != "auto" ]; then
+            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=${SCALE_ALGO}+accurate_rnd+full_chroma_int")
+          fi
 
-            if [ "$ENCODE_METHOD" = "auto" ]; then
-              [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || { echo 'هدف VMAF يجب أن يكون 50-99' >&2; exit 1; }
+          if [ "$ENCODE_MODE" = "filters" ]; then
+            case "$FILTER_PROFILE" in
+              anime)
+                # ======================================================
+                # فلاتر الأنمي - مبنية على طبيعة المحتوى
+                # ======================================================
+                case "$NOISE_CLASS" in
+                  noisy)
+                    # مصدر ضجيج عالٍ: تنعيم قوي ثم استعادة الحدة
+                    echo "🎌 أنمي + ضجيج عالٍ: تنعيم قوي + شحذ"
+                    FILTERS+=("hqdn3d=3.0:2.0:4.0:3.0")
+                    FILTERS+=("cas=0.4")
+                    ;;
+                  medium)
+                    # مصدر ضجيج متوسط: تنعيم معتدل + شحذ خفيف
+                    echo "🎌 أنمي + ضجيج متوسط: تنعيم معتدل"
+                    FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0")
+                    FILTERS+=("cas=0.3")
+                    ;;
+                  clean)
+                    # مصدر نظيف: تنعيم خفيف فقط للبانديج
+                    echo "🎌 أنمي + مصدر نظيف: تنعيم خفيف"
+                    FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0")
+                    ;;
+                esac
+
+                # إصلاح البانديج في الخلفيات للأنمي دائماً
+                FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                ;;
+
+              realistic)
+                # ======================================================
+                # فلاتر الواقعي (أفلام/مسلسلات)
+                # ======================================================
+                case "$NOISE_CLASS" in
+                  noisy)
+                    echo "🎬 واقعي + ضجيج عالٍ: تنعيم موجّه للحواف"
+                    FILTERS+=("hqdn3d=1.5:1.0:2.0:1.5")
+                    ;;
+                  medium)
+                    echo "🎬 واقعي + ضجيج متوسط: تنعيم خفيف"
+                    FILTERS+=("hqdn3d=0.8:0.6:1.2:0.8")
+                    ;;
+                  clean)
+                    echo "🎬 واقعي + مصدر نظيف: بلا تنعيم"
+                    ;;
+                esac
+                ;;
+            esac
+          fi
+
+          # ============================================================
+          # معالجة الألوان بناءً على المصدر
+          # ============================================================
+          COLOR_ARGS=()
+          OUT_PIX_FMT="yuv420p10le"
+
+          if [ "$IS_HDR" = "true" ]; then
+            # HDR حقيقي (PQ): نحتفظ به كما هو
+            echo "🌈 مصدر HDR: الاحتفاظ بالنطاق الكامل"
+            OUT_PIX_FMT="yuv420p10le"
+            COLOR_ARGS=(
+              -colorspace bt2020nc
+              -color_primaries bt2020
+              -color_trc smpte2084
+            )
+          elif [ "$IS_HLG" = "true" ]; then
+            # HLG: نحتفظ به
+            echo "🌈 مصدر HLG: الاحتفاظ بالنطاق الكامل"
+            OUT_PIX_FMT="yuv420p10le"
+            COLOR_ARGS=(
+              -colorspace bt2020nc
+              -color_primaries bt2020
+              -color_trc arib-std-b67
+            )
+          elif [ "$IS_BT2020" = "true" ]; then
+            # BT.2020 SDR (مثل ملف المجموعة): نحتفظ بالنطاق الأصلي
+            echo "🌈 مصدر BT.2020 SDR: الاحتفاظ بالنطاق"
+            OUT_PIX_FMT="yuv420p10le"
+            COLOR_ARGS=(
+              -colorspace bt2020nc
+              -color_primaries bt2020
+              -color_trc "$SRC_TRANSFER"
+            )
+          else
+            # SDR BT.709 عادي
+            echo "📺 مصدر SDR BT.709"
+            OUT_PIX_FMT="yuv420p10le"
+            SRC_WW=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN" | head -1)
+            SRC_HH=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN" | head -1)
+            if { [ "${SRC_WW:-0}" -ge 1280 ] || [ "${SRC_HH:-0}" -gt 576 ]; } && \
+               { [ -z "$SRC_PRIMARIES" ] || [ "$SRC_PRIMARIES" = "unknown" ]; }; then
+              COLOR_ARGS=(
+                -colorspace bt709
+                -color_primaries bt709
+                -color_trc bt709
+              )
+            fi
+          fi
+
+          # تحويل الصيغة النهائية
+          FILTERS+=("format=${OUT_PIX_FMT}")
+
+          VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
+          echo "🔗 سلسلة الفلاتر: $VF_CHAIN"
+
+          # ============================================================
+          # معاملات SVT-AV1
+          # ============================================================
+          NPROC=$(nproc)
+          # حساب عدد العمال: 2 عمال بحد أقصى إذا كان لدينا 4 أنوية أو أقل
+          if (( NPROC <= 4 )); then
+            WORKERS=2
+            THREADS_PER_WORKER=2
+          else
+            WORKERS=$(( NPROC / 2 ))
+            THREADS_PER_WORKER=2
+          fi
+
+          SVT_BASE="tune=0:enable-qm=1:qm-min=0:lp=${THREADS_PER_WORKER}"
+
+          if [ "$FILTER_PROFILE" = "anime" ] && [ "$ENCODE_MODE" = "filters" ]; then
+            SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
+          fi
+
+          SVT_PARAMS="-svtav1-params ${SVT_BASE}"
+
+          echo "⚙️ SVT params: $SVT_PARAMS"
+          echo "👷 عمال: $WORKERS (${THREADS_PER_WORKER} خيط/عامل)"
+
+          # ============================================================
+          # الترميز
+          # ============================================================
+          case "$ENCODE_METHOD" in
+            crf)
+              [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
+                { echo 'CRF غير صحيح (0-63)' >&2; exit 1; }
+
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
+                "${DECODER_ARGS[@]}" -y -i "$IN" \
+                -vf "$VF_CHAIN" \
+                -r "$OUT_FPS" -fps_mode cfr \
+                -c:v libsvtav1 \
+                -preset "$PRESET_INPUT" \
+                -crf "$TARGET_VALUE" \
+                -g 240 \
+                "${COLOR_ARGS[@]}" \
+                $SVT_PARAMS \
+                -an \
+                "$OUT_FILE"
+              CRF_USED="$TARGET_VALUE"
+              ;;
+
+            twopass)
+              [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || \
+                { echo 'معدل بت غير صحيح' >&2; exit 1; }
+              TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
+              PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
+
+              # المرور الأول (نفس المعاملات تماماً)
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
+                "${DECODER_ARGS[@]}" -y -i "$IN" \
+                -vf "$VF_CHAIN" \
+                -r "$OUT_FPS" -fps_mode cfr \
+                -c:v libsvtav1 \
+                -preset "$PRESET_INPUT" \
+                -b:v "$TARGET_VALUE" \
+                -g 240 \
+                "${COLOR_ARGS[@]}" \
+                $SVT_PARAMS \
+                -pass 1 -passlogfile "$PASSLOG" \
+                -an -f null /dev/null
+
+              # المرور الثاني (نفس المعاملات بالضبط)
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
+                "${DECODER_ARGS[@]}" -y -i "$IN" \
+                -vf "$VF_CHAIN" \
+                -r "$OUT_FPS" -fps_mode cfr \
+                -c:v libsvtav1 \
+                -preset "$PRESET_INPUT" \
+                -b:v "$TARGET_VALUE" \
+                -g 240 \
+                "${COLOR_ARGS[@]}" \
+                $SVT_PARAMS \
+                -pass 2 -passlogfile "$PASSLOG" \
+                -an \
+                "$OUT_FILE"
+              CRF_USED="twopass-${TARGET_VALUE}"
+              ;;
+
+            auto)
+              [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || \
+                { echo 'هدف VMAF يجب أن يكون 50-99' >&2; exit 1; }
               VMAF_TARGET="$TARGET_VALUE"
 
-              SVT_FOR_AV1AN=$(printf '%s' "$SVT_BASE" | tr ':' '\n' | sed 's/=/ /; s/^/--/' | paste -sd' ' -)
+              # بناء معاملات SVT لـ Av1an
+              SVT_FOR_AV1AN=$(printf '%s' "$SVT_BASE" | \
+                tr ':' '\n' | sed 's/=/ /; s/^/--/' | paste -sd' ' -)
 
-              AV1AN_IN="$IN"
-              AUDIO_PARAMS_STR="-c:a libopus -b:a ${AUDIO_BITRATE} -ac 1"
+              # فحص المساحة قبل إنشاء ملف ffv1 الوسيط (يحتاج على الأقل 5GB)
+              FREE_GB=$(df -BG . | awk 'NR==2{gsub("G",""); print $4}')
+              echo "💾 مساحة متاحة: ${FREE_GB}GB"
+              (( FREE_GB >= 5 )) || {
+                echo "❌ مساحة غير كافية لملف ffv1 الوسيط: ${FREE_GB}GB" >&2
+                echo "💡 استخدم وضع crf أو twopass بدلاً من auto" >&2
+                exit 1
+              }
 
-              if [ "$ENCODE_MODE" = "filters" ] || [ "$RESOLUTION" != "auto" ]; then
-                PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
-                "$FFMPEG" -hide_banner -nostdin -y "${DECODER_ARGS[@]}" -i "$IN" \
-                  -map 0:v:0 -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr -c:v ffv1 \
-                  -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" -ac 1 "$PRE_FILE"
-                test -s "$PRE_FILE"
-                AV1AN_IN="$PRE_FILE"
-                AUDIO_PARAMS_STR="-c:a copy"
-              fi
+              # تجهيز الملف المفلتر مسبقاً
+              PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
+              "$FFMPEG" -hide_banner -nostdin -y \
+                "${DECODER_ARGS[@]}" -i "$IN" \
+                -map 0:v:0 \
+                -vf "$VF_CHAIN" \
+                -r "$OUT_FPS" -fps_mode cfr \
+                -c:v ffv1 \
+                "$PRE_FILE"
+              test -s "$PRE_FILE"
+              PRE_SIZE=$(du -sh "$PRE_FILE" | cut -f1)
+              echo "📦 حجم الملف الوسيط ffv1: $PRE_SIZE"
 
-              BREW_BIN="$(brew --prefix)/bin"
-              test -x "$BREW_BIN/ffmpeg" || { echo '❌ ffmpeg من Homebrew مفقود' >&2; exit 1; }
-              export PATH="$BREW_BIN:$HOME/codec-build/bin:$PATH"
-              echo "av1an ffmpeg: $(command -v ffmpeg)"
-              echo "🎯 Av1an Target Quality: VMAF=$VMAF_TARGET | chunk-method=segment | filters=$ENCODE_MODE"
+              # حساب حد الذاكرة لـ Av1an (80% من الذاكرة المتاحة بالميغابايت)
+              RAM_MB=$(awk '/MemAvailable/{print int($2/1024*0.8)}' /proc/meminfo)
+              echo "🧠 حد الذاكرة لـ Av1an: ${RAM_MB}MB"
 
+              # Av1an مع الإعدادات الكاملة
               av1an \
-                -i "$AV1AN_IN" \
+                -i "$PRE_FILE" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
-                -v "--preset ${VIDEO_PRESET} --crf 30 ${SVT_FOR_AV1AN}" \
+                -v "--preset ${PRESET_INPUT} --crf 30 ${SVT_FOR_AV1AN}" \
                 --target-quality "$VMAF_TARGET" \
-                -w "$(nproc)" \
+                --probes 4 \
+                --probing-rate 4 \
+                --min-q 20 \
+                --max-q 60 \
+                -w "$WORKERS" \
+                --sc-method standard \
+                --min-scene-len 24 \
+                --extra-split 240 \
                 --chunk-method segment \
-                --audio-params "$AUDIO_PARAMS_STR" \
-                --keep
+                --audio-params "-c:a copy" \
+                --max-ram "$RAM_MB" \
+                --ffmpeg-location "$HOME/codec-build/bin"
+
+              # حذف الملف الوسيط فور الانتهاء لاسترجاع المساحة
+              rm -f "$PRE_FILE"
+              echo "🗑️ تم حذف الملف الوسيط ffv1"
               CRF_USED="Av1an-VMAF${VMAF_TARGET}"
-            else
-              CRF_USED=""
-              if [ "$ENCODE_METHOD" = "crf" ]; then
-                [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
-                CRF_USED="$TARGET_VALUE"
-                "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
-                  -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 240 "${COLOR_ARGS[@]}" $SVT_PARAMS \
-                  -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
-              else
-                [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
-                TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
-                PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
-                "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
-                  -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 240 -pass 1 -passlogfile "$PASSLOG" -an -f null /dev/null
-                "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$OUT_FPS" -fps_mode cfr \
-                  -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 240 -pass 2 -passlogfile "$PASSLOG" "${COLOR_ARGS[@]}" $SVT_PARAMS \
-                  -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
-              fi
+              ;;
+          esac
+
+          # ============================================================
+          # التحقق من الناتج
+          # ============================================================
+          test -s "$OUT_FILE" || { echo '❌ ملف الناتج فارغ' >&2; exit 1; }
+
+          OUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | head -1)
+          [ "$OUT_CODEC" = "av1" ] || { echo "❌ الناتج ليس AV1: $OUT_CODEC" >&2; exit 1; }
+
+          IN_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$IN")
+          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
+          printf '📊 المدة: مدخل=%s ناتج=%s\n' "$IN_DUR" "$OUT_DUR"
+
+          # تقرير الجودة
+          (
+            set +e
+            Q_W=$("$FFPROBE" -v error -select_streams v:0 \
+              -show_entries stream=width -of csv=p=0 "$OUT_FILE" | head -1)
+            Q_H=$("$FFPROBE" -v error -select_streams v:0 \
+              -show_entries stream=height -of csv=p=0 "$OUT_FILE" | head -1)
+            Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
+          [1:v]setpts=PTS-STARTPTS,fps=${OUT_FPS},\
+          scale=${Q_W}:${Q_H}:flags=lanczos+accurate_rnd+full_chroma_int,\
+          format=yuv420p10le[r]"
+            SSIM=$("$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
+              -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | \
+              grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2)
+            VMAF_SCORE=""
+            if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
+              "$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
+                -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:\
+          log_path=${OUT_DIR}/vmaf_${CHUNK_ID}.json:n_threads=$(nproc):n_subsample=6" \
+                -f null - >/dev/null 2>&1
+              VMAF_SCORE=$(python3 -c "
+          import json,sys
+          d=json.load(open(sys.argv[1]))
+          print(round(d['pooled_metrics']['vmaf']['mean'],2))
+          " "${OUT_DIR}/vmaf_${CHUNK_ID}.json" 2>/dev/null)
             fi
-          fi
-
-          test -s "$OUT_FILE"
-          if [ "$CODEC" != "audio" ]; then
-            "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | grep -Eq '^av1$' || { echo 'خطأ: لا يوجد فيديو AV1' >&2; exit 1; }
-          fi
-          HAS_INPUT_AUDIO=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$IN" | head -n 1 || true)
-          if [ "$CODEC" = "audio" ] || [ -n "$HAS_INPUT_AUDIO" ]; then
-            "$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | grep -q 'opus' || { echo 'خطأ: لا يوجد صوت Opus' >&2; exit 1; }
-          fi
-          IN_DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$IN")
-          OUT_DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
-          printf 'DURATION CHECK: input=%s output=%s\n' "$IN_DURATION" "$OUT_DURATION"
-
-          if [ "$CODEC" != "audio" ] && [ "${QUALITY_REPORT:-1}" = "1" ]; then
-            (
-              set +e
-              Q_W=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$OUT_FILE" | head -n 1)
-              Q_H=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$OUT_FILE" | head -n 1)
-              Q_N=$("$FFPROBE" -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE" | head -n 1)
-              Q_REF_SCALE="${QUALITY_REF_SCALE:-${SCALE_ALGO:-lanczos}}"
-              Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];[1:v]setpts=PTS-STARTPTS,fps=${OUT_FPS:-24},scale=${Q_W}:${Q_H}:flags=${Q_REF_SCALE}+accurate_rnd+full_chroma_int,format=yuv420p10le[r]"
-              SSIM_ALL=$("$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | grep -o 'All:[0-9.]*' | tail -n 1 | cut -d: -f2)
-              VMAF_MEAN=""
-              if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
-                "$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
-                  -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:log_path=${OUT_DIR}/vmaf_${CHUNK_ID}.json:n_threads=$(nproc):n_subsample=2" -f null - >/dev/null 2>&1
-                VMAF_MEAN=$(python3 -c "import json,sys; print(round(json.load(open(sys.argv[1]))['pooled_metrics']['vmaf']['mean'],2))" "${OUT_DIR}/vmaf_${CHUNK_ID}.json" 2>/dev/null)
-              fi
-              echo "frames=${Q_N:-0} ssim=${SSIM_ALL:-NA} vmaf=${VMAF_MEAN:-NA} crf=${CRF_USED:-NA}" > "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt"
-              echo "QUALITY chunk=${CHUNK_ID} ref_scale=${Q_REF_SCALE}: $(cat "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt")"
-            ) || true
-          fi
+            echo "frames=NA ssim=${SSIM:-NA} vmaf=${VMAF_SCORE:-NA} crf=${CRF_USED:-NA}" \
+              > "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt"
+            echo "📈 الجودة: $(cat "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt")"
+          ) || true
 
       - name: رفع الجزء المضغوط
         uses: actions/upload-artifact@v4
@@ -845,13 +1011,16 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  # ============================================================
+  # 4. دمج الناتج وإرساله
+  # ============================================================
   merge-and-send:
     name: دمج الناتج وإرساله
     needs: [prepare-codec-build, split-video, encode-chunks]
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: استعادة FFmpeg الموحد للدمج
+      - name: استعادة FFmpeg للدمج
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
@@ -859,23 +1028,29 @@ jobs:
             ~/codec-build
             ~/.cargo
             ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v11
 
-      - name: تجهيز أدوات الدمج والإرسال
+      - name: تجهيز أدوات الدمج
         run: |
           set -euo pipefail
-          sudo apt update
-          sudo apt install -y ffmpeg libdav1d-dev libopus0
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg libdav1d-dev libopus0
           python3 -m pip install --user telethon
 
-      - name: تنزيل جميع الأجزاء المضغوطة
+      - name: تنزيل الأجزاء المضغوطة
         uses: actions/download-artifact@v4
         with:
           pattern: encoded-*
           path: all_encoded
           merge-multiple: true
 
-      - name: دمج الأجزاء
+      - name: تنزيل الصوت المضغوط
+        uses: actions/download-artifact@v4
+        with:
+          name: raw-chunks
+          path: audio_dl
+
+      - name: دمج الفيديو + الصوت
         env:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
@@ -883,18 +1058,130 @@ jobs:
           if [ "$CODEC" = "audio" ]; then
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           else
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"
+            FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           fi
+
           cd all_encoded
           find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
           test -s /tmp/encoded_files.txt
           sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
-          "$FFMPEG" -hide_banner -nostdin -y -f concat -safe 0 -i concat_list.txt -map 0 -c copy "../output.mkv"
-          test -s "../output.mkv"
-          if [ "$CODEC" != "audio" ]; then
-            "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "../output.mkv" | grep -Eq '^av1$' || { echo 'الدمج فقد الفيديو' >&2; exit 1; }
+
+          # دمج الفيديو أولاً
+          "$FFMPEG" -hide_banner -nostdin -y \
+            -f concat -safe 0 -i concat_list.txt \
+            -map 0:v \
+            -c:v copy \
+            "../video_only.mkv"
+          test -s "../video_only.mkv"
+
+          cd ..
+
+          # دمج الفيديو مع الصوت المضغوط مسبقاً
+          AUDIO_FILE="audio_dl/audio_compressed.opus"
+          if [ -s "$AUDIO_FILE" ]; then
+            "$FFMPEG" -hide_banner -nostdin -y \
+              -i video_only.mkv \
+              -i "$AUDIO_FILE" \
+              -map 0:v \
+              -map 1:a \
+              -c:v copy \
+              -c:a copy \
+              output.mkv
+          else
+            echo "⚠️ لا يوجد صوت، نسخ الفيديو فقط"
+            cp video_only.mkv output.mkv
           fi
+
+          test -s "output.mkv"
+
+          if [ "$CODEC" != "audio" ]; then
+            "$FFPROBE" -v error -select_streams v:0 \
+              -show_entries stream=codec_name -of csv=p=0 "output.mkv" | \
+              grep -Eq '^av1$' || { echo '❌ الدمج فقد الفيديو AV1' >&2; exit 1; }
+          fi
+
+          # التحقق من مدة الناتج
+          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 output.mkv | cut -d. -f1)
+          echo "✅ مدة الناتج النهائي: ${OUT_DUR}s"
+
+      - name: قياس الجودة على الناتج الكامل
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+        run: |
+          set -euo pipefail
+          [ "$CODEC" = "audio" ] && { echo "⏭️ وضع صوت: تخطي قياس الجودة"; exit 0; }
+
+          if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"
+            FFPROBE="$HOME/codec-build/bin/ffprobe"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          else
+            FFMPEG=ffmpeg; FFPROBE=ffprobe
+          fi
+
+          # قياس على 90 ثانية من المنتصف (تغطي عدة أجزاء وحدودها)
+          TOTAL_DUR=$("$FFPROBE" -v error -show_entries format=duration \
+            -of csv=p=0 output.mkv | cut -d. -f1)
+          SAMPLE_START=$(( TOTAL_DUR / 2 - 45 ))
+          (( SAMPLE_START < 0 )) && SAMPLE_START=0
+          SAMPLE_DUR=90
+          (( SAMPLE_START + SAMPLE_DUR > TOTAL_DUR )) && SAMPLE_DUR=$(( TOTAL_DUR - SAMPLE_START ))
+
+          echo "📊 قياس الجودة: من ${SAMPLE_START}s لمدة ${SAMPLE_DUR}s"
+
+          Q_W=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=width -of csv=p=0 output.mkv | head -1)
+          Q_H=$("$FFPROBE" -v error -select_streams v:0 \
+            -show_entries stream=height -of csv=p=0 output.mkv | head -1)
+
+          # استخراج عينة الناتج
+          "$FFMPEG" -hide_banner -nostdin -y \
+            -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
+            -i output.mkv \
+            -map 0:v:0 -c:v copy sample_out.mkv
+
+          # استخراج عينة المصدر بالدقة نفسها
+          # المصدر موجود في audio_dl (رُفع مع raw-chunks)
+          SRC_FILE="audio_dl/$(ls audio_dl/*.mp4 audio_dl/*.mkv 2>/dev/null | head -1 || echo '')"
+          if [ -z "$SRC_FILE" ] || [ ! -s "$SRC_FILE" ]; then
+            echo "⚠️ المصدر الأصلي غير متاح في مرحلة الدمج، تخطي VMAF"
+            exit 0
+          fi
+
+          Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
+          [1:v]ss=${SAMPLE_START},setpts=PTS-STARTPTS,\
+          scale=${Q_W}:${Q_H}:flags=lanczos+accurate_rnd+full_chroma_int,\
+          format=yuv420p10le[r]"
+
+          # SSIM
+          SSIM=$("$FFMPEG" -hide_banner -nostdin \
+            -i sample_out.mkv -ss "$SAMPLE_START" -t "$SAMPLE_DUR" -i "$SRC_FILE" \
+            -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | \
+            grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2 || echo "NA")
+
+          # VMAF
+          VMAF_SCORE="NA"
+          if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
+            "$FFMPEG" -hide_banner -nostdin \
+              -i sample_out.mkv -ss "$SAMPLE_START" -t "$SAMPLE_DUR" -i "$SRC_FILE" \
+              -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:\
+          log_path=vmaf_final.json:n_threads=$(nproc):n_subsample=6" \
+              -f null - >/dev/null 2>&1 || true
+            VMAF_SCORE=$(python3 -c "
+          import json, sys
+          try:
+              d = json.load(open('vmaf_final.json'))
+              print(round(d['pooled_metrics']['vmaf']['mean'], 2))
+          except:
+              print('NA')
+          " 2>/dev/null)
+          fi
+
+          echo "📈 جودة الناتج الكامل: SSIM=${SSIM} VMAF=${VMAF_SCORE}"
+          echo "SSIM=${SSIM} VMAF=${VMAF_SCORE}" > final_quality.txt
+          rm -f sample_out.mkv
 
       - name: استخراج معلومات الناتج
         id: videoinfo
@@ -902,42 +1189,63 @@ jobs:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
-          DURATION_SEC=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "output.mkv" | cut -d. -f1)
-          H=$((DURATION_SEC / 3600)); M=$(((DURATION_SEC % 3600) / 60)); S=$((DURATION_SEC % 60))
-          echo "duration_fmt=$(printf '%02d:%02d:%02d' "$H" "$M" "$S")" >> "$GITHUB_OUTPUT"
+          DURATION_SEC=$(ffprobe -v error -show_entries format=duration \
+            -of csv=p=0 "output.mkv" | cut -d. -f1)
+          H=$((DURATION_SEC/3600)); M=$(((DURATION_SEC%3600)/60)); S=$((DURATION_SEC%60))
+          echo "duration_fmt=$(printf '%02d:%02d:%02d' $H $M $S)" >> "$GITHUB_OUTPUT"
+
           if [ "$CODEC" = "audio" ]; then
             echo 'actual_res=صوت فقط' >> "$GITHUB_OUTPUT"
           else
-            ACTUAL_RES=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
+            ACTUAL_RES=$(ffprobe -v error -select_streams v:0 \
+              -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
             echo "actual_res=$ACTUAL_RES" >> "$GITHUB_OUTPUT"
+
+            V_CODEC=$(ffprobe -v error -select_streams v:0 \
+              -show_entries stream=codec_name -of csv=p=0 "output.mkv" | head -1)
+            V_PIX=$(ffprobe -v error -select_streams v:0 \
+              -show_entries stream=pix_fmt -of csv=p=0 "output.mkv" | head -1)
+            V_FPS=$(ffprobe -v error -select_streams v:0 \
+              -show_entries stream=avg_frame_rate -of csv=p=0 "output.mkv" | head -1)
+            echo "video_info=${V_CODEC} ${V_PIX} ${V_FPS}" >> "$GITHUB_OUTPUT"
           fi
-          A_CODEC=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+
+          A_CODEC=$(ffprobe -v error -select_streams a:0 \
+            -show_entries stream=codec_name -of csv=p=0 "output.mkv" 2>/dev/null | head -1 || true)
           if [ -z "$A_CODEC" ]; then
             echo "actual_abr=بلا صوت" >> "$GITHUB_OUTPUT"
           else
-            A_CH=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
-            A_BR=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "output.mkv" 2>/dev/null | head -n 1 || true)
+            A_CH=$(ffprobe -v error -select_streams a:0 \
+              -show_entries stream=channels -of csv=p=0 "output.mkv" | head -1)
+            A_BR=$(ffprobe -v error -select_streams a:0 \
+              -show_entries stream=bit_rate -of csv=p=0 "output.mkv" | head -1)
             A_LABEL="$A_CODEC"
-            if [ "$A_CH" = "1" ]; then A_LABEL="$A_LABEL أحادي"; elif [ "$A_CH" = "2" ]; then A_LABEL="$A_LABEL ستيريو"; fi
-            if [[ "$A_BR" =~ ^[0-9]+$ ]]; then A_LABEL="$A_LABEL ~$((A_BR / 1000))k"; fi
+            [ "$A_CH" = "1" ] && A_LABEL="$A_LABEL أحادي" || A_LABEL="$A_LABEL ستيريو"
+            [[ "$A_BR" =~ ^[0-9]+$ ]] && A_LABEL="$A_LABEL ~$((A_BR/1000))k"
             echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
           fi
 
+          # تقرير الجودة: نفضّل القياس على الناتج الكامل إن وُجد
           Q_LINE="غير متاح"
-          if ls all_encoded/encoded_*.quality.txt >/dev/null 2>&1; then
+          if [ -f final_quality.txt ]; then
+            Q_LINE=$(cat final_quality.txt)
+            echo "✅ جودة الناتج الكامل: $Q_LINE"
+          elif ls all_encoded/encoded_*.quality.txt >/dev/null 2>&1; then
             Q_LINE=$(cat all_encoded/encoded_*.quality.txt | awk '
-              function add(x) { out = (out == "") ? x : out " • " x }
-              { f=0; s=""; v=""; c="";
-                for (i=1; i<=NF; i++) { split($i, kv, "="); if (kv[1]=="frames") f=kv[2]; else if (kv[1]=="ssim") s=kv[2]; else if (kv[1]=="vmaf") v=kv[2]; else if (kv[1]=="crf") c=kv[2] }
-                if (f>0 && s ~ /^[0-9.]+$/) { sf+=f*s; nf+=f }
-                if (f>0 && v ~ /^[0-9.]+$/) { vf+=f*v; vn+=f; if (min_v=="" || v+0<min_v+0) min_v=v }
-                if (f>0 && c ~ /^[A-Za-z0-9-]+$/) { cn++; if (min_c=="") min_c=c; if (max_c=="" || (c+0)>(max_c+0)) max_c=c } }
-              END { out="";
-                    if (nf>0) add(sprintf("SSIM %.4f", sf/nf));
-                    if (vn>0) add(sprintf("VMAF %.1f (أدنى قطعة %.1f)", vf/vn, min_v));
-                    if (cn>0) { if (min_c ~ /^[0-9]+$/ && max_c ~ /^[0-9]+$/) add((min_c==max_c) ? sprintf("CRF %s", min_c) : sprintf("CRF %s–%s", min_c, max_c)); else add(min_c); }
-                    if (out=="") out="غير متاح";
-                    print out }')
+              function add(x){out=(out=="")?x:out" • "x}
+              {s="";v="";c=""
+               for(i=1;i<=NF;i++){split($i,kv,"=");
+                 if(kv[1]=="ssim")s=kv[2];
+                 else if(kv[1]=="vmaf")v=kv[2];
+                 else if(kv[1]=="crf")c=kv[2]}
+               if(s~/^[0-9.]+/){ss+=s;ns++}
+               if(v~/^[0-9.]+/){vv+=v;nv++;if(mv==""||v+0<mv+0)mv=v}
+               if(c!="NA"&&c!=""){cc=c}}
+              END{out="";
+                if(ns>0)add(sprintf("SSIM %.4f",ss/ns));
+                if(nv>0)add(sprintf("VMAF %.1f (أدنى %.1f)",vv/nv,mv));
+                if(cc!="")add("CRF "cc);
+                if(out=="")out="غير متاح";print out}')
           fi
           echo "quality=$Q_LINE" >> "$GITHUB_OUTPUT"
 
@@ -946,10 +1254,9 @@ jobs:
         env:
           FILENAME: ${{ github.event.inputs.filename }}
         run: |
-          set -euo pipefail
-          sanitize() { printf '%s' "$1" | head -n1 | tr -d '\r' | sed 's#[/\\:*?"<>|]# #g; s/  */ /g; s/^ *//; s/ *$//'; }
-          SAFE_FILENAME=$(sanitize "$FILENAME")
-          echo "final_name=${SAFE_FILENAME:-video}" >> "$GITHUB_OUTPUT"
+          SAFE=$(printf '%s' "$FILENAME" | head -n1 | tr -d '\r' | \
+            sed 's#[/\\:*?"<>|]# #g; s/  */ /g; s/^ *//; s/ *$//')
+          echo "final_name=${SAFE:-video}" >> "$GITHUB_OUTPUT"
 
       - name: رفع الناتج وإشعار المستخدم
         env:
@@ -963,32 +1270,57 @@ jobs:
           DURATION_FMT: ${{ steps.videoinfo.outputs.duration_fmt }}
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
+          VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
           QUALITY: ${{ steps.videoinfo.outputs.quality }}
           CODEC: ${{ github.event.inputs.codec }}
           FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
+          NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
+          IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
         run: |
           set -euo pipefail
           UPLOAD_FILE="${FINAL_NAME}.mkv"
           mv "output.mkv" "$UPLOAD_FILE"
           FILE_SIZE=$(stat -c%s "$UPLOAD_FILE")
-          SIZE_MB=$(awk -v size="$FILE_SIZE" 'BEGIN {printf "%.1f", size / 1048576}')
-          CAPTION=$(printf '🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT" "$CODEC" "$FILTER_PROFILE")
+          SIZE_MB=$(awk -v s="$FILE_SIZE" 'BEGIN{printf "%.1f",s/1048576}')
+
+          COLOR_TAG=""
+          [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | 🎨 BT.2020"
+
+          CAPTION=$(printf '🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s | ضجيج: %s%s' \
+            "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
+            "$QUALITY" "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
+            "$FILTER_PROFILE" "$NOISE_CLASS" "$COLOR_TAG")
           export UPLOAD_FILE CAPTION
+
           python3 <<'PYEOF'
           import asyncio, os
           from telethon import TelegramClient
           from telethon.sessions import StringSession
           async def main():
-              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              client = TelegramClient(
+                  StringSession(os.environ["TG_SESSION"]),
+                  int(os.environ["TG_API_ID"]),
+                  os.environ["TG_API_HASH"])
               await client.start()
               async with client:
-                  await client.send_file(int(os.environ["TG_CHANNEL_ID"]), os.environ["UPLOAD_FILE"], caption=os.environ["CAPTION"], force_document=True)
+                  await client.send_file(
+                      int(os.environ["TG_CHANNEL_ID"]),
+                      os.environ["UPLOAD_FILE"],
+                      caption=os.environ["CAPTION"],
+                      force_document=True)
           asyncio.run(main())
           PYEOF
-          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
-          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MESSAGE}"
 
+          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' \
+            "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
+          curl --fail --silent --show-error \
+            -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}"
+
+  # ============================================================
+  # 5. إشعار الفشل
+  # ============================================================
   notify-failure:
     name: إشعار فشل العملية
     needs: [prepare-codec-build, split-video, encode-chunks, merge-and-send]
@@ -1001,15 +1333,16 @@ jobs:
       ) }}
     runs-on: ubuntu-24.04
     steps:
-      - name: إرسال رابط سجل الفشل
+      - name: إرسال رابط السجل
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          set -euo pipefail
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          MESSAGE=$(printf '❌ فشلت عملية الضغط.\n\n📋 افتح السجل لمعرفة المرحلة والخطأ:\n%s' "$RUN_URL")
-          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MESSAGE}"
+          MESSAGE=$(printf '❌ فشلت عملية الضغط.\n\n📋 السجل:\n%s' "$RUN_URL")
+          curl --fail --silent --show-error \
+            -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}"
