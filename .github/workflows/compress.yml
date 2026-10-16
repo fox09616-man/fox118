@@ -25,9 +25,11 @@ on:
         type: choice
         options: ['av1', 'audio']
       preset:
-        description: 'AV1: رقم من 0 إلى 13. كلما قل كان أبطأ وأصغر حجماً.'
+        description: 'AV1: رقم من 0 إلى 13. يُهمَل عند اختيار audio.'
         required: true
         default: '6'
+        type: choice
+        options: ['none', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
       encode_mode:
         description: 'وضع الفلاتر: filters مع فلاتر، nofilters بدونها، audio للصوت.'
         required: true
@@ -35,11 +37,11 @@ on:
         type: choice
         options: ['filters', 'nofilters', 'audio']
       encode_method:
-        description: 'طريقة الترميز: crf بجودة ثابتة، twopass بمعدل بت، auto بهدف VMAF.'
+        description: 'طريقة الترميز: crf بجودة ثابتة، twopass بمعدل بت، auto بهدف VMAF، audio لاستخراج الصوت.'
         required: true
         default: 'crf'
         type: choice
-        options: ['crf', 'twopass', 'auto']
+        options: ['crf', 'twopass', 'auto', 'audio']
       target_value:
         description: 'CRF من 0 إلى 63، أو معدل بت مثل 500k، أو هدف VMAF من 50 إلى 99 مع auto.'
         required: true
@@ -165,7 +167,6 @@ jobs:
           mkdir -p "$HOME/codec-build" "$HOME/codec-sources"
           cd "$HOME/codec-sources"
 
-          # SVT-AV1 إصدار مثبّت
           git clone --depth 1 --branch v2.3.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git
           cmake -S SVT-AV1 -B SVT-AV1/Build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -174,7 +175,6 @@ jobs:
           cmake --build SVT-AV1/Build --parallel "$(nproc)"
           cmake --install SVT-AV1/Build
 
-          # VMAF إصدار مثبّت
           git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git
           meson setup vmaf/libvmaf/build vmaf/libvmaf \
             --buildtype release \
@@ -185,7 +185,6 @@ jobs:
           ninja -C vmaf/libvmaf/build
           ninja -C vmaf/libvmaf/build install
 
-          # FFmpeg إصدار مثبّت
           git clone --depth 1 --branch n7.1 https://github.com/FFmpeg/FFmpeg.git
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
@@ -370,7 +369,6 @@ jobs:
           SRC_BITRATE=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=bit_rate -of csv=p=0 raw_input.mp4 | head -1)
 
-          # تحديد نوع المصدر
           is_bt2020=false
           is_hdr=false
           is_hlg=false
@@ -381,7 +379,6 @@ jobs:
             arib-std-b67)  is_hdr=true; is_hlg=true ;;
           esac
 
-          # عمق البت الحقيقي
           BIT_DEPTH=8
           case "$PIX_FMT" in
             *p10*|*10le*|*10be*) BIT_DEPTH=10 ;;
@@ -395,7 +392,6 @@ jobs:
 
           echo "Inter-frame PSNR noise: $NOISE_SCORE"
 
-          # تصنيف الضجيج: نظيف أعلى من 50، متوسط بين 40 و 50، عالٍ أقل من 40
           NOISE_CLASS="clean"
           if awk "BEGIN{exit !($NOISE_SCORE < 40)}"; then
             NOISE_CLASS="noisy"
@@ -466,7 +462,6 @@ jobs:
             : > audio_compressed.opus
           fi
 
-          # إنشاء عيّنة صغيرة لقياس VMAF على الناتج الكامل
           SRC_DUR=$("$FFPROBE" -v error -show_entries format=duration \
             -of csv=p=0 raw_input.mp4 | cut -d. -f1)
           SAMPLE_START=$(( SRC_DUR / 2 - 45 ))
@@ -674,7 +669,6 @@ jobs:
             fi
           fi
 
-          # قراءة معلومات المصدر من JSON
           eval "$(echo "$SOURCE_INFO" | python3 -c "
           import json, sys
           try:
@@ -695,7 +689,6 @@ jobs:
           echo "BT.2020=$IS_BT2020 | HDR=$IS_HDR | HLG=$IS_HLG | noise=$NOISE_CLASS"
           echo "Color: $SRC_PRIMARIES / $SRC_TRANSFER / $SRC_COLORSPACE | range: $SRC_RANGE"
 
-          # التحقق من المدخلات
           case "$CODEC" in av1|audio) ;; *) echo "Unsupported codec" >&2; exit 1 ;; esac
           if [ "$RESOLUTION" != "auto" ]; then
             [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'Invalid resolution' >&2; exit 1; }
@@ -704,9 +697,8 @@ jobs:
           fi
           [[ "$FRAME_RATE" =~ ^(auto|[0-9]+(\.[0-9]+)?|[0-9]+/[0-9]+)$ ]] || \
             { echo 'Invalid frame rate' >&2; exit 1; }
-          [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'Invalid preset' >&2; exit 1; }
+          [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3]|none)$ ]] || { echo 'Invalid preset' >&2; exit 1; }
 
-          # وضع audio
           if [ "$CODEC" = "audio" ]; then
             [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'Invalid bitrate' >&2; exit 1; }
             TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
@@ -715,7 +707,6 @@ jobs:
             exit 0
           fi
 
-          # كشف الحواف السوداء
           echo "Detecting black bars..."
           CROPDETECT=$("$FFMPEG" -hide_banner -nostdin -t 120 -i "$IN" \
             -vf "cropdetect=24:16:0" -f null - 2>&1 | \
@@ -742,13 +733,11 @@ jobs:
             echo "No black bars"
           fi
 
-          # اختيار المفكك الصحيح
           INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=codec_name -of csv=p=0 "$IN")
           DECODER_ARGS=()
           [ "$INPUT_CODEC" = "av1" ] && DECODER_ARGS=(-c:v libdav1d)
 
-          # حساب معدل الإطارات
           SRC_FPS_RAW=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=avg_frame_rate -of csv=p=0 "$IN")
 
@@ -785,19 +774,14 @@ jobs:
           # ============================================================
           FILTERS=("setpts=PTS-STARTPTS")
 
-          # القص أولاً
           [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
 
-          # التصغير
           if [ "$RESOLUTION" != "auto" ]; then
             FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int+full_chroma_pos")
           fi
 
           if [ "$ENCODE_MODE" = "filters" ]; then
 
-            # --------------------------------------------------------
-            # 1) التنعيم
-            # --------------------------------------------------------
             case "${DENOISE_FILTER}:${DENOISE_STRENGTH}" in
               "hqdn3d:light")          FILTERS+=("hqdn3d=1.0:0.8:1.5:1.0") ;;
               "hqdn3d:medium")         FILTERS+=("hqdn3d=2.0:1.5:3.0:2.0") ;;
@@ -825,9 +809,6 @@ jobs:
               *)                       echo "Unknown denoise combo: ${DENOISE_FILTER}:${DENOISE_STRENGTH}" >&2 ;;
             esac
 
-            # --------------------------------------------------------
-            # 2) البانديج
-            # --------------------------------------------------------
             case "$DEBAND_FILTER" in
               deband)
                 FILTERS+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true") ;;
@@ -840,9 +821,6 @@ jobs:
               *) echo "Unknown deband: $DEBAND_FILTER" >&2 ;;
             esac
 
-            # --------------------------------------------------------
-            # 3) السطوع
-            # --------------------------------------------------------
             case "$BRIGHTNESS_CURVE" in
               eq)
                 FILTERS+=("eq=brightness=0.05:contrast=1.05") ;;
@@ -856,9 +834,6 @@ jobs:
               *) echo "Unknown brightness: $BRIGHTNESS_CURVE" >&2 ;;
             esac
 
-            # --------------------------------------------------------
-            # 4) التشبع
-            # --------------------------------------------------------
             case "$SATURATION_BOOST" in
               eq)
                 FILTERS+=("eq=saturation=1.1") ;;
@@ -868,9 +843,6 @@ jobs:
               *) echo "Unknown saturation: $SATURATION_BOOST" >&2 ;;
             esac
 
-            # --------------------------------------------------------
-            # 5) الحدة
-            # --------------------------------------------------------
             case "$SHARPEN_FILTER" in
               cas)
                 FILTERS+=("cas=0.3") ;;
@@ -880,9 +852,6 @@ jobs:
               *) echo "Unknown sharpen: $SHARPEN_FILTER" >&2 ;;
             esac
 
-            # --------------------------------------------------------
-            # 6) القيم المخصصة (تعمل فوق الاختيارات)
-            # --------------------------------------------------------
             [ -n "${CUSTOM_DENOISE:-}" ]    && FILTERS+=("$CUSTOM_DENOISE")
             [ -n "${CUSTOM_DEBAND:-}" ]     && FILTERS+=("$CUSTOM_DEBAND")
             [ -n "${CUSTOM_BRIGHTNESS:-}" ] && FILTERS+=("$CUSTOM_BRIGHTNESS")
@@ -891,7 +860,6 @@ jobs:
 
           fi
 
-          # معالجة الألوان
           COLOR_ARGS=()
           OUT_PIX_FMT="yuv420p10le"
 
@@ -936,7 +904,6 @@ jobs:
           VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
           echo "Filter chain: $VF_CHAIN"
 
-          # معاملات SVT-AV1
           NPROC=$(nproc)
           if [ "$NPROC" -le 4 ]; then
             WORKERS=2
@@ -948,7 +915,7 @@ jobs:
 
           SVT_BASE="tune=0:enable-qm=1:qm-min=0:lp=${THREADS_PER_WORKER}"
 
-          # film-grain يُفعّل عندما يكون التنعيم نشطاً (بدل FILTER_PROFILE القديم)
+          # film-grain يُفعّل عندما يكون التنعيم نشطاً
           if [ "$ENCODE_MODE" = "filters" ] && [ "$DENOISE_FILTER" != "off" ]; then
             SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
           fi
@@ -958,7 +925,6 @@ jobs:
           echo "SVT params: $SVT_PARAMS"
           echo "Workers: $WORKERS threads-per-worker: $THREADS_PER_WORKER"
 
-          # الترميز
           case "$ENCODE_METHOD" in
             crf)
               [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
@@ -1070,7 +1036,6 @@ jobs:
               ;;
           esac
 
-          # التحقق من الناتج
           test -s "$OUT_FILE" || { echo 'Empty output file' >&2; exit 1; }
 
           OUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
@@ -1081,7 +1046,6 @@ jobs:
           OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
           echo "Duration: in=$IN_DUR out=$OUT_DUR"
 
-          # قياس الجودة لكل قطعة
           (
             set +e
             Q_W=$("$FFPROBE" -v error -select_streams v:0 \
@@ -1364,23 +1328,17 @@ jobs:
           set -euo pipefail
 
           RAW="${FILENAME:-}"
-
-          # إزالة CR/LF/Tab
           RAW=$(printf '%s' "$RAW" | tr -d '\000-\010\013\014\016-\037\r\n\t')
 
-          # تنقية ذكية عبر python3
           DISPLAY_NAME=$(printf '%s' "$RAW" | python3 -c "
 import sys, unicodedata
 s = sys.stdin.read()
-# إزالة BiDi
 strip = set()
 for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
           list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
     strip.add(chr(cp))
 s = ''.join(ch for ch in s if ch not in strip)
-# NFC
 s = unicodedata.normalize('NFC', s)
-# استبدال ذكي
 def is_letter(c): return unicodedata.category(c).startswith('L')
 def is_digit(c):  return unicodedata.category(c).startswith('N')
 def is_allowed(c):
