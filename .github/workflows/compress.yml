@@ -1,4 +1,4 @@
-name: ضغط الفيديو الشخصي الموحد (AV1)
+Name: ضغط الفيديو الشخصي الموحد (AV1)
 
 on:
   workflow_dispatch:
@@ -1159,7 +1159,7 @@ jobs:
           fi
 
           # ============================================================
-          # فلاتر التشكيلة المختارة
+          # فلاتر التشكيلة المختارة (مرتبة هندسياً: ألوان ثم تنظيف ثم حواف)
           # ============================================================
           FILTERS_EXTRA=()
 
@@ -1173,64 +1173,84 @@ jobs:
 
               clean-gentle)
                 echo "Preset: clean-gentle"
-                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                FILTERS_EXTRA+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16:blur=false")
+                FILTERS_EXTRA+=("gradfun=strength=1.0:radius=16")
                 FILTERS_EXTRA+=("cas=0.2")
                 ;;
 
               anime-balanced)
                 echo "Preset: anime-balanced"
-                FILTERS_EXTRA+=("hqdn3d=2.0:1.5:3.0:2.0")
-                FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.02:v=0.04")
-                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                # 1. تعديل الألوان أولاً
                 FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02")
-                FILTERS_EXTRA+=("cas=0.3")
+                FILTERS_EXTRA+=("colorbalance=rs=0.04:gs=0.02:bs=-0.02")
+                # 2. إزالة التشويش والتدرجات ثانياً
+                FILTERS_EXTRA+=("hqdn3d=1.5:1.5:2.0:2.0")
+                FILTERS_EXTRA+=("deband=1thr=0.025:2thr=0.025:3thr=0.025:range=16:blur=false")
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                # 3. معالجة الحواف أخيراً
+                FILTERS_EXTRA+=("cas=0.25")
                 ;;
 
               anime-vibrant)
                 echo "Preset: anime-vibrant"
-                FILTERS_EXTRA+=("hqdn3d=2.0:1.5:3.0:2.0")
-                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                # 1. الألوان أولاً
                 FILTERS_EXTRA+=("curves=all='0/0 0.1/0.20 0.3/0.42 0.5/0.60 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.08:gs=0.04:bs=-0.04")
-                FILTERS_EXTRA+=("cas=0.3")
+                FILTERS_EXTRA+=("colorbalance=rs=0.06:gs=0.03:bs=-0.03")
+                # 2. التنظيف ثانياً
+                FILTERS_EXTRA+=("hqdn3d=1.5:1.5:2.0:2.0")
+                FILTERS_EXTRA+=("deband=1thr=0.025:2thr=0.025:3thr=0.025:range=16:blur=false")
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                # 3. الحواف أخيراً
+                FILTERS_EXTRA+=("cas=0.25")
                 ;;
 
               anime-cinematic)
                 echo "Preset: anime-cinematic"
-                FILTERS_EXTRA+=("nlmeans=s=1.0:p=7:r=15:rc=3")
-                FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
-                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                # 1. الألوان أولاً
                 FILTERS_EXTRA+=("curves=all='0/0 0.08/0.20 0.25/0.42 0.5/0.65 1/1'")
                 FILTERS_EXTRA+=("colorbalance=rs=0.05:gs=0.02:bs=-0.02")
-                FILTERS_EXTRA+=("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.5")
+                # 2. التنظيف ثانياً
+                FILTERS_EXTRA+=("nlmeans=s=1.0:p=7:r=15:rc=3")
+                FILTERS_EXTRA+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16:blur=false")
+                FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
+                # 3. الحواف أخيراً
+                FILTERS_EXTRA+=("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.4")
                 ;;
 
               movie-balanced)
                 echo "Preset: movie-balanced"
+                # 1. الألوان أولاً
+                FILTERS_EXTRA+=("curves=all='0/0 0.2/0.24 0.5/0.53 1/1'")
+                # 2. التنظيف ثانياً
                 FILTERS_EXTRA+=("hqdn3d=1.0:0.8:1.5:1.0")
                 FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
-                FILTERS_EXTRA+=("curves=all='0/0 0.2/0.24 0.5/0.53 1/1'")
+                # 3. الحواف أخيراً
                 FILTERS_EXTRA+=("cas=0.3")
                 ;;
 
               movie-vibrant)
                 echo "Preset: movie-vibrant"
-                FILTERS_EXTRA+=("hqdn3d=1.0:0.8:1.5:1.0")
-                FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                # 1. الألوان أولاً
                 FILTERS_EXTRA+=("curves=all='0/0 0.1/0.20 0.3/0.42 0.5/0.60 1/1'")
                 FILTERS_EXTRA+=("colorbalance=rs=0.08:gs=0.04:bs=-0.04")
+                # 2. التنظيف ثانياً
+                FILTERS_EXTRA+=("hqdn3d=1.0:0.8:1.5:1.0")
+                FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
+                # 3. الحواف أخيراً
                 FILTERS_EXTRA+=("cas=0.3")
                 ;;
 
               old-restoration)
                 echo "Preset: old-restoration"
+                # 1. الألوان أولاً
+                FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
+                FILTERS_EXTRA+=("colorbalance=rs=0.02:gs=0.01:bs=-0.01")
+                # 2. التنظيف ثانياً
                 FILTERS_EXTRA+=("hqdn3d=3.0:2.0:4.0:3.0")
                 FILTERS_EXTRA+=("atadenoise=s=0:0:0:p=0.04:v=0.08")
                 FILTERS_EXTRA+=("deband=1thr=0.03:2thr=0.03:3thr=0.03:range=12:blur=true")
                 FILTERS_EXTRA+=("gradfun=strength=1.2:radius=16")
-                FILTERS_EXTRA+=("curves=all='0/0 0.15/0.22 0.35/0.42 0.5/0.55 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.02:gs=0.01:bs=-0.01")
+                # 3. الحواف أخيراً
                 FILTERS_EXTRA+=("cas=0.2")
                 ;;
 
@@ -1316,7 +1336,7 @@ jobs:
 
           # film-grain يُفعّل عندما تكون الفلاتر فعلية (ليست off)
           if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "off" ]; then
-            SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=4:film-grain-denoise=0"
+            SVT_BASE="${SVT_BASE}:enable-overlays=1:film-grain=3:film-grain-denoise=0"
           fi
 
           SVT_PARAMS="-svtav1-params ${SVT_BASE}"
@@ -1719,63 +1739,30 @@ jobs:
           fi
           echo "quality=$Q_LINE" >> "$GITHUB_OUTPUT"
 
-      - name: إعداد الاسم النهائي
+      - name: إعداد الاسم المخصص الحقيقي للملف
         id: naming
         env:
           FILENAME: ${{ github.event.inputs.filename }}
         run: |
           set -euo pipefail
-
           RAW="${FILENAME:-}"
-          RAW=$(printf '%s' "$RAW" | tr -d '\000-\010\013\014\016-\037\r\n\t')
-          export RAW
-
-          DISPLAY_NAME=$(python3 <<'PYEOF'
-          import os, sys, unicodedata
+          SAFE_NAME=$(python3 -c '
+          import os, unicodedata, re
           s = os.environ.get("RAW", "")
-          strip = set()
-          for cp in list(range(0x200E, 0x2010)) + list(range(0x202A, 0x202F)) + \
-                    list(range(0x2066, 0x2070)) + [0x061C, 0xFEFF]:
-              strip.add(chr(cp))
-          s = ''.join(ch for ch in s if ch not in strip)
-          s = unicodedata.normalize('NFC', s)
-          def is_letter(c): return unicodedata.category(c).startswith('L')
-          def is_digit(c):  return unicodedata.category(c).startswith('N')
-          def is_allowed(c):
-              if is_letter(c) or is_digit(c): return True
-              if c in ' _-.()[]': return True
-              if unicodedata.category(c) == 'Zs': return True
-              return False
-          out = []
-          for i, c in enumerate(s):
-              if is_allowed(c):
-                  out.append(c)
-              else:
-                  prev = next((s[j] for j in range(i - 1, -1, -1) if is_allowed(s[j])), None)
-                  nxt  = next((s[j] for j in range(i + 1, len(s)) if is_allowed(s[j])), None)
-                  if prev and nxt and (is_letter(prev) or is_digit(prev)) and (is_letter(nxt) or is_digit(nxt)):
-                      out.append(' ')
-          s = ''.join(out)
-          s = ' '.join(s.split())
-          while '..' in s: s = s.replace('..', '.')
-          s = s.strip('.')
-          sys.stdout.write(s[:100])
-          PYEOF
-          )
+          s = unicodedata.normalize("NFC", s)
+          s = re.sub(r"[\\/*?\"<>|:]", "_", s)
+          s = " ".join(s.split())
+          print(s[:80])
+          ')
 
-          [ -z "$DISPLAY_NAME" ] && DISPLAY_NAME="video"
+          if [ -z "$SAFE_NAME" ]; then
+            SAFE_NAME="anime-compressed"
+          fi
 
-          TS=$(date -u +%Y%m%d-%H%M%S)
-          HASH=$(printf '%s' "$DISPLAY_NAME" | sha256sum | cut -c1-8)
-          SAFE_FILE="video-${TS}-${HASH}"
+          echo "final_file_name=${SAFE_NAME}.mkv" >> "$GITHUB_OUTPUT"
+          echo "Display Name: $SAFE_NAME"
 
-          echo "display_name=$DISPLAY_NAME" >> "$GITHUB_OUTPUT"
-          echo "file_name=$SAFE_FILE" >> "$GITHUB_OUTPUT"
-
-          echo "Display name: $DISPLAY_NAME"
-          echo "File name:    $SAFE_FILE"
-
-      - name: رفع الناتج وإشعار المستخدم
+      - name: رفع الناتج وإشعار المستخدم بالاسم الحقيقي
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -1783,8 +1770,7 @@ jobs:
           TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
-          FINAL_NAME: ${{ steps.naming.outputs.display_name }}
-          FILE_NAME:  ${{ steps.naming.outputs.file_name }}
+          FINAL_FILE_NAME: ${{ steps.naming.outputs.final_file_name }}
           DURATION_FMT: ${{ steps.videoinfo.outputs.duration_fmt }}
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
@@ -1796,9 +1782,8 @@ jobs:
           IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
         run: |
           set -euo pipefail
-          UPLOAD_FILE="${FILE_NAME}.mkv"
-          mv "output.mkv" "$UPLOAD_FILE"
-          FILE_SIZE=$(stat -c%s "$UPLOAD_FILE")
+          mv "output.mkv" "$FINAL_FILE_NAME"
+          FILE_SIZE=$(stat -c%s "$FINAL_FILE_NAME")
           SIZE_MB=$(awk -v s="$FILE_SIZE" 'BEGIN{printf "%.1f",s/1048576}')
 
           COLOR_TAG=""
@@ -1807,10 +1792,10 @@ jobs:
           FILTERS_TAG="preset=${FILTER_PRESET}"
 
           CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
-            "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
+            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
             "$QUALITY" "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
             "$FILTERS_TAG" "$NOISE_CLASS" "$COLOR_TAG")
-          export UPLOAD_FILE CAPTION
+          export FINAL_FILE_NAME CAPTION
 
           python3 <<'PYEOF'
           import asyncio, os
@@ -1825,14 +1810,14 @@ jobs:
               async with client:
                   await client.send_file(
                       int(os.environ["TG_CHANNEL_ID"]),
-                      os.environ["UPLOAD_FILE"],
+                      os.environ["FINAL_FILE_NAME"],
                       caption=os.environ["CAPTION"],
                       force_document=True)
           asyncio.run(main())
           PYEOF
 
-          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' \
-            "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
+          MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' \
+            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
           curl --fail --silent --show-error \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
