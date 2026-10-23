@@ -161,8 +161,12 @@ jobs:
         if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
         uses: actions/cache@v4
         with:
-          path: ~/.cache/Homebrew
-          key: homebrew-av1an-ubuntu-24.04-v1
+          path: |
+            /home/linuxbrew/.linuxbrew/Cellar/av1an
+            /home/linuxbrew/.linuxbrew/opt/av1an
+            /home/linuxbrew/.linuxbrew/bin/av1an
+            ~/.cache/Homebrew
+          key: av1an-homebrew-ubuntu-24.04-v1
 
       - name: تثبيت av1an عند الحاجة فقط
         if: >-
@@ -172,7 +176,7 @@ jobs:
           set -euo pipefail
           export HOMEBREW_NO_AUTO_UPDATE=1
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew install av1an
+          if ! av1an --version >/dev/null 2>&1; then brew install av1an; fi
           AV1AN_VER=$(av1an --version 2>/dev/null || true)
           echo "av1an: $AV1AN_VER"
 
@@ -1129,8 +1133,12 @@ jobs:
         if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
         uses: actions/cache@v4
         with:
-          path: ~/.cache/Homebrew
-          key: homebrew-av1an-ubuntu-24.04-v1
+          path: |
+            /home/linuxbrew/.linuxbrew/Cellar/av1an
+            /home/linuxbrew/.linuxbrew/opt/av1an
+            /home/linuxbrew/.linuxbrew/bin/av1an
+            ~/.cache/Homebrew
+          key: av1an-homebrew-ubuntu-24.04-v1
 
       - name: تثبيت av1an عند الحاجة فقط
         if: >-
@@ -1140,7 +1148,7 @@ jobs:
           set -euo pipefail
           export HOMEBREW_NO_AUTO_UPDATE=1
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew install av1an
+          if ! av1an --version >/dev/null 2>&1; then brew install av1an; fi
           echo "av1an: $(av1an --version 2>/dev/null | head -1)"
 
       - name: ترميز الجزء
@@ -1221,7 +1229,7 @@ jobs:
             [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
             "$HOME/.venvs/dt2/bin/python" dt2_stream.py "$IN" "$OUT_FILE" \
               --crf "$TARGET_VALUE" --preset "$P" --fps "$F" \
-              --start-frame "$SPEC_START" --frames "$SPEC_FRAMES" --dt-threads 2 "${RES_ARGS[@]}"
+              --start-frame "$SPEC_START" --frames "$SPEC_FRAMES" "${RES_ARGS[@]}"
             test -s "$OUT_FILE" || { echo "ملف فارغ" >&2; exit 1; }
             GOT=$(ffprobe -v error -count_packets -select_streams v:0 \
               -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE")
