@@ -16,8 +16,7 @@ on:
         required: true
       filename:
         description: 'الاسم النهائي، من دون امتداد.'
-        required: false
-        default: ''
+        required: true
       codec:
         description: 'المرمّز: av1 للفيديو أو audio للصوت فقط.'
         required: true
@@ -33,7 +32,7 @@ on:
       encode_mode:
         description: 'dt2 لخط DT المزدوج، filters للفلاتر، nofilters بدونها، audio للصوت.'
         required: true
-        default: 'dt2'
+        default: 'nofilters'
         type: choice
         options: ['dt2', 'filters', 'nofilters', 'audio']
       encode_method:
@@ -55,26 +54,12 @@ on:
         required: true
         default: '23.976'
 
-      # ============ تشكيلات الفلاتر (مُبقاة للتوافق مع البوت؛ لا تُطبَّق حالياً) ============
       filter_preset:
-        description: 'تشكيلة الفلاتر (مُبقاة للتوافق؛ لا تُطبَّق حالياً).'
+        description: 'فلتر تنعيم DT أو hqdn3d للمحتوى الواقعي؛ يستخدم فقط مع encode_mode المناسب.'
         required: true
         default: 'off'
         type: choice
-        options:
-          - 'off'
-          - 'clean-gentle'
-          - 'anime-balanced'
-          - 'anime-vibrant'
-          - 'anime-cinematic'
-          - 'movie-balanced'
-          - 'movie-vibrant'
-          - 'old-restoration'
-          - 'custom'
-      custom_filters:
-        description: 'سلسلة فلاتر مخصصة (مُبقاة للتوافق؛ لا تُطبَّق حالياً).'
-        required: false
-        default: ''
+        options: ['off', 'dt-smooth', 'realistic']
 
 concurrency:
   group: video-compression-${{ github.event.inputs.chat_id }}
@@ -103,6 +88,22 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
+      - name: استعادة بيئة DT2 Python من الكاش
+        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_mode == 'dt2'
+        id: cache-dt2-python
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/dt2
+          key: dt2-opencv-ubuntu-24.04-python312-v1
+
+      - name: إنشاء بيئة DT2 عند الحاجة فقط
+        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_mode == 'dt2' && steps.cache-dt2-python.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$HOME/.venvs/dt2"
+          "$HOME/.venvs/dt2/bin/python" -m pip install opencv-contrib-python-headless==4.10.0.84 numpy==1.26.4
+          "$HOME/.venvs/dt2/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "dtFilter"); print("OpenCV", cv2.__version__, "NumPy", numpy.__version__)'
+
       - name: بناء SVT-AV1 v4.2.0 و VMAF v3.0.0 و FFmpeg
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
         timeout-minutes: 90
@@ -115,7 +116,7 @@ jobs:
 
           sudo apt-get update -qq
           sudo apt-get install -y build-essential cmake git nasm pkg-config \
-            libdav1d-dev libogg-dev libopus-dev meson ninja-build xxd
+            libdav1d-dev libopus-dev meson ninja-build
           rm -rf "$HOME/codec-build" "$HOME/codec-sources"
           mkdir -p "$HOME/codec-build" "$HOME/codec-sources"
           cd "$HOME/codec-sources"
@@ -156,6 +157,13 @@ jobs:
           make -j"$(nproc)"
           make install
 
+      - name: استعادة حزم Homebrew لـ Av1an عند الحاجة فقط
+        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Homebrew
+          key: homebrew-av1an-ubuntu-24.04-v1
+
       - name: تثبيت av1an عند الحاجة فقط
         if: >-
           github.event.inputs.codec != 'audio' &&
@@ -172,7 +180,7 @@ jobs:
         if: github.event.inputs.codec != 'audio'
         run: |
           set -euo pipefail
-          sudo apt-get install -y libdav1d-dev libopus0
+          sudo apt-get install -y libdav1d7 libopus0
           export PATH="$HOME/codec-build/bin:$PATH"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
 
@@ -207,14 +215,64 @@ jobs:
       chunk_specs: ${{ steps.segment.outputs.chunk_specs }}
       source_info: ${{ steps.probe_source.outputs.source_info }}
     steps:
-      - name: تجهيز أدوات التحميل
+      - name: تحديد اعتماديات المصدر المطلوبة
+        id: fetch-profile
+        env:
+          INPUT_URL: ${{ github.event.inputs.url }}
+          MESSAGE_ID: ${{ github.event.inputs.message_id }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re
+          from urllib.parse import urlparse
+          u = os.environ.get("INPUT_URL", "").strip()
+          path = urlparse(u).path.lower()
+          if os.environ.get("MESSAGE_ID", "").strip() or re.match(r"^https?://(t\.me|telegram\.me|telegram\.dog)/", u, re.I):
+              profile = "telegram"
+          elif re.search(r"\.(m3u8|mpd)$", path):
+              profile = "hls"
+          elif re.search(r"\.(mp4|mkv|avi|mov|webm|flv|ts)$", path):
+              profile = "direct"
+          elif u:
+              profile = "web"
+          else:
+              profile = "direct"
+          print(f"profile={profile}")
+          PY
+
+      - name: استعادة بيئة تنزيل Python حسب نوع المصدر
+        if: steps.fetch-profile.outputs.profile != 'direct'
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/fetch
+          key: fetch-ubuntu-24.04-python312-${{ steps.fetch-profile.outputs.profile }}-v1
+
+      - name: تثبيت حزم المصدر المطلوبة عند الحاجة فقط
+        if: steps.fetch-profile.outputs.profile != 'direct'
+        env:
+          FETCH_PROFILE: ${{ steps.fetch-profile.outputs.profile }}
+        run: |
+          set -euo pipefail
+          VENV="$HOME/.venvs/fetch"
+          if [ ! -x "$VENV/bin/python" ]; then python3 -m venv "$VENV"; fi
+          case "$FETCH_PROFILE" in
+            telegram) "$VENV/bin/python" -c 'import telethon' 2>/dev/null || "$VENV/bin/python" -m pip install telethon ;;
+            hls) "$VENV/bin/python" -c 'import yt_dlp' 2>/dev/null || "$VENV/bin/python" -m pip install yt-dlp ;;
+            web) "$VENV/bin/python" -c 'import requests, bs4, yt_dlp' 2>/dev/null || "$VENV/bin/python" -m pip install requests beautifulsoup4 yt-dlp ;;
+            *) echo "Unknown fetch profile: $FETCH_PROFILE" >&2; exit 1 ;;
+          esac
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+
+      - name: تجهيز أدوات النظام اللازمة للتنزيل والفحص
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg jq libdav1d-dev libopus0 python3-pip curl
-          python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user telethon requests beautifulsoup4 lxml yt-dlp
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "$CODEC" = "audio" ]; then
+            sudo apt-get install -y ffmpeg jq
+          else
+            sudo apt-get install -y jq libdav1d7 libopus0
+          fi
 
       - name: استعادة FFmpeg الموحد
         if: github.event.inputs.codec != 'audio'
@@ -226,17 +284,20 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: تجهيز Playwright و curl_cffi (للروابط العامة فقط)
-        if: >-
-          github.event.inputs.url != '' &&
-          github.event.inputs.message_id == '' &&
-          !contains(github.event.inputs.url, 't.me/') &&
-          !contains(github.event.inputs.url, 'telegram.')
+      - name: تهيئة FFmpeg المبني للمهمة
+        if: github.event.inputs.codec != 'audio'
         run: |
-          set -euo pipefail
-          python3 -m pip install --user curl_cffi playwright
-          python3 -m playwright install --with-deps chromium \
-            || echo "Playwright browser install failed (non-fatal)"
+          echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: استعادة بيئة المتصفح الاختيارية للصفحات التي تتطلبها
+        if: steps.fetch-profile.outputs.profile == 'web'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.venvs/fetch-browser
+            ~/.cache/ms-playwright
+          key: fetch-browser-ubuntu-24.04-python312-v1
 
       - name: تحميل الفيديو المصدر
         env:
@@ -253,6 +314,11 @@ jobs:
           TG_LINK_RE='^https?://(t\.me|telegram\.me|telegram\.dog)/'
           HLS_RE='\.(m3u8|mpd)(\?.*)?$'
           DIRECT_RE='\.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$'
+          PYTHON=python3
+          if [ -x "$HOME/.venvs/fetch/bin/python" ]; then
+            PYTHON="$HOME/.venvs/fetch/bin/python"
+            export PATH="$HOME/.venvs/fetch/bin:$PATH"
+          fi
 
           # 1+2. تيليجرام (رسالة أو رابط): البوت أولاً، ثم الجلسة إن فشل
           if [ -n "$MESSAGE_ID" ] || { [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $TG_LINK_RE ]]; }; then
@@ -362,7 +428,7 @@ jobs:
 
           sys.exit(asyncio.run(main()))
           PYEOF
-            python3 tg_fetch.py || { echo 'Telegram download failed (bot and session)' >&2; exit 1; }
+            "$PYTHON" tg_fetch.py || { echo 'Telegram download failed (bot and session)' >&2; exit 1; }
 
           # 3. رابط HLS / DASH مباشر
           elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $HLS_RE ]]; then
@@ -713,11 +779,22 @@ jobs:
           print("All methods failed")
           sys.exit(1)
           PYEOF
-            if ! python3 fetch_page.py; then
-              echo "Page extraction failed, falling back to yt-dlp..."
-              rm -f raw_input.mp4 candidate.mp4
-              yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
-                || { echo 'Download failed' >&2; exit 1; }
+            if ! "$PYTHON" fetch_page.py; then
+              echo "Basic extraction failed; trying optional browser tooling..."
+              BROWSER_VENV="$HOME/.venvs/fetch-browser"
+              if [ ! -x "$BROWSER_VENV/bin/python" ]; then python3 -m venv "$BROWSER_VENV"; fi
+              "$BROWSER_VENV/bin/python" -c 'import requests, bs4, yt_dlp, curl_cffi, playwright' 2>/dev/null || \
+                "$BROWSER_VENV/bin/python" -m pip install requests beautifulsoup4 yt-dlp curl_cffi playwright
+              if ! find "$HOME/.cache/ms-playwright" -maxdepth 1 -type d -name 'chromium-*' -print -quit 2>/dev/null | grep -q .; then
+                "$BROWSER_VENV/bin/python" -m playwright install --with-deps chromium || \
+                  echo "Playwright browser install failed; try yt-dlp fallback"
+              fi
+              if ! "$BROWSER_VENV/bin/python" fetch_page.py; then
+                echo "Browser extraction failed, falling back to yt-dlp..."
+                rm -f raw_input.mp4 candidate.mp4
+                yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
+                  || { echo 'Download failed' >&2; exit 1; }
+              fi
             fi
 
           else
@@ -1017,25 +1094,43 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: تجهيز الاعتماديات
+      - name: استعادة بيئة DT2 Python
+        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_mode == 'dt2'
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/dt2
+          key: dt2-opencv-ubuntu-24.04-python312-v1
+
+      - name: تجهيز أدوات الترميز المطلوبة فقط
         env:
           CODEC: ${{ github.event.inputs.codec }}
+          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libdav1d-dev libopus0 jq
+          if [ "$CODEC" = "audio" ]; then
+            sudo apt-get install -y ffmpeg
+          else
+            sudo apt-get install -y libdav1d7 libopus0
+            if [ "$ENCODE_MODE" = "dt2" ]; then
+              sudo apt-get install -y jq
+              "$HOME/.venvs/dt2/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "dtFilter")'
+            fi
+          fi
           if [ "$CODEC" != "audio" ]; then
             export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-
             echo "=== Tools check ==="
             echo "ffmpeg: $("$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1)"
             echo "SvtAv1EncApp: $("$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || echo 'unavailable')"
           fi
-          if [ "${{ github.event.inputs.encode_mode }}" = "dt2" ]; then
-            python3 -m pip install --user --break-system-packages \
-              opencv-contrib-python-headless numpy
-          fi
+
+      - name: استعادة حزم Homebrew لـ Av1an عند الحاجة فقط
+        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Homebrew
+          key: homebrew-av1an-ubuntu-24.04-v1
 
       - name: تثبيت av1an عند الحاجة فقط
         if: >-
@@ -1060,6 +1155,7 @@ jobs:
           CHUNK_SPECS: ${{ needs.split-video.outputs.chunk_specs }}
           CHUNK_ID: ${{ matrix.chunk }}
           SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
+          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
         run: |
           set -euo pipefail
           IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
@@ -1110,18 +1206,22 @@ jobs:
           # ============================================================
           # مسار DT المزدوج: فك -> DT -> ترميز AV1 عبر أنابيب الذاكرة
           # ============================================================
-          if [ "${ENCODE_MODE:-}" = "dt2" ]; then
+          if [ "$ENCODE_MODE" = "dt2" ]; then
+            [ "$FILTER_PRESET" = "dt-smooth" ] || { echo 'dt2 يتطلب filter_preset=dt-smooth' >&2; exit 1; }
+            [ "$ENCODE_METHOD" = "crf" ] || { echo 'dt2 يدعم CRF فقط' >&2; exit 1; }
             IN="chunks_raw/source.mp4"
             SPEC_START=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].start')
             SPEC_FRAMES=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].frames')
             P="${PRESET_INPUT/none/4}"
             [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
               { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
-            F="$FRAME_RATE"
-            case "$F" in 23.976|23.97|auto) F="24000/1001" ;; esac
-            python3 dt2_stream.py "$IN" "$OUT_FILE" \
+            F="24000/1001"
+            echo "DT smoothing selected; fixed frame grid=$F, target height=$RESOLUTION"
+            RES_ARGS=()
+            [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
+            "$HOME/.venvs/dt2/bin/python" dt2_stream.py "$IN" "$OUT_FILE" \
               --crf "$TARGET_VALUE" --preset "$P" --fps "$F" \
-              --start-frame "$SPEC_START" --frames "$SPEC_FRAMES"
+              --start-frame "$SPEC_START" --frames "$SPEC_FRAMES" --dt-threads 2 "${RES_ARGS[@]}"
             test -s "$OUT_FILE" || { echo "ملف فارغ" >&2; exit 1; }
             GOT=$(ffprobe -v error -count_packets -select_streams v:0 \
               -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE")
@@ -1130,9 +1230,12 @@ jobs:
             echo "الجزء $CHUNK_ID: $GOT إطاراً من البداية $SPEC_START، $(stat -c%s "$OUT_FILE") bytes"
             exit 0
           fi
+          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "realistic" ]; then
+            echo 'filters mode requires filter_preset=realistic' >&2; exit 1
+          fi
 
           # ============================================================
-          # المسار العام: بدون فلاتر (تحجيم وتغيير معدل فقط)
+          # المسار العام: بدون فلاتر أو hqdn3d للمحتوى الواقعي
           # ============================================================
           echo "Detecting source info..."
           eval "$(echo "$SOURCE_INFO" | python3 -c "
@@ -1151,6 +1254,13 @@ jobs:
           ")"
 
           FILTERS=("setpts=PTS-STARTPTS")
+          if [ "$ENCODE_MODE" = "filters" ]; then
+            # فلتر خفيف للحد من الضجيج مع الحفاظ على مظهر المحتوى الواقعي.
+            FILTERS+=("hqdn3d=1.5:1.5:3:3")
+            echo "Filter selected: hqdn3d (realistic content)"
+          elif [ "$ENCODE_MODE" != "nofilters" ]; then
+            echo "Unsupported encode_mode for video: $ENCODE_MODE" >&2; exit 1
+          fi
 
           if [ "$RESOLUTION" != "auto" ]; then
             FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
@@ -1343,12 +1453,26 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: تجهيز أدوات الدمج
+      - name: استعادة بيئة Telegram Python
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/telegram
+          key: telegram-telethon-ubuntu-24.04-python312-v1
+
+      - name: تجهيز أدوات الدمج المطلوبة فقط
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libdav1d-dev libopus0 jq
-          python3 -m pip install --user telethon
+          if [ "$CODEC" = "audio" ]; then
+            sudo apt-get install -y ffmpeg
+          else
+            sudo apt-get install -y libdav1d7 libopus0
+          fi
+          if [ ! -x "$HOME/.venvs/telegram/bin/python" ]; then python3 -m venv "$HOME/.venvs/telegram"; fi
+          "$HOME/.venvs/telegram/bin/python" -c 'import telethon' 2>/dev/null || \
+            "$HOME/.venvs/telegram/bin/python" -m pip install telethon
 
       - name: تنزيل الأجزاء المضغوطة
         uses: actions/download-artifact@v4
@@ -1469,10 +1593,9 @@ jobs:
           FILENAME: ${{ github.event.inputs.filename }}
         run: |
           set -euo pipefail
-          RAW="${FILENAME:-}"
           SAFE_NAME=$(python3 -c '
           import os, unicodedata, re
-          s = os.environ.get("RAW", "")
+          s = os.environ.get("FILENAME", "")
           s = unicodedata.normalize("NFC", s)
           s = re.sub(r"[\\/*?\"<>|:]", "_", s)
           s = " ".join(s.split())
@@ -1480,7 +1603,8 @@ jobs:
           ')
 
           if [ -z "$SAFE_NAME" ]; then
-            SAFE_NAME="anime-compressed"
+            echo "يجب إدخال اسم الملف النهائي." >&2
+            exit 1
           fi
 
           echo "final_file_name=${SAFE_NAME}.mkv" >> "$GITHUB_OUTPUT"
@@ -1518,7 +1642,7 @@ jobs:
             "$ENCODE_MODE" "$NOISE_CLASS" "$COLOR_TAG")
           export FINAL_FILE_NAME CAPTION
 
-          python3 <<'PYEOF'
+          "$HOME/.venvs/telegram/bin/python" <<'PYEOF'
           import asyncio, os, sys
           from telethon import TelegramClient
           from telethon.sessions import StringSession
