@@ -204,6 +204,7 @@ jobs:
     timeout-minutes: 360
     outputs:
       chunks: ${{ steps.segment.outputs.chunks }}
+      chunk_specs: ${{ steps.segment.outputs.chunk_specs }}
       source_info: ${{ steps.probe_source.outputs.source_info }}
     steps:
       - name: تجهيز أدوات التحميل
@@ -872,6 +873,34 @@ jobs:
           set -euo pipefail
           mkdir -p chunks_raw
 
+          # ============================================================
+          # وضع dt2: تقسيم على شبكة 23.976 بالفهرس، والمصدر يبقى ملفاً واحداً
+          # ============================================================
+          if [ "${{ github.event.inputs.encode_mode }}" = "dt2" ]; then
+            cp raw_input.mp4 chunks_raw/source.mp4
+            DUR_SEC=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_input.mp4)
+            python3 - "$DUR_SEC" > /tmp/plan.json <<'PYEOF'
+          import json, math, sys
+          dur = float(sys.argv[1])
+          total = math.floor(dur * 24000 / 1001 + 1e-6)
+          if dur <= 300:
+              n = 1
+          else:
+              n = max(min(10, int(dur // 90)), math.ceil(dur / 2400))
+          bounds = [round(i * total / n) for i in range(n + 1)]
+          specs = {f"{i:03d}": {"start": bounds[i], "frames": bounds[i + 1] - bounds[i]}
+                   for i in range(n)}
+          print(json.dumps({"total": total, "specs": specs}))
+          PYEOF
+            CHUNKS_JSON=$(jq -c '.specs | keys' /tmp/plan.json)
+            SPECS_JSON=$(jq -c '.specs' /tmp/plan.json)
+            echo "dt2 plan: $(jq -c '.total' /tmp/plan.json) إطاراً على 23.976 في $(jq '.specs|length' /tmp/plan.json) أجزاء"
+            echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
+            echo "chunk_specs=$SPECS_JSON" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
             FFMPEG="$HOME/codec-build/bin/ffmpeg"
             FFPROBE="$HOME/codec-build/bin/ffprobe"
@@ -889,11 +918,6 @@ jobs:
           MIN_CHUNK=90
           MAX_CHUNK=2400
           MAX_PARALLEL=10
-
-          # في وضع dt2 لا يُقسَّم المصدر: المعالجة متسلسلة لأن القناع الزمني يعتمد على الإطار السابق.
-          if [ "${{ github.event.inputs.encode_mode }}" = "dt2" ]; then
-            SPLIT_THRESHOLD=999999999
-          fi
 
           if [ "$DURATION" -gt "$SPLIT_THRESHOLD" ]; then
             N=$(( DURATION / MIN_CHUNK ))
@@ -1033,11 +1057,13 @@ jobs:
           TARGET_VALUE: ${{ github.event.inputs.target_value }}
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
+          CHUNK_SPECS: ${{ needs.split-video.outputs.chunk_specs }}
           CHUNK_ID: ${{ matrix.chunk }}
           SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
         run: |
           set -euo pipefail
           IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
+          if [ "${ENCODE_MODE:-}" = "dt2" ]; then IN="chunks_raw/source.mp4"; fi
           OUT_DIR="chunks_encoded"
           OUT_FILE="${OUT_DIR}/encoded_${CHUNK_ID}.mkv"
           mkdir -p "$OUT_DIR"
@@ -1084,36 +1110,24 @@ jobs:
           # ============================================================
           # مسار DT المزدوج: فك -> DT -> ترميز AV1 عبر أنابيب الذاكرة
           # ============================================================
-          if [ "$ENCODE_MODE" = "dt2" ]; then
-            SW=$(echo "$SOURCE_INFO" | jq -r .w)
-            SH=$(echo "$SOURCE_INFO" | jq -r .h)
-            if [ "$SH" -gt 720 ]; then
-              TH=720
-              TW=$(( (SW * TH / SH + 1) / 2 * 2 ))
-              SCALE_FILTER="scale=${TW}:${TH}:flags=lanczos,"
-            else
-              TW=$SW; TH=$SH
-              SCALE_FILTER=""
-            fi
-            echo "dt2 working size: ${TW}x${TH} (source ${SW}x${SH})"
-
+          if [ "${ENCODE_MODE:-}" = "dt2" ]; then
+            IN="chunks_raw/source.mp4"
+            SPEC_START=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].start')
+            SPEC_FRAMES=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].frames')
             P="${PRESET_INPUT/none/4}"
             [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
-              { echo 'dt2 needs a CRF value 0-63' >&2; exit 1; }
-
-            "$FFMPEG" -v error -nostdin -i "$IN" \
-              -vf "fps=24000/1001,${SCALE_FILTER%,}" -an \
-              -f rawvideo -pix_fmt bgr24 - \
-            | python3 dt_stage.py --width "$TW" --height "$TH" \
-            | "$FFMPEG" -v error -nostdin -y \
-                -f rawvideo -pix_fmt bgr24 -s "${TW}x${TH}" -r 24000/1001 -i - \
-                -vf "format=yuv420p10le" \
-                -c:v libsvtav1 -preset "$P" -crf "$TARGET_VALUE" \
-                -pix_fmt yuv420p10le \
-                -svtav1-params "tune=0:enable-overlays=1:sharpness=4:film-grain=0:enable-tf=0:lp=4" \
-                -an "$OUT_FILE"
-            test -s "$OUT_FILE" || { echo "Empty dt2 output" >&2; exit 1; }
-            echo "dt2 encode done: $(stat -c%s "$OUT_FILE") bytes"
+              { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
+            F="$FRAME_RATE"
+            case "$F" in 23.976|23.97|auto) F="24000/1001" ;; esac
+            python3 dt2_stream.py "$IN" "$OUT_FILE" \
+              --crf "$TARGET_VALUE" --preset "$P" --fps "$F" \
+              --start-frame "$SPEC_START" --frames "$SPEC_FRAMES"
+            test -s "$OUT_FILE" || { echo "ملف فارغ" >&2; exit 1; }
+            GOT=$(ffprobe -v error -count_packets -select_streams v:0 \
+              -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE")
+            [ "$GOT" -eq "$SPEC_FRAMES" ] || \
+              { echo "الجزء $CHUNK_ID: $GOT إطاراً بدل $SPEC_FRAMES" >&2; exit 1; }
+            echo "الجزء $CHUNK_ID: $GOT إطاراً من البداية $SPEC_START، $(stat -c%s "$OUT_FILE") bytes"
             exit 0
           fi
 
@@ -1485,6 +1499,7 @@ jobs:
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
           VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
+          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
           CODEC: ${{ github.event.inputs.codec }}
           IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
           NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
@@ -1504,22 +1519,38 @@ jobs:
           export FINAL_FILE_NAME CAPTION
 
           python3 <<'PYEOF'
-          import asyncio, os
+          import asyncio, os, sys
           from telethon import TelegramClient
           from telethon.sessions import StringSession
+
           async def main():
+              channel = os.environ.get("TG_CHANNEL_ID", "").strip()
+              if not channel:
+                  print("TG_CHANNEL_ID غير مضبوط في الأسرار", file=sys.stderr)
+                  return 1
               client = TelegramClient(
                   StringSession(os.environ["TG_SESSION"]),
                   int(os.environ["TG_API_ID"]),
                   os.environ["TG_API_HASH"])
-              await client.start()
-              async with client:
-                  await client.send_file(
-                      int(os.environ["TG_CHANNEL_ID"]),
-                      os.environ["FINAL_FILE_NAME"],
-                      caption=os.environ["CAPTION"],
-                      force_document=True)
-          asyncio.run(main())
+              await client.connect()
+              try:
+                  if not await client.is_user_authorized():
+                      print("TG_SESSION غير صالحة أو منتهية، أعد توليدها", file=sys.stderr)
+                      return 1
+                  path = os.environ["FINAL_FILE_NAME"]
+                  size = os.path.getsize(path)
+                  if size > 2 * 1024 ** 3:
+                      print(f"الملف أكبر من حد تيليجرام: {size} bytes", file=sys.stderr)
+                      return 1
+                  await client.send_file(int(channel), path,
+                                         caption=os.environ["CAPTION"],
+                                         force_document=True)
+                  print("sent to channel")
+                  return 0
+              finally:
+                  await client.disconnect()
+
+          sys.exit(asyncio.run(main()))
           PYEOF
 
           MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s' \
