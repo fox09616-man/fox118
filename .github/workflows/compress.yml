@@ -206,6 +206,11 @@ jobs:
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf ' \
             && echo "OK libvmaf" || { echo 'MISSING libvmaf' >&2; exit 1; }
 
+      - name: تخطي بناء أدوات الفيديو عند اختيار الصوت فقط
+        if: github.event.inputs.codec == 'audio'
+        run: |
+          echo "Audio-only mode: AV1/DT tools are not required."
+
   # ============================================================
   # 2. تحميل المصدر وفحصه وتقطيعه
   # ============================================================
@@ -234,7 +239,7 @@ jobs:
               profile = "telegram"
           elif re.search(r"\.(m3u8|mpd)$", path):
               profile = "hls"
-          elif re.search(r"\.(mp4|mkv|avi|mov|webm|flv|ts)$", path):
+          elif re.search(r"\.(mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)$", path):
               profile = "direct"
           elif u:
               profile = "web"
@@ -317,7 +322,7 @@ jobs:
 
           TG_LINK_RE='^https?://(t\.me|telegram\.me|telegram\.dog)/'
           HLS_RE='\.(m3u8|mpd)(\?.*)?$'
-          DIRECT_RE='\.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$'
+          DIRECT_RE='\.(mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)(\?.*)?$'
           PYTHON=python3
           if [ -x "$HOME/.venvs/fetch/bin/python" ]; then
             PYTHON="$HOME/.venvs/fetch/bin/python"
@@ -480,7 +485,7 @@ jobs:
               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
               'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           ]
-          VIDEO_URL_RE = re.compile(r'\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv)(?=$|[?#&/"\'])', re.IGNORECASE)
+          VIDEO_URL_RE = re.compile(r'\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv|m4a|mp3|aac|ogg|opus|wav|flac)(?=$|[?#&/"\'])', re.IGNORECASE)
           HLS_RE = re.compile(r'\.(?:m3u8|mpd)(?=$|[?#&/"\'])', re.IGNORECASE)
           CANDIDATE = "candidate.mp4"
           MIN_DUR = 61
@@ -607,7 +612,7 @@ jobs:
                       strong.append(v)
 
               patterns = [
-                  r'["\']((?:https?:)?//[^"\']+\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv)[^"\']*)["\']',
+                  r'["\']((?:https?:)?//[^"\']+\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv|m4a|mp3|aac|ogg|opus|wav|flac)[^"\']*)["\']',
                   r'(?:videoUrl|video_url|videoURL|videoSrc|video_src|sourceUrl|playUrl|mediaUrl|streamUrl|hlsUrl|dashUrl|file|src)\s*[:=]\s*["\']([^"\']+)["\']',
                   r'data-(?:video|src|url|source|stream|file|hls|dash)\s*=\s*["\']([^"\']+)["\']',
               ]
@@ -621,7 +626,7 @@ jobs:
                   for m in re.findall(p, html):
                       try:
                           d = base64.b64decode(m).decode('utf-8', errors='ignore')
-                          for dm in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|mpd|webm|flv|ts)[^\s"\'<>]*', d):
+                          for dm in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|mpd|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)[^\s"\'<>]*', d):
                               weak.append(dm)
                       except Exception:
                           pass
@@ -902,6 +907,8 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: ضغط الصوت من المصدر الكامل
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
@@ -927,6 +934,10 @@ jobs:
               audio_compressed.opus
             echo "Audio size: $(stat -c%s audio_compressed.opus) bytes"
           else
+            if [ "$CODEC" = "audio" ]; then
+              echo 'Audio-only requested but source has no audio stream.' >&2
+              exit 1
+            fi
             echo "No audio in source"
             : > audio_compressed.opus
           fi
@@ -939,20 +950,31 @@ jobs:
           if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$SRC_DUR" ]; then
             SAMPLE_DUR=$(( SRC_DUR - SAMPLE_START ))
           fi
-          echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
-          "$FFMPEG" -hide_banner -nostdin -y \
-            -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
-            -i raw_input.mp4 \
-            -map 0:v:0 -c:v copy \
-            source_sample.mkv
-          test -s source_sample.mkv
-          echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
+          HAS_VIDEO=$($FFPROBE -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 raw_input.mp4 | grep -c . || true)
+          if [ "${HAS_VIDEO:-0}" -gt 0 ] && [ "$SAMPLE_DUR" -gt 0 ]; then
+            echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
+            "$FFMPEG" -hide_banner -nostdin -y \
+              -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
+              -i raw_input.mp4 \
+              -map 0:v:0 -c:v copy \
+              source_sample.mkv
+            test -s source_sample.mkv
+            echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
+          else
+            echo "No usable video sample; continuing without source_sample.mkv"
+          fi
 
       - name: تقسيم المصدر إلى أجزاء
         id: segment
         run: |
           set -euo pipefail
           mkdir -p chunks_raw
+
+          if [ "${{ github.event.inputs.codec }}" = "audio" ]; then
+            echo 'chunks=["000"]' >> "$GITHUB_OUTPUT"
+            echo 'chunk_specs={}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # ============================================================
           # وضع dt2: تقسيم على شبكة 23.976 بالفهرس، والمصدر يبقى ملفاً واحداً
@@ -990,9 +1012,10 @@ jobs:
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           fi
 
-          DURATION=$("$FFPROBE" -v error -show_entries format=duration \
-            -of csv=p=0 raw_input.mp4 | cut -d. -f1)
-          test -n "$DURATION"
+          DURATION_FULL=$("$FFPROBE" -v error -show_entries format=duration \
+            -of csv=p=0 raw_input.mp4)
+          [[ "$DURATION_FULL" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo 'Invalid source duration' >&2; exit 1; }
+          DURATION=${DURATION_FULL%%.*}
           echo "Duration: $DURATION seconds"
 
           SPLIT_THRESHOLD=300
@@ -1009,21 +1032,14 @@ jobs:
             SEGMENT_TIME=$(( (DURATION + N - 1) / N ))
             echo "Splitting into ~${N} chunks, ${SEGMENT_TIME}s each"
 
-            KF_EXPR=$(python3 -c "
-          n=$N; t=$SEGMENT_TIME; dur=$DURATION
-          pts=[i*t for i in range(1,n) if i*t < dur]
-          print(','.join(str(p) for p in pts))
-            ")
-            echo "Keyframe points: $KF_EXPR"
+            echo "Splitting on existing keyframes; stream-copy cannot force new keyframes"
 
             "$FFMPEG" -hide_banner -nostdin -y \
               -i raw_input.mp4 \
               -map 0:v:0 \
               -c:v copy \
-              -force_key_frames "$KF_EXPR" \
               -f segment \
               -segment_time "$SEGMENT_TIME" \
-              -segment_atclocktime 0 \
               -break_non_keyframes 0 \
               -reset_timestamps 1 \
               -avoid_negative_ts make_zero \
@@ -1037,15 +1053,12 @@ jobs:
               chunks_raw/chunk_000.mkv
           fi
 
-          TOTAL_CHUNK_DUR=0
-          for f in chunks_raw/chunk_*.mkv; do
-            D=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$f" | cut -d. -f1)
-            TOTAL_CHUNK_DUR=$(( TOTAL_CHUNK_DUR + D ))
-          done
-          DIFF=$(( TOTAL_CHUNK_DUR - DURATION ))
-          DIFF=${DIFF#-}
-          echo "Chunks check: total=${TOTAL_CHUNK_DUR}s source=${DURATION}s diff=${DIFF}s"
-          if [ "$DIFF" -gt 5 ]; then
+          TOTAL_CHUNK_DUR=$(for f in chunks_raw/chunk_*.mkv; do
+            "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$f"
+          done | awk '{sum += $1} END {printf "%.3f", sum}')
+          DIFF=$(awk -v total="$TOTAL_CHUNK_DUR" -v source="$DURATION_FULL" 'BEGIN {d=total-source; if(d<0)d=-d; printf "%.3f",d}')
+          echo "Chunks check: total=${TOTAL_CHUNK_DUR}s source=${DURATION_FULL}s diff=${DIFF}s"
+          if awk -v d="$DIFF" 'BEGIN {exit !(d > 5)}'; then
             echo 'Duration mismatch after split' >&2; exit 1
           fi
 
@@ -1071,6 +1084,7 @@ jobs:
   encode-chunks:
     name: ضغط الأجزاء
     needs: [prepare-codec-build, split-video]
+    if: github.event.inputs.codec != 'audio'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
@@ -1118,10 +1132,17 @@ jobs:
             sudo apt-get install -y libdav1d7 libopus0
             if [ "$ENCODE_MODE" = "dt2" ]; then
               sudo apt-get install -y jq
+              if ! "$HOME/.venvs/dt2/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "dtFilter")' 2>/dev/null; then
+                rm -rf "$HOME/.venvs/dt2"
+                python3 -m venv "$HOME/.venvs/dt2"
+                "$HOME/.venvs/dt2/bin/python" -m pip install opencv-contrib-python-headless==4.10.0.84 numpy==1.26.4
+              fi
               "$HOME/.venvs/dt2/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "dtFilter")'
             fi
           fi
           if [ "$CODEC" != "audio" ]; then
+            echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
+            echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
             export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
             echo "=== Tools check ==="
@@ -1448,6 +1469,9 @@ jobs:
   merge-and-send:
     name: دمج الناتج وإرساله
     needs: [prepare-codec-build, split-video, encode-chunks]
+    if: >-
+      ${{ always() && (needs.prepare-codec-build.result == 'success' || (github.event.inputs.codec == 'audio' && needs.prepare-codec-build.result == 'skipped')) && needs.split-video.result == 'success' &&
+          (needs.encode-chunks.result == 'success' || (github.event.inputs.codec == 'audio' && needs.encode-chunks.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -1477,12 +1501,15 @@ jobs:
             sudo apt-get install -y ffmpeg
           else
             sudo apt-get install -y libdav1d7 libopus0
+            echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
+            echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
           fi
           if [ ! -x "$HOME/.venvs/telegram/bin/python" ]; then python3 -m venv "$HOME/.venvs/telegram"; fi
           "$HOME/.venvs/telegram/bin/python" -c 'import telethon' 2>/dev/null || \
             "$HOME/.venvs/telegram/bin/python" -m pip install telethon
 
       - name: تنزيل الأجزاء المضغوطة
+        if: github.event.inputs.codec != 'audio'
         uses: actions/download-artifact@v4
         with:
           pattern: encoded-*
@@ -1495,57 +1522,48 @@ jobs:
           name: raw-chunks
           path: audio_dl
 
-      - name: دمج الفيديو مع الصوت
+      - name: إنشاء الناتج النهائي (فيديو أو صوت)
         env:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           if [ "$CODEC" = "audio" ]; then
-            FFMPEG=ffmpeg; FFPROBE=ffprobe
+            AUDIO_FILE="audio_dl/audio_compressed.opus"
+            [ -s "$AUDIO_FILE" ] || { echo 'Compressed audio file is missing or empty' >&2; exit 1; }
+            cp "$AUDIO_FILE" output.opus
+            OUTPUT_FILE=output.opus
+            FFPROBE=ffprobe
           else
+            export PATH="$HOME/codec-build/bin:$PATH"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
             FFMPEG="$HOME/codec-build/bin/ffmpeg"
             FFPROBE="$HOME/codec-build/bin/ffprobe"
-            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          fi
-
-          cd all_encoded
-          find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
-          test -s /tmp/encoded_files.txt
-          sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
-
-          "$FFMPEG" -hide_banner -nostdin -y \
-            -f concat -safe 0 -i concat_list.txt \
-            -map 0:v \
-            -c:v copy \
-            "../video_only.mkv"
-          test -s "../video_only.mkv"
-
-          cd ..
-
-          AUDIO_FILE="audio_dl/audio_compressed.opus"
-          if [ -s "$AUDIO_FILE" ]; then
+            cd all_encoded
+            find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
+            test -s /tmp/encoded_files.txt
+            sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
             "$FFMPEG" -hide_banner -nostdin -y \
-              -i video_only.mkv \
-              -i "$AUDIO_FILE" \
-              -map 0:v \
-              -map 1:a \
-              -c:v copy \
-              -c:a copy \
-              output.mkv
-          else
-            echo "No audio, video-only output"
-            cp video_only.mkv output.mkv
-          fi
-
-          test -s "output.mkv"
-
-          if [ "$CODEC" != "audio" ]; then
+              -f concat -safe 0 -i concat_list.txt \
+              -map 0:v -c:v copy "../video_only.mkv"
+            test -s "../video_only.mkv"
+            cd ..
+            AUDIO_FILE="audio_dl/audio_compressed.opus"
+            if [ -s "$AUDIO_FILE" ]; then
+              "$FFMPEG" -hide_banner -nostdin -y \
+                -i video_only.mkv -i "$AUDIO_FILE" \
+                -map 0:v -map 1:a -c:v copy -c:a copy output.mkv
+            else
+              echo "No audio, video-only output"
+              cp video_only.mkv output.mkv
+            fi
+            OUTPUT_FILE=output.mkv
             "$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=codec_name -of csv=p=0 "output.mkv" | \
+              -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" | \
               grep -Eq '^av1$' || { echo 'Merge lost AV1 video' >&2; exit 1; }
           fi
-
-          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 output.mkv | cut -d. -f1)
+          test -s "$OUTPUT_FILE"
+          echo "OUTPUT_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
+          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE" | cut -d. -f1)
           echo "Final duration: ${OUT_DUR}s"
 
       - name: استخراج معلومات الناتج
@@ -1555,7 +1573,7 @@ jobs:
         run: |
           set -euo pipefail
           DURATION_SEC=$(ffprobe -v error -show_entries format=duration \
-            -of csv=p=0 "output.mkv" | cut -d. -f1)
+            -of csv=p=0 "$OUTPUT_FILE" | cut -d. -f1)
           H=$((DURATION_SEC/3600)); M=$(((DURATION_SEC%3600)/60)); S=$((DURATION_SEC%60))
           echo "duration_fmt=$(printf '%02d:%02d:%02d' $H $M $S)" >> "$GITHUB_OUTPUT"
 
@@ -1564,34 +1582,38 @@ jobs:
             echo 'video_info=audio' >> "$GITHUB_OUTPUT"
           else
             ACTUAL_RES=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
+              -show_entries stream=width,height -of csv=s=x:p=0 "$OUTPUT_FILE")
             echo "actual_res=$ACTUAL_RES" >> "$GITHUB_OUTPUT"
 
             V_CODEC=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=codec_name -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" | head -1)
             V_PIX=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=pix_fmt -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=pix_fmt -of csv=p=0 "$OUTPUT_FILE" | head -1)
             V_FPS=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=avg_frame_rate -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=avg_frame_rate -of csv=p=0 "$OUTPUT_FILE" | head -1)
             echo "video_info=${V_CODEC} ${V_PIX} ${V_FPS}" >> "$GITHUB_OUTPUT"
           fi
 
           A_CODEC=$(ffprobe -v error -select_streams a:0 \
-            -show_entries stream=codec_name -of csv=p=0 "output.mkv" 2>/dev/null | head -1 || true)
+            -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null | head -1 || true)
           if [ -z "$A_CODEC" ]; then
             echo "actual_abr=no audio" >> "$GITHUB_OUTPUT"
           else
             A_CH=$(ffprobe -v error -select_streams a:0 \
-              -show_entries stream=channels -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=channels -of csv=p=0 "$OUTPUT_FILE" | head -1)
             A_BR=$(ffprobe -v error -select_streams a:0 \
-              -show_entries stream=bit_rate -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=bit_rate -of csv=p=0 "$OUTPUT_FILE" | head -1)
             A_LABEL="$A_CODEC"
             if [ "$A_CH" = "1" ]; then
               A_LABEL="$A_LABEL mono"
             else
               A_LABEL="$A_LABEL stereo"
             fi
-            [[ "$A_BR" =~ ^[0-9]+$ ]] && A_LABEL="$A_LABEL ~$((A_BR/1000))k"
+            if [[ "$A_BR" =~ ^[0-9]+$ ]]; then
+              A_LABEL="$A_LABEL ~$((A_BR/1000))k"
+            elif [ "$A_CH" = "1" ] && [ -s "audio_dl/audio_compressed.opus" ]; then
+              A_LABEL="$A_LABEL ~14k"
+            fi
             echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
           fi
 
@@ -1599,6 +1621,7 @@ jobs:
         id: naming
         env:
           FILENAME: ${{ github.event.inputs.filename }}
+          CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           SAFE_NAME=$(python3 -c '
@@ -1615,8 +1638,10 @@ jobs:
             exit 1
           fi
 
-          echo "final_file_name=${SAFE_NAME}.mkv" >> "$GITHUB_OUTPUT"
-          echo "Display Name: $SAFE_NAME"
+          EXT=mkv
+          [ "$CODEC" = "audio" ] && EXT=opus
+          echo "final_file_name=${SAFE_NAME}.${EXT}" >> "$GITHUB_OUTPUT"
+          echo "Display Name: ${SAFE_NAME}.${EXT}"
 
       - name: رفع الناتج وإشعار المستخدم بالاسم الحقيقي
         env:
@@ -1637,7 +1662,7 @@ jobs:
           NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
         run: |
           set -euo pipefail
-          mv "output.mkv" "$FINAL_FILE_NAME"
+          mv "$OUTPUT_FILE" "$FINAL_FILE_NAME"
           FILE_SIZE=$(stat -c%s "$FINAL_FILE_NAME")
           SIZE_MB=$(awk -v s="$FILE_SIZE" 'BEGIN{printf "%.1f",s/1048576}')
 
