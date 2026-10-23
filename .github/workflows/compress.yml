@@ -991,7 +991,7 @@ jobs:
           else:
               n = max(min(10, int(dur // 90)), math.ceil(dur / 2400))
           bounds = [round(i * total / n) for i in range(n + 1)]
-          specs = {f"{i:03d}": {"start": bounds[i], "frames": bounds[i + 1] - bounds[i]}
+          specs = {f"{i:03d}": {"start": bounds[i], "frames": bounds[i + 1] - bounds[i], "total": total}
                    for i in range(n)}
           print(json.dumps({"total": total, "specs": specs}))
           PYEOF
@@ -1241,6 +1241,7 @@ jobs:
             IN="chunks_raw/source.mp4"
             SPEC_START=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].start')
             SPEC_FRAMES=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].frames')
+            SPEC_TOTAL=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].total')
             P="${PRESET_INPUT/none/4}"
             [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
               { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
@@ -1248,14 +1249,26 @@ jobs:
             echo "DT smoothing selected; fixed frame grid=$F, target height=$RESOLUTION"
             RES_ARGS=()
             [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
+            LAST_CHUNK=false
+            if [ "$((SPEC_START + SPEC_FRAMES))" -eq "$SPEC_TOTAL" ]; then
+              LAST_CHUNK=true
+            fi
             "$HOME/.venvs/dt2/bin/python" dt2_stream.py "$IN" "$OUT_FILE" \
               --crf "$TARGET_VALUE" --preset "$P" --fps "$F" \
               --start-frame "$SPEC_START" --frames "$SPEC_FRAMES" "${RES_ARGS[@]}"
             test -s "$OUT_FILE" || { echo "ملف فارغ" >&2; exit 1; }
             GOT=$(ffprobe -v error -count_packets -select_streams v:0 \
               -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE")
-            [ "$GOT" -eq "$SPEC_FRAMES" ] || \
-              { echo "الجزء $CHUNK_ID: $GOT إطاراً بدل $SPEC_FRAMES" >&2; exit 1; }
+            if [ "$GOT" -ne "$SPEC_FRAMES" ]; then
+              MISSING=$((SPEC_FRAMES - GOT))
+              if [ "$LAST_CHUNK" = true ] && [ "$MISSING" -ge 1 ] && [ "$MISSING" -le 24 ]; then
+                printf '%s\n' "$MISSING" > "${OUT_DIR}/encoded_${CHUNK_ID}.frames.txt"
+                echo "تحذير: الجزء الأخير ناقص ${MISSING} إطاراً (الحد المسموح 24، المتوقع ${SPEC_FRAMES}، الناتج ${GOT})؛ سيستمر الدمج والإرسال مع إظهار التحذير."
+              else
+                echo "الجزء $CHUNK_ID: $GOT إطاراً بدل $SPEC_FRAMES؛ النقص مسموح فقط في آخر الجزء الأخير وبحد أقصى 24 إطاراً." >&2
+                exit 1
+              fi
+            fi
             echo "الجزء $CHUNK_ID: $GOT إطاراً من البداية $SPEC_START، $(stat -c%s "$OUT_FILE") bytes"
             exit 0
           fi
@@ -1516,6 +1529,25 @@ jobs:
           path: all_encoded
           merge-multiple: true
 
+      - name: جمع تحذير نقص الإطارات النهائي
+        if: github.event.inputs.encode_mode == 'dt2'
+        run: |
+          set -euo pipefail
+          TOTAL_MISSING=0
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            VALUE=$(cat "$file")
+            [[ "$VALUE" =~ ^([1-9]|1[0-9]|2[0-4])$ ]] || { echo "Invalid DT2 frame warning: $file" >&2; exit 1; }
+            TOTAL_MISSING=$((TOTAL_MISSING + VALUE))
+          done < <(find all_encoded -maxdepth 1 -type f -name 'encoded_*.frames.txt' -print 2>/dev/null | sort)
+          if [ "$TOTAL_MISSING" -gt 0 ]; then
+            echo "FRAME_WARNING=⚠️ تنبيه: الناتج ناقص ${TOTAL_MISSING} إطاراً من نهاية المصدر (نحو ثانية كحد أقصى)." >> "$GITHUB_ENV"
+            echo "DT2 final frame warning: ${TOTAL_MISSING} frame(s) missing; continuing to merge/send."
+          else
+            echo "FRAME_WARNING=" >> "$GITHUB_ENV"
+            echo "DT2 frame count is exact."
+          fi
+
       - name: تنزيل الصوت وعيّنة المصدر
         uses: actions/download-artifact@v4
         with:
@@ -1630,6 +1662,7 @@ jobs:
           s = unicodedata.normalize("NFC", s)
           s = re.sub(r"[\\/*?\"<>|:]", "_", s)
           s = " ".join(s.split())
+          s = re.sub(r"\.(?:mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)$", "", s, flags=re.I)
           print(s[:80])
           ')
 
@@ -1658,6 +1691,7 @@ jobs:
           VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
           ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
           CODEC: ${{ github.event.inputs.codec }}
+          FRAME_WARNING: ${{ env.FRAME_WARNING }}
           IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
           NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
         run: |
@@ -1673,6 +1707,9 @@ jobs:
             "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
             "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
             "$ENCODE_MODE" "$NOISE_CLASS" "$COLOR_TAG")
+          if [ -n "$FRAME_WARNING" ]; then
+            CAPTION="${CAPTION}"$'\n'"${FRAME_WARNING}"
+          fi
           export FINAL_FILE_NAME CAPTION
 
           "$HOME/.venvs/telegram/bin/python" <<'PYEOF'
@@ -1712,6 +1749,9 @@ jobs:
 
           MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s' \
             "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$DURATION_FMT")
+          if [ -n "$FRAME_WARNING" ]; then
+            MESSAGE="${MESSAGE}"$'\n'"${FRAME_WARNING}"
+          fi
           curl --fail --silent --show-error \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
