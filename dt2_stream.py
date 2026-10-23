@@ -6,6 +6,7 @@ ffmpeg (فك + تحويل المعدل قبل الاختيار) -> Python (DT + 
 الصوت لا يُعالَج هنا؛ يُدمج لاحقاً في مرحلة الدمج من الملف الصوتي المستقل.
 """
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -65,6 +66,7 @@ def main():
     ap.add_argument("--start-frame", type=int, default=0)
     ap.add_argument("--frames", type=int, default=0, help="0 = حتى النهاية")
     ap.add_argument("--height", type=int, default=0, help="ارتفاع الإخراج؛ 0 يحافظ على أبعاد المصدر")
+    ap.add_argument("--dt-threads", type=int, default=2, help="عدد خيوط OpenCV لمعالجة DT")
     ap.add_argument("--warmup-frames", type=int, default=1)
     args = ap.parse_args()
 
@@ -80,8 +82,15 @@ def main():
     W, H = probe_size(src)
     if args.height < 0:
         raise ValueError("ارتفاع الإخراج لا يمكن أن يكون سالباً")
+    if args.dt_threads < 1:
+        raise ValueError("عدد خيوط DT يجب أن يكون 1 على الأقل")
+    # DT يعمل على W×H الأصلية؛ التصغير مؤجل لما بعد التنعيم.
+    cv2.setUseOptimized(True)
+    cv2.setNumThreads(min(args.dt_threads, os.cpu_count() or 1))
     out_h = min(H, args.height) if args.height else H
+    out_h = max(2, out_h // 2 * 2)
     out_w = max(2, int(round(W * out_h / H)) // 2 * 2)
+    print(f"DT resolution: source={W}x{H}; output={out_w}x{out_h}; OpenCV threads={cv2.getNumThreads()}")
     frame_bytes = W * H * 3
     context = min(max(args.warmup_frames, 0), args.start_frame)
     seek_frame = args.start_frame - context
