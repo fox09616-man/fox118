@@ -64,6 +64,7 @@ def main():
     ap.add_argument("--fps", default="24000/1001", help="معدل الإخراج قبل الاختيار")
     ap.add_argument("--start-frame", type=int, default=0)
     ap.add_argument("--frames", type=int, default=0, help="0 = حتى النهاية")
+    ap.add_argument("--height", type=int, default=0, help="ارتفاع الإخراج؛ 0 يحافظ على أبعاد المصدر")
     ap.add_argument("--warmup-frames", type=int, default=1)
     args = ap.parse_args()
 
@@ -77,6 +78,10 @@ def main():
         raise RuntimeError("يلزم opencv-contrib-python-headless")
 
     W, H = probe_size(src)
+    if args.height < 0:
+        raise ValueError("ارتفاع الإخراج لا يمكن أن يكون سالباً")
+    out_h = min(H, args.height) if args.height else H
+    out_w = max(2, int(round(W * out_h / H)) // 2 * 2)
     frame_bytes = W * H * 3
     context = min(max(args.warmup_frames, 0), args.start_frame)
     seek_frame = args.start_frame - context
@@ -98,7 +103,7 @@ def main():
         dec_cmd += ["-frames:v", str(context + args.frames)]
     dec_cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "pipe:1"]
     enc_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-               "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}",
+               "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{out_w}x{out_h}",
                "-r", args.fps, "-i", "pipe:0",
                "-c:v", "libsvtav1", "-preset", str(args.preset), "-crf", str(args.crf),
                "-pix_fmt", "yuv420p10le", "-svtav1-params", SVT_PARAMS,
@@ -128,7 +133,10 @@ def main():
             p2 = dt(p1, SIGMA_COLOR_2)
             m = w[:, :, None]
             out = p1.astype(np.float32) * (1.0 - m) + p2.astype(np.float32) * m
-            enc.stdin.write(np.clip(out, 0, 255).astype(np.uint8).tobytes())
+            out = np.clip(out, 0, 255).astype(np.uint8)
+            if out_w != W or out_h != H:
+                out = cv2.resize(out, (out_w, out_h), interpolation=cv2.INTER_AREA)
+            enc.stdin.write(out.tobytes())
             encoded += 1
             if encoded % 24 == 0:
                 print(f"encoded {encoded} frames", flush=True)
@@ -143,7 +151,7 @@ def main():
     stopped_early = bool(args.frames) and encoded >= args.frames
     if (dec_rc and not stopped_early) or enc_rc or encoded == 0:
         raise RuntimeError(f"فشل: decoder={dec_rc} {dec_err[:300]} encoder={enc_rc} {enc_err[:300]}")
-    print(f"done: {encoded} frames -> {dst}")
+    print(f"done: {encoded} frames at {out_w}x{out_h} -> {dst}")
 
 
 if __name__ == "__main__":
