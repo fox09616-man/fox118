@@ -27,15 +27,15 @@ on:
       preset:
         description: 'AV1: رقم من 0 إلى 13. يُهمَل عند اختيار audio.'
         required: true
-        default: '6'
+        default: '4'
         type: choice
         options: ['none', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
       encode_mode:
-        description: 'وضع الفلاتر: filters مع فلاتر، nofilters بدونها، audio للصوت.'
+        description: 'dt2 لخط DT المزدوج، filters للفلاتر، nofilters بدونها، audio للصوت.'
         required: true
-        default: 'filters'
+        default: 'dt2'
         type: choice
-        options: ['filters', 'nofilters', 'audio']
+        options: ['dt2', 'filters', 'nofilters', 'audio']
       encode_method:
         description: 'طريقة الترميز: crf بجودة ثابتة، twopass بمعدل بت، auto بهدف VMAF، audio لاستخراج الصوت.'
         required: true
@@ -45,7 +45,7 @@ on:
       target_value:
         description: 'CRF من 0 إلى 63، أو معدل بت مثل 500k، أو هدف VMAF من 50 إلى 99 مع auto.'
         required: true
-        default: '38'
+        default: '48'
       resolution:
         description: 'الارتفاع النهائي مثل 480 أو 720 أو 1080، أو auto للإبقاء على دقة المصدر.'
         required: true
@@ -55,11 +55,11 @@ on:
         required: true
         default: '23.976'
 
-      # ============ تشكيلات الفلاتر الجاهزة ============
+      # ============ تشكيلات الفلاتر (مُبقاة للتوافق مع البوت؛ لا تُطبَّق حالياً) ============
       filter_preset:
-        description: 'اختر تشكيلة الفلاتر الجاهزة بالأسماء المعبّرة أو الوضع اليدوي custom.'
+        description: 'تشكيلة الفلاتر (مُبقاة للتوافق؛ لا تُطبَّق حالياً).'
         required: true
-        default: 'anime-balanced'
+        default: 'off'
         type: choice
         options:
           - 'off'
@@ -72,7 +72,7 @@ on:
           - 'old-restoration'
           - 'custom'
       custom_filters:
-        description: 'سلسلة فلاتر FFmpeg مخصصة بالكامل (تُستخدم حصرياً عند اختيار filter_preset=custom).'
+        description: 'سلسلة فلاتر مخصصة (مُبقاة للتوافق؛ لا تُطبَّق حالياً).'
         required: false
         default: ''
 
@@ -834,12 +834,12 @@ jobs:
                -of csv=p=0 raw_input.mp4 | grep -c . || true)
 
           if [ "${HAS_AUDIO:-0}" -gt 0 ]; then
-            echo "Compressing audio..."
+            echo "Compressing audio (Opus 14k mono)..."
             "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 \
               -map 0:a:0 \
               -vn \
               -c:a libopus \
-              -b:a 16k \
+              -b:a 14k \
               -ac 1 \
               -ar 48000 \
               audio_compressed.opus
@@ -889,6 +889,11 @@ jobs:
           MIN_CHUNK=90
           MAX_CHUNK=2400
           MAX_PARALLEL=10
+
+          # في وضع dt2 لا يُقسَّم المصدر: المعالجة متسلسلة لأن القناع الزمني يعتمد على الإطار السابق.
+          if [ "${{ github.event.inputs.encode_mode }}" = "dt2" ]; then
+            SPLIT_THRESHOLD=999999999
+          fi
 
           if [ "$DURATION" -gt "$SPLIT_THRESHOLD" ]; then
             N=$(( DURATION / MIN_CHUNK ))
@@ -969,6 +974,9 @@ jobs:
       matrix:
         chunk: ${{ fromJSON(needs.split-video.outputs.chunks) }}
     steps:
+      - name: تنزيل كود المستودع
+        uses: actions/checkout@v4
+
       - name: تنزيل الأجزاء الخام
         uses: actions/download-artifact@v4
         with:
@@ -991,7 +999,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libdav1d-dev libopus0
+          sudo apt-get install -y ffmpeg libdav1d-dev libopus0 jq
           if [ "$CODEC" != "audio" ]; then
             export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
@@ -999,6 +1007,10 @@ jobs:
             echo "=== Tools check ==="
             echo "ffmpeg: $("$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1)"
             echo "SvtAv1EncApp: $("$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || echo 'unavailable')"
+          fi
+          if [ "${{ github.event.inputs.encode_mode }}" = "dt2" ]; then
+            python3 -m pip install --user --break-system-packages \
+              opencv-contrib-python-headless numpy
           fi
 
       - name: تثبيت av1an عند الحاجة فقط
@@ -1021,8 +1033,6 @@ jobs:
           TARGET_VALUE: ${{ github.event.inputs.target_value }}
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
-          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
-          CUSTOM_FILTERS: ${{ github.event.inputs.custom_filters }}
           CHUNK_ID: ${{ matrix.chunk }}
           SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
         run: |
@@ -1046,26 +1056,6 @@ jobs:
               eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
             fi
           fi
-
-          eval "$(echo "$SOURCE_INFO" | python3 -c "
-          import json, sys
-          try:
-              d = json.load(sys.stdin)
-          except Exception:
-              d = {}
-          print('IS_BT2020='    + str(d.get('is_bt2020','false')).lower())
-          print('IS_HDR='       + str(d.get('is_hdr','false')).lower())
-          print('IS_HLG='       + str(d.get('is_hlg','false')).lower())
-          print('NOISE_CLASS='  + d.get('noise_class','medium'))
-          print('SRC_PRIMARIES='+ d.get('color_primaries','bt709'))
-          print('SRC_TRANSFER=' + d.get('color_transfer','bt709'))
-          print('SRC_COLORSPACE='+ d.get('color_space','bt709'))
-          print('SRC_RANGE='    + d.get('color_range','tv'))
-          ")"
-
-          echo "=== Source info ==="
-          echo "BT.2020=$IS_BT2020 | HDR=$IS_HDR | HLG=$IS_HLG | noise=$NOISE_CLASS"
-          echo "Color: $SRC_PRIMARIES / $SRC_TRANSFER / $SRC_COLORSPACE | range: $SRC_RANGE"
 
           case "$CODEC" in av1|audio) ;; *) echo "Unsupported codec" >&2; exit 1 ;; esac
           if [ "$RESOLUTION" != "auto" ]; then
@@ -1091,36 +1081,81 @@ jobs:
             exit 0
           fi
 
-          echo "Detecting black bars..."
-          CROPDETECT=$("$FFMPEG" -hide_banner -nostdin -t 120 -i "$IN" \
-            -vf "cropdetect=24:16:0" -f null - 2>&1 | \
-            grep -oP 'crop=\d+:\d+:\d+:\d+' | tail -5 | \
-            sort | uniq -c | sort -rn | head -1 | awk '{print $2}' || true)
-
-          CROP_FILTER=""
-          if [ -n "${CROPDETECT:-}" ] && [ "$CROPDETECT" != "crop=0:0:0:0" ]; then
-            CROP_W=$(printf '%s' "$CROPDETECT" | cut -d: -f1 | sed 's/^crop=//')
-            CROP_H=$(printf '%s' "$CROPDETECT" | cut -d: -f2)
-            SRC_WW=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width  -of csv=p=0 "$IN" | head -1)
-            SRC_HH=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN" | head -1)
-            CROP_W=${CROP_W:-0}; CROP_H=${CROP_H:-0}
-            SRC_WW=${SRC_WW:-0}; SRC_HH=${SRC_HH:-0}
-            DIFF_W=$(( SRC_WW - CROP_W ))
-            DIFF_H=$(( SRC_HH - CROP_H ))
-            if [ "$DIFF_W" -gt 4 ] || [ "$DIFF_H" -gt 4 ]; then
-              CROP_FILTER="${CROPDETECT},"
-              echo "Cropping: ${CROPDETECT} saved ${DIFF_W}x${DIFF_H} px"
+          # ============================================================
+          # مسار DT المزدوج: فك -> DT -> ترميز AV1 عبر أنابيب الذاكرة
+          # ============================================================
+          if [ "$ENCODE_MODE" = "dt2" ]; then
+            SW=$(echo "$SOURCE_INFO" | jq -r .w)
+            SH=$(echo "$SOURCE_INFO" | jq -r .h)
+            if [ "$SH" -gt 720 ]; then
+              TH=720
+              TW=$(( (SW * TH / SH + 1) / 2 * 2 ))
+              SCALE_FILTER="scale=${TW}:${TH}:flags=lanczos,"
             else
-              echo "No black bars"
+              TW=$SW; TH=$SH
+              SCALE_FILTER=""
             fi
-          else
-            echo "No black bars"
+            echo "dt2 working size: ${TW}x${TH} (source ${SW}x${SH})"
+
+            P="${PRESET_INPUT/none/4}"
+            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
+              { echo 'dt2 needs a CRF value 0-63' >&2; exit 1; }
+
+            "$FFMPEG" -v error -nostdin -i "$IN" \
+              -vf "fps=24000/1001,${SCALE_FILTER%,}" -an \
+              -f rawvideo -pix_fmt bgr24 - \
+            | python3 dt_stage.py --width "$TW" --height "$TH" \
+            | "$FFMPEG" -v error -nostdin -y \
+                -f rawvideo -pix_fmt bgr24 -s "${TW}x${TH}" -r 24000/1001 -i - \
+                -vf "format=yuv420p10le" \
+                -c:v libsvtav1 -preset "$P" -crf "$TARGET_VALUE" \
+                -pix_fmt yuv420p10le \
+                -svtav1-params "tune=0:enable-overlays=1:sharpness=4:film-grain=0:enable-tf=0:lp=4" \
+                -an "$OUT_FILE"
+            test -s "$OUT_FILE" || { echo "Empty dt2 output" >&2; exit 1; }
+            echo "dt2 encode done: $(stat -c%s "$OUT_FILE") bytes"
+            exit 0
           fi
 
-          INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=codec_name -of csv=p=0 "$IN")
-          DECODER_ARGS=()
-          [ "$INPUT_CODEC" = "av1" ] && DECODER_ARGS=(-c:v libdav1d)
+          # ============================================================
+          # المسار العام: بدون فلاتر (تحجيم وتغيير معدل فقط)
+          # ============================================================
+          echo "Detecting source info..."
+          eval "$(echo "$SOURCE_INFO" | python3 -c "
+          import json, sys
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              d = {}
+          print('IS_BT2020='    + str(d.get('is_bt2020','false')).lower())
+          print('IS_HDR='       + str(d.get('is_hdr','false')).lower())
+          print('IS_HLG='       + str(d.get('is_hlg','false')).lower())
+          print('SRC_PRIMARIES='+ d.get('color_primaries','bt709'))
+          print('SRC_TRANSFER=' + d.get('color_transfer','bt709'))
+          print('SRC_COLORSPACE='+ d.get('color_space','bt709'))
+          print('SRC_RANGE='    + d.get('color_range','tv'))
+          ")"
+
+          FILTERS=("setpts=PTS-STARTPTS")
+
+          if [ "$RESOLUTION" != "auto" ]; then
+            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
+          fi
+
+          COLOR_ARGS=()
+          OUT_PIX_FMT="yuv420p10le"
+
+          if [ "$IS_HDR" = "true" ] && [ "$IS_HLG" = "true" ]; then
+            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc arib-std-b67)
+          elif [ "$IS_HDR" = "true" ]; then
+            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc smpte2084)
+          elif [ "$IS_BT2020" = "true" ]; then
+            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc "$SRC_TRANSFER")
+          fi
+
+          FILTERS+=("format=${OUT_PIX_FMT}")
+          VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
+          echo "Filter chain: $VF_CHAIN"
 
           SRC_FPS_RAW=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=avg_frame_rate -of csv=p=0 "$IN")
@@ -1153,189 +1188,15 @@ jobs:
             fi
           fi
 
-          # ============================================================
-          # بناء سلسلة الفلاتر الأساسية
-          # ============================================================
-          FILTERS=("setpts=PTS-STARTPTS")
-
-          [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
-
-          if [ "$RESOLUTION" != "auto" ]; then
-            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
-          fi
-
-          # ============================================================
-          # فلاتر التشكيلة المختارة: تنظيف خفيف، ثم تدرج/لون، ثم إبراز حواف محدود.
-          # ============================================================
-          FILTERS_EXTRA=()
-
-          if [ "$ENCODE_MODE" = "filters" ]; then
-
-            case "$FILTER_PRESET" in
-
-              off)
-                echo "Preset: off (no filters)"
-                ;;
-
-              clean-gentle)
-                echo "Preset: clean-gentle"
-                # تنظيف طفيف للتدرجات مع أقل قدر من تنعيم التفاصيل.
-                FILTERS_EXTRA+=("hqdn3d=0.35:0.3:0.6:0.5")
-                FILTERS_EXTRA+=("deband=1thr=0.008:2thr=0.008:3thr=0.008:range=8:blur=false")
-                FILTERS_EXTRA+=("cas=0.08")
-                ;;
-
-              anime-balanced)
-                echo "Preset: anime-balanced"
-                # 1. إزالة الضجيج بلطف قبل تعديل النغمة واللون.
-                FILTERS_EXTRA+=("hqdn3d=1.0:0.8:1.3:1.0")
-                FILTERS_EXTRA+=("deband=1thr=0.012:2thr=0.012:3thr=0.012:range=12:blur=false")
-                FILTERS_EXTRA+=("gradfun=strength=0.55:radius=16")
-                # 2. منحنى وتوازن لوني خفيفان لمظهر أنظف وأكثر إشراقاً دون مبالغة.
-                FILTERS_EXTRA+=("curves=all='0/0 0.2/0.21 0.5/0.52 0.8/0.81 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.02:gs=0.01:bs=-0.005")
-                # 3. إبراز محلي ضعيف للحواف.
-                FILTERS_EXTRA+=("cas=0.12")
-                ;;
-
-              anime-vibrant)
-                echo "Preset: anime-vibrant"
-                FILTERS_EXTRA+=("hqdn3d=1.0:0.8:1.3:1.0")
-                FILTERS_EXTRA+=("deband=1thr=0.012:2thr=0.012:3thr=0.012:range=12:blur=false")
-                FILTERS_EXTRA+=("gradfun=strength=0.55:radius=16")
-                FILTERS_EXTRA+=("curves=all='0/0 0.18/0.19 0.5/0.53 0.8/0.83 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.03:gs=0.012:bs=-0.012")
-                FILTERS_EXTRA+=("eq=contrast=1.02:brightness=0.002:saturation=1.03")
-                FILTERS_EXTRA+=("cas=0.12")
-                ;;
-
-              anime-cinematic)
-                echo "Preset: anime-cinematic"
-                # استبدال NLMeans البطيء بتنعيم زمني أخف، مع عدم إضافة حبيبات.
-                FILTERS_EXTRA+=("hqdn3d=1.1:0.9:1.5:1.2")
-                FILTERS_EXTRA+=("deband=1thr=0.012:2thr=0.012:3thr=0.012:range=12:blur=false")
-                FILTERS_EXTRA+=("gradfun=strength=0.55:radius=16")
-                FILTERS_EXTRA+=("curves=all='0/0 0.18/0.19 0.5/0.53 0.82/0.84 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.02:gs=0.01:bs=-0.01")
-                FILTERS_EXTRA+=("cas=0.10")
-                ;;
-
-              movie-balanced)
-                echo "Preset: movie-balanced"
-                FILTERS_EXTRA+=("hqdn3d=0.55:0.4:0.9:0.7")
-                FILTERS_EXTRA+=("deband=1thr=0.008:2thr=0.008:3thr=0.008:range=10:blur=false")
-                FILTERS_EXTRA+=("curves=all='0/0 0.25/0.26 0.5/0.515 0.8/0.81 1/1'")
-                FILTERS_EXTRA+=("eq=contrast=1.015:brightness=0.002:saturation=1.012")
-                FILTERS_EXTRA+=("cas=0.10")
-                ;;
-
-              movie-vibrant)
-                echo "Preset: movie-vibrant"
-                FILTERS_EXTRA+=("hqdn3d=0.55:0.4:0.9:0.7")
-                FILTERS_EXTRA+=("deband=1thr=0.008:2thr=0.008:3thr=0.008:range=10:blur=false")
-                FILTERS_EXTRA+=("curves=all='0/0 0.22/0.23 0.5/0.53 0.8/0.83 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.025:gs=0.01:bs=-0.012")
-                FILTERS_EXTRA+=("eq=contrast=1.02:brightness=0.002:saturation=1.03")
-                FILTERS_EXTRA+=("cas=0.12")
-                ;;
-
-              old-restoration)
-                echo "Preset: old-restoration"
-                # أقوى من الوصفات الأخرى، لكن بلا ATADenoise المتراكم أو NLMeans.
-                FILTERS_EXTRA+=("hqdn3d=2.0:1.4:2.5:1.8")
-                FILTERS_EXTRA+=("deband=1thr=0.018:2thr=0.018:3thr=0.018:range=16:blur=false")
-                FILTERS_EXTRA+=("gradfun=strength=0.65:radius=16")
-                FILTERS_EXTRA+=("curves=all='0/0 0.2/0.21 0.5/0.52 0.8/0.82 1/1'")
-                FILTERS_EXTRA+=("colorbalance=rs=0.012:gs=0.006:bs=-0.006")
-                FILTERS_EXTRA+=("cas=0.12")
-                ;;
-
-              custom)
-                if [ -z "${CUSTOM_FILTERS:-}" ]; then
-                  echo "custom preset selected but custom_filters is empty" >&2
-                  exit 1
-                fi
-                echo "Preset: custom -> $CUSTOM_FILTERS"
-                FILTERS_EXTRA+=("$CUSTOM_FILTERS")
-                ;;
-
-              *)
-                echo "Unknown FILTER_PRESET: $FILTER_PRESET" >&2
-                exit 1
-                ;;
-
-            esac
-
-            for f in "${FILTERS_EXTRA[@]}"; do
-              FILTERS+=("$f")
-            done
-
-          fi
-
-          # ============================================================
-          # معالجة الألوان
-          # ============================================================
-          COLOR_ARGS=()
-          OUT_PIX_FMT="yuv420p10le"
-
-          if [ "$IS_HDR" = "true" ] && [ "$IS_HLG" = "true" ]; then
-            echo "HLG source: keeping full range"
-            COLOR_ARGS=(
-              -colorspace bt2020nc
-              -color_primaries bt2020
-              -color_trc arib-std-b67
-            )
-          elif [ "$IS_HDR" = "true" ]; then
-            echo "HDR PQ source: keeping full range"
-            COLOR_ARGS=(
-              -colorspace bt2020nc
-              -color_primaries bt2020
-              -color_trc smpte2084
-            )
-          elif [ "$IS_BT2020" = "true" ]; then
-            echo "BT.2020 SDR source: keeping wide gamut"
-            COLOR_ARGS=(
-              -colorspace bt2020nc
-              -color_primaries bt2020
-              -color_trc "$SRC_TRANSFER"
-            )
-          else
-            echo "SDR BT.709 source"
-            SRC_WW=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN" | head -1)
-            SRC_HH=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN" | head -1)
-            SRC_WW=${SRC_WW:-0}; SRC_HH=${SRC_HH:-0}
-            if { [ "$SRC_WW" -ge 1280 ] || [ "$SRC_HH" -gt 576 ]; } && \
-               { [ -z "$SRC_PRIMARIES" ] || [ "$SRC_PRIMARIES" = "unknown" ]; }; then
-              COLOR_ARGS=(
-                -colorspace bt709
-                -color_primaries bt709
-                -color_trc bt709
-              )
-            fi
-          fi
-
-          FILTERS+=("format=${OUT_PIX_FMT}")
-
-          VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
-          echo "Filter chain: $VF_CHAIN"
-
           NPROC=$(nproc)
-          # Av1an استخدم كل الأنوية في النسخة الأقدم؛ SVT-AV1 يُترك على التوازي التلقائي.
-          WORKERS="$NPROC"
-          # لا نضيف حبيبات اصطناعية؛ هدف المعالجة صورة ناعمة ونظيفة.
-          SVT_BASE="tune=0:enable-qm=1:qm-min=0"
-          SVT_PARAMS="-svtav1-params ${SVT_BASE}"
-
-          echo "SVT params: $SVT_PARAMS"
-          echo "Av1an workers: $WORKERS; SVT parallelism: automatic"
+          SVT_PARAMS="-svtav1-params tune=0:enable-qm=1:qm-min=0"
+          echo "Workers: $NPROC | SVT params: $SVT_PARAMS"
 
           case "$ENCODE_METHOD" in
             crf)
               [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
                 { echo 'Invalid CRF range 0-63' >&2; exit 1; }
-
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
-                "${DECODER_ARGS[@]}" -y -i "$IN" \
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v libsvtav1 \
@@ -1355,8 +1216,7 @@ jobs:
               TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
               PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
 
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
-                "${DECODER_ARGS[@]}" -y -i "$IN" \
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v libsvtav1 \
@@ -1368,8 +1228,7 @@ jobs:
                 -pass 1 -passlogfile "$PASSLOG" \
                 -an -f null /dev/null
 
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
-                "${DECODER_ARGS[@]}" -y -i "$IN" \
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v libsvtav1 \
@@ -1389,9 +1248,6 @@ jobs:
                 { echo 'VMAF target must be 50-99' >&2; exit 1; }
               VMAF_TARGET="$TARGET_VALUE"
 
-              SVT_FOR_AV1AN=$(printf '%s' "$SVT_BASE" | \
-                tr ':' '\n' | sed 's/=/ /; s/^/--/' | paste -sd' ' -)
-
               FREE_GB=$(df -BG . | awk 'NR==2{gsub("G",""); print $4}')
               echo "Free space: ${FREE_GB}GB"
               if [ "$FREE_GB" -lt 5 ]; then
@@ -1402,30 +1258,27 @@ jobs:
 
               PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
               "$FFMPEG" -hide_banner -nostdin -y \
-                "${DECODER_ARGS[@]}" -i "$IN" \
+                -i "$IN" \
                 -map 0:v:0 \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v ffv1 \
                 "$PRE_FILE"
               test -s "$PRE_FILE"
-              PRE_SIZE=$(du -sh "$PRE_FILE" | cut -f1)
-              echo "ffv1 intermediate size: $PRE_SIZE"
 
               RAM_MB=$(awk '/MemAvailable/{print int($2/1024*0.8)}' /proc/meminfo)
-              echo "Av1an RAM limit: ${RAM_MB}MB"
 
               av1an \
                 -i "$PRE_FILE" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
-                -v "${AV1AN_PRESET_ARGS[*]} --crf 30 ${SVT_FOR_AV1AN}" \
+                -v "${AV1AN_PRESET_ARGS[*]} --crf 30 --tune 0 --enable-qm 1" \
                 --target-quality "$VMAF_TARGET" \
                 --probes 4 \
                 --probing-rate 4 \
                 --min-q 20 \
                 --max-q 60 \
-                -w "$WORKERS" \
+                -w "$NPROC" \
                 --sc-method standard \
                 --min-scene-len 24 \
                 --extra-split 240 \
@@ -1435,7 +1288,6 @@ jobs:
                 --ffmpeg-location "$HOME/codec-build/bin"
 
               rm -f "$PRE_FILE"
-              echo "Removed ffv1 intermediate"
               CRF_USED="Av1an-VMAF${VMAF_TARGET}"
               ;;
           esac
@@ -1448,37 +1300,7 @@ jobs:
 
           IN_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$IN")
           OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
-          echo "Duration: in=$IN_DUR out=$OUT_DUR"
-
-          (
-            set +e
-            Q_W=$("$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=width -of csv=p=0 "$OUT_FILE" | head -1)
-            Q_H=$("$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=height -of csv=p=0 "$OUT_FILE" | head -1)
-            Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
-          [1:v]setpts=PTS-STARTPTS,fps=${OUT_FPS},\
-          scale=${Q_W}:${Q_H}:flags=lanczos+accurate_rnd+full_chroma_int,\
-          format=yuv420p10le[r]"
-            SSIM=$("$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
-              -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | \
-              grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2)
-            VMAF_SCORE=""
-            if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
-              "$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
-                -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:\
-          log_path=${OUT_DIR}/vmaf_${CHUNK_ID}.json:n_threads=$(nproc):n_subsample=6" \
-                -f null - >/dev/null 2>&1
-              VMAF_SCORE=$(python3 -c "
-          import json,sys
-          d=json.load(open(sys.argv[1]))
-          print(round(d['pooled_metrics']['vmaf']['mean'],2))
-          " "${OUT_DIR}/vmaf_${CHUNK_ID}.json" 2>/dev/null)
-            fi
-            echo "frames=NA ssim=${SSIM:-NA} vmaf=${VMAF_SCORE:-NA} crf=${CRF_USED:-NA}" \
-              > "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt"
-            echo "Quality: $(cat "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt")"
-          ) || true
+          echo "Duration: in=$IN_DUR out=$OUT_DUR | crf=${CRF_USED:-NA}"
 
       - name: رفع الجزء المضغوط
         uses: actions/upload-artifact@v4
@@ -1511,7 +1333,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libdav1d-dev libopus0
+          sudo apt-get install -y ffmpeg libdav1d-dev libopus0 jq
           python3 -m pip install --user telethon
 
       - name: تنزيل الأجزاء المضغوطة
@@ -1580,81 +1402,6 @@ jobs:
           OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 output.mkv | cut -d. -f1)
           echo "Final duration: ${OUT_DUR}s"
 
-      - name: قياس الجودة على الناتج الكامل
-        env:
-          CODEC: ${{ github.event.inputs.codec }}
-        run: |
-          set -euo pipefail
-          if [ "$CODEC" = "audio" ]; then
-            echo "Audio mode: skip quality measurement"; exit 0
-          fi
-
-          if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
-            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          else
-            FFMPEG=ffmpeg; FFPROBE=ffprobe
-          fi
-
-          TOTAL_DUR=$("$FFPROBE" -v error -show_entries format=duration \
-            -of csv=p=0 output.mkv | cut -d. -f1)
-          SAMPLE_START=$(( TOTAL_DUR / 2 - 45 ))
-          [ "$SAMPLE_START" -lt 0 ] && SAMPLE_START=0
-          SAMPLE_DUR=90
-          if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$TOTAL_DUR" ]; then
-            SAMPLE_DUR=$(( TOTAL_DUR - SAMPLE_START ))
-          fi
-
-          echo "Quality measurement: start=${SAMPLE_START}s duration=${SAMPLE_DUR}s"
-
-          Q_W=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=width -of csv=p=0 output.mkv | head -1)
-          Q_H=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=height -of csv=p=0 output.mkv | head -1)
-
-          "$FFMPEG" -hide_banner -nostdin -y \
-            -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
-            -i output.mkv \
-            -map 0:v:0 -c:v copy sample_out.mkv
-
-          SRC_FILE="audio_dl/source_sample.mkv"
-          if [ ! -s "$SRC_FILE" ]; then
-            echo "Source sample not available, skipping quality"
-            exit 0
-          fi
-
-          Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
-          [1:v]setpts=PTS-STARTPTS,\
-          scale=${Q_W}:${Q_H}:flags=lanczos+accurate_rnd+full_chroma_int,\
-          format=yuv420p10le[r]"
-
-          SSIM=$("$FFMPEG" -hide_banner -nostdin \
-            -i sample_out.mkv -i "$SRC_FILE" \
-            -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | \
-            grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2 || echo "NA")
-
-          VMAF_SCORE="NA"
-          if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
-            "$FFMPEG" -hide_banner -nostdin \
-              -i sample_out.mkv -i "$SRC_FILE" \
-              -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:\
-          log_path=vmaf_final.json:n_threads=$(nproc):n_subsample=6" \
-              -f null - >/dev/null 2>&1 || true
-            VMAF_SCORE=$(python3 -c "
-          import json, sys
-          try:
-              d = json.load(open('vmaf_final.json'))
-              print(round(d['pooled_metrics']['vmaf']['mean'], 2))
-          except:
-              print('NA')
-          " 2>/dev/null)
-          fi
-
-          echo "Full output quality: SSIM=${SSIM} VMAF=${VMAF_SCORE}"
-          echo "SSIM=${SSIM} VMAF=${VMAF_SCORE}" > final_quality.txt
-          rm -f sample_out.mkv
-
       - name: استخراج معلومات الناتج
         id: videoinfo
         env:
@@ -1668,6 +1415,7 @@ jobs:
 
           if [ "$CODEC" = "audio" ]; then
             echo 'actual_res=audio only' >> "$GITHUB_OUTPUT"
+            echo 'video_info=audio' >> "$GITHUB_OUTPUT"
           else
             ACTUAL_RES=$(ffprobe -v error -select_streams v:0 \
               -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
@@ -1700,29 +1448,6 @@ jobs:
             [[ "$A_BR" =~ ^[0-9]+$ ]] && A_LABEL="$A_LABEL ~$((A_BR/1000))k"
             echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
           fi
-
-          Q_LINE="NA"
-          if [ -f final_quality.txt ]; then
-            Q_LINE=$(cat final_quality.txt)
-            echo "Full output quality: $Q_LINE"
-          elif ls all_encoded/encoded_*.quality.txt >/dev/null 2>&1; then
-            Q_LINE=$(cat all_encoded/encoded_*.quality.txt | awk '
-              function add(x){out=(out=="")?x:out" - "x}
-              {s="";v="";c=""
-               for(i=1;i<=NF;i++){split($i,kv,"=");
-                 if(kv[1]=="ssim")s=kv[2];
-                 else if(kv[1]=="vmaf")v=kv[2];
-                 else if(kv[1]=="crf")c=kv[2]}
-               if(s~/^[0-9.]+/){ss+=s;ns++}
-               if(v~/^[0-9.]+/){vv+=v;nv++;if(mv==""||v+0<mv+0)mv=v}
-               if(c!="NA"&&c!=""){cc=c}}
-              END{out="";
-                if(ns>0)add(sprintf("SSIM %.4f",ss/ns));
-                if(nv>0)add(sprintf("VMAF %.1f min %.1f",vv/nv,mv));
-                if(cc!="")add("CRF "cc);
-                if(out=="")out="NA";print out}')
-          fi
-          echo "quality=$Q_LINE" >> "$GITHUB_OUTPUT"
 
       - name: إعداد الاسم المخصص الحقيقي للملف
         id: naming
@@ -1760,11 +1485,9 @@ jobs:
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
           VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
-          QUALITY: ${{ steps.videoinfo.outputs.quality }}
           CODEC: ${{ github.event.inputs.codec }}
-          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
-          NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
           IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
+          NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
         run: |
           set -euo pipefail
           mv "output.mkv" "$FINAL_FILE_NAME"
@@ -1774,12 +1497,10 @@ jobs:
           COLOR_TAG=""
           [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | 🎨 BT.2020"
 
-          FILTERS_TAG="preset=${FILTER_PRESET}"
-
-          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
+          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
             "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
-            "$QUALITY" "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
-            "$FILTERS_TAG" "$NOISE_CLASS" "$COLOR_TAG")
+            "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
+            "$ENCODE_MODE" "$NOISE_CLASS" "$COLOR_TAG")
           export FINAL_FILE_NAME CAPTION
 
           python3 <<'PYEOF'
@@ -1801,8 +1522,8 @@ jobs:
           asyncio.run(main())
           PYEOF
 
-          MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' \
-            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
+          MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s' \
+            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$DURATION_FMT")
           curl --fail --silent --show-error \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
