@@ -30,11 +30,11 @@ on:
         type: choice
         options: ['none', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
       encode_mode:
-        description: 'dt2 لخط DT المزدوج، filters للفلاتر، nofilters بدونها، audio للصوت.'
+        description: 'filters لاختيار مسار التنعيم أو الواقعي، nofilters دون فلاتر، audio للصوت فقط.'
         required: true
         default: 'nofilters'
         type: choice
-        options: ['dt2', 'filters', 'nofilters', 'audio']
+        options: ['filters', 'nofilters', 'audio']
       encode_method:
         description: 'طريقة الترميز: crf بجودة ثابتة، twopass بمعدل بت، auto بهدف VMAF، audio لاستخراج الصوت.'
         required: true
@@ -55,11 +55,11 @@ on:
         default: '23.976'
 
       filter_preset:
-        description: 'فلتر تنعيم DT أو hqdn3d للمحتوى الواقعي؛ يستخدم فقط مع encode_mode المناسب.'
+        description: 'عند اختيار filters: modern-anime أو old-anime؛ realistic للمحتوى الواقعي. اختر off مع nofilters.'
         required: true
         default: 'off'
         type: choice
-        options: ['off', 'dt-smooth', 'realistic']
+        options: ['off', 'modern-anime', 'old-anime', 'realistic']
 
 concurrency:
   group: video-compression-${{ github.event.inputs.chat_id }}
@@ -88,21 +88,28 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: استعادة بيئة DT2 Python من الكاش
-        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_mode == 'dt2'
-        id: cache-dt2-python
+      - name: استعادة بيئة المطابقة المكانية من الكاش
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_mode == 'filters' &&
+          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime')
+        id: cache-spatial-python
         uses: actions/cache@v4
         with:
-          path: ~/.venvs/dt2
-          key: dt2-opencv-ubuntu-24.04-python312-v1
+          path: ~/.venvs/spatial
+          key: spatial-match-opencv-ubuntu-24.04-python312-v1
 
-      - name: إنشاء بيئة DT2 عند الحاجة فقط
-        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_mode == 'dt2' && steps.cache-dt2-python.outputs.cache-hit != 'true'
+      - name: إنشاء بيئة المطابقة عند الحاجة فقط
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_mode == 'filters' &&
+          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime') &&
+          steps.cache-spatial-python.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          python3 -m venv "$HOME/.venvs/dt2"
-          "$HOME/.venvs/dt2/bin/python" -m pip install opencv-contrib-python-headless==4.10.0.84 numpy==1.26.4
-          "$HOME/.venvs/dt2/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "dtFilter"); print("OpenCV", cv2.__version__, "NumPy", numpy.__version__)'
+          python3 -m venv "$HOME/.venvs/spatial"
+          "$HOME/.venvs/spatial/bin/python" -m pip install opencv-contrib-python-headless==4.10.0.84 numpy==1.26.4
+          "$HOME/.venvs/spatial/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter"); print("OpenCV", cv2.__version__, "NumPy", numpy.__version__)'
 
       - name: بناء SVT-AV1 v4.2.0 و VMAF v3.0.0 و FFmpeg
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
@@ -976,34 +983,6 @@ jobs:
             exit 0
           fi
 
-          # ============================================================
-          # وضع dt2: تقسيم على شبكة 23.976 بالفهرس، والمصدر يبقى ملفاً واحداً
-          # ============================================================
-          if [ "${{ github.event.inputs.encode_mode }}" = "dt2" ]; then
-            cp raw_input.mp4 chunks_raw/source.mp4
-            DUR_SEC=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_input.mp4)
-            python3 - "$DUR_SEC" > /tmp/plan.json <<'PYEOF'
-          import json, math, sys
-          dur = float(sys.argv[1])
-          total = math.floor(dur * 24000 / 1001 + 1e-6)
-          if dur <= 300:
-              n = 1
-          else:
-              n = max(min(10, int(dur // 90)), math.ceil(dur / 2400))
-          bounds = [round(i * total / n) for i in range(n + 1)]
-          specs = {f"{i:03d}": {"start": bounds[i], "frames": bounds[i + 1] - bounds[i], "total": total}
-                   for i in range(n)}
-          print(json.dumps({"total": total, "specs": specs}))
-          PYEOF
-            CHUNKS_JSON=$(jq -c '.specs | keys' /tmp/plan.json)
-            SPECS_JSON=$(jq -c '.specs' /tmp/plan.json)
-            echo "dt2 plan: $(jq -c '.total' /tmp/plan.json) إطاراً على 23.976 في $(jq '.specs|length' /tmp/plan.json) أجزاء"
-            echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
-            echo "chunk_specs=$SPECS_JSON" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
             FFMPEG="$HOME/codec-build/bin/ffmpeg"
             FFPROBE="$HOME/codec-build/bin/ffprobe"
@@ -1112,17 +1091,21 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: استعادة بيئة DT2 Python
-        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_mode == 'dt2'
+      - name: استعادة بيئة المطابقة المكانية
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_mode == 'filters' &&
+          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime')
         uses: actions/cache@v4
         with:
-          path: ~/.venvs/dt2
-          key: dt2-opencv-ubuntu-24.04-python312-v1
+          path: ~/.venvs/spatial
+          key: spatial-match-opencv-ubuntu-24.04-python312-v1
 
       - name: تجهيز أدوات الترميز المطلوبة فقط
         env:
           CODEC: ${{ github.event.inputs.codec }}
           ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
+          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
@@ -1130,14 +1113,8 @@ jobs:
             sudo apt-get install -y ffmpeg
           else
             sudo apt-get install -y libdav1d7 libopus0
-            if [ "$ENCODE_MODE" = "dt2" ]; then
-              sudo apt-get install -y jq
-              if ! "$HOME/.venvs/dt2/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "dtFilter")' 2>/dev/null; then
-                rm -rf "$HOME/.venvs/dt2"
-                python3 -m venv "$HOME/.venvs/dt2"
-                "$HOME/.venvs/dt2/bin/python" -m pip install opencv-contrib-python-headless==4.10.0.84 numpy==1.26.4
-              fi
-              "$HOME/.venvs/dt2/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "dtFilter")'
+            if [ "$ENCODE_MODE" = "filters" ] && { [ "$FILTER_PRESET" = "modern-anime" ] || [ "$FILTER_PRESET" = "old-anime" ]; }; then
+              "$HOME/.venvs/spatial/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter")'
             fi
           fi
           if [ "$CODEC" != "audio" ]; then
@@ -1188,7 +1165,6 @@ jobs:
         run: |
           set -euo pipefail
           IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
-          if [ "${ENCODE_MODE:-}" = "dt2" ]; then IN="chunks_raw/source.mp4"; fi
           OUT_DIR="chunks_encoded"
           OUT_FILE="${OUT_DIR}/encoded_${CHUNK_ID}.mkv"
           mkdir -p "$OUT_DIR"
@@ -1232,48 +1208,15 @@ jobs:
             exit 0
           fi
 
-          # ============================================================
-          # مسار DT المزدوج: فك -> DT -> ترميز AV1 عبر أنابيب الذاكرة
-          # ============================================================
-          if [ "$ENCODE_MODE" = "dt2" ]; then
-            [ "$FILTER_PRESET" = "dt-smooth" ] || { echo 'dt2 يتطلب filter_preset=dt-smooth' >&2; exit 1; }
-            [ "$ENCODE_METHOD" = "crf" ] || { echo 'dt2 يدعم CRF فقط' >&2; exit 1; }
-            IN="chunks_raw/source.mp4"
-            SPEC_START=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].start')
-            SPEC_FRAMES=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].frames')
-            SPEC_TOTAL=$(echo "$CHUNK_SPECS" | jq -r --arg id "$CHUNK_ID" '.[$id].total')
-            P="${PRESET_INPUT/none/4}"
-            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
-              { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
-            F="24000/1001"
-            echo "DT smoothing selected; fixed frame grid=$F, target height=$RESOLUTION"
-            RES_ARGS=()
-            [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
-            LAST_CHUNK=false
-            if [ "$((SPEC_START + SPEC_FRAMES))" -eq "$SPEC_TOTAL" ]; then
-              LAST_CHUNK=true
-            fi
-            "$HOME/.venvs/dt2/bin/python" dt2_stream.py "$IN" "$OUT_FILE" \
-              --crf "$TARGET_VALUE" --preset "$P" --fps "$F" \
-              --start-frame "$SPEC_START" --frames "$SPEC_FRAMES" "${RES_ARGS[@]}"
-            test -s "$OUT_FILE" || { echo "ملف فارغ" >&2; exit 1; }
-            GOT=$(ffprobe -v error -count_packets -select_streams v:0 \
-              -show_entries stream=nb_read_packets -of csv=p=0 "$OUT_FILE")
-            if [ "$GOT" -ne "$SPEC_FRAMES" ]; then
-              MISSING=$((SPEC_FRAMES - GOT))
-              if [ "$LAST_CHUNK" = true ] && [ "$MISSING" -ge 1 ] && [ "$MISSING" -le 24 ]; then
-                printf '%s\n' "$MISSING" > "${OUT_DIR}/encoded_${CHUNK_ID}.frames.txt"
-                echo "تحذير: الجزء الأخير ناقص ${MISSING} إطاراً (الحد المسموح 24، المتوقع ${SPEC_FRAMES}، الناتج ${GOT})؛ سيستمر الدمج والإرسال مع إظهار التحذير."
-              else
-                echo "الجزء $CHUNK_ID: $GOT إطاراً بدل $SPEC_FRAMES؛ النقص مسموح فقط في آخر الجزء الأخير وبحد أقصى 24 إطاراً." >&2
-                exit 1
-              fi
-            fi
-            echo "الجزء $CHUNK_ID: $GOT إطاراً من البداية $SPEC_START، $(stat -c%s "$OUT_FILE") bytes"
-            exit 0
-          fi
-          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" != "realistic" ]; then
-            echo 'filters mode requires filter_preset=realistic' >&2; exit 1
+          if [ "$ENCODE_MODE" = "filters" ]; then
+            case "$FILTER_PRESET" in
+              modern-anime|old-anime|realistic) ;;
+              *) echo 'مع filters اختر modern-anime أو old-anime أو realistic' >&2; exit 1 ;;
+            esac
+          elif [ "$ENCODE_MODE" = "nofilters" ]; then
+            [ "$FILTER_PRESET" = "off" ] || { echo 'مع nofilters يجب اختيار filter_preset=off' >&2; exit 1; }
+          else
+            echo "قيمة encode_mode غير مدعومة للفيديو: $ENCODE_MODE" >&2; exit 1
           fi
 
           # ============================================================
@@ -1296,12 +1239,11 @@ jobs:
           ")"
 
           FILTERS=("setpts=PTS-STARTPTS")
-          if [ "$ENCODE_MODE" = "filters" ]; then
-            # فلتر خفيف للحد من الضجيج مع الحفاظ على مظهر المحتوى الواقعي.
+          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" = "realistic" ]; then
             FILTERS+=("hqdn3d=1.5:1.5:3:3")
-            echo "Filter selected: hqdn3d (realistic content)"
-          elif [ "$ENCODE_MODE" != "nofilters" ]; then
-            echo "Unsupported encode_mode for video: $ENCODE_MODE" >&2; exit 1
+            echo "المسار الواقعي: تطبيق hqdn3d"
+          elif [ "$ENCODE_MODE" = "nofilters" ]; then
+            echo "المسار دون فلاتر"
           fi
 
           if [ "$RESOLUTION" != "auto" ]; then
@@ -1352,6 +1294,32 @@ jobs:
               OUT_FPS="$TARGET_FPS_FRAC"
               echo "FPS downscale from $SRC_FPS_RAW to $OUT_FPS"
             fi
+          fi
+
+          if [ "$ENCODE_MODE" = "filters" ] && { [ "$FILTER_PRESET" = "modern-anime" ] || [ "$FILTER_PRESET" = "old-anime" ]; }; then
+            [ "$ENCODE_METHOD" = "crf" ] || { echo 'مسارا الأنمي الحديث والقديم يدعمان CRF فقط حالياً' >&2; exit 1; }
+            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
+            [ "$IS_HDR" != "true" ] || { echo 'مسار المطابقة 16x9 الحالي مخصص لمصدر SDR؛ اختر الواقعي أو بدون فلاتر لمصدر HDR' >&2; exit 1; }
+            SPATIAL_PY="$HOME/.venvs/spatial/bin/python"
+            PROFILE=modern
+            LUT_ARGS=()
+            if [ "$FILTER_PRESET" = "old-anime" ]; then
+              PROFILE=old
+              test -s grade_blend_warm_start16.cube || { echo 'ملف grade_blend_warm_start16.cube غير موجود في جذر المستودع' >&2; exit 1; }
+              LUT_ARGS=(--lut3d grade_blend_warm_start16.cube)
+              echo 'مسار الأنمي القديم: تصحيح الأصل بـLUT ثم المطابقة مع دليل 16x9 المكبّر'
+            else
+              echo 'مسار الأنمي الحديث: دليل 16x9 مكبّر ثم المطابقة مع الأصل دون LUT'
+            fi
+            RES_ARGS=()
+            [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
+            COLOR_INFO_ARGS=(--color-space "$SRC_COLORSPACE" --color-primaries "$SRC_PRIMARIES" --color-trc "$SRC_TRANSFER" --color-range "$SRC_RANGE")
+            "$SPATIAL_PY" spatial_match_stream.py "$IN" "$OUT_FILE" \
+              --profile "$PROFILE" --crf "$TARGET_VALUE" --preset "${PRESET_INPUT/none/4}" \
+              --fps "$OUT_FPS" "${RES_ARGS[@]}" "${LUT_ARGS[@]}" "${COLOR_INFO_ARGS[@]}"
+            test -s "$OUT_FILE" || { echo 'ملف ناتج المطابقة المكانية فارغ' >&2; exit 1; }
+            echo "تمت معالجة الجزء $CHUNK_ID؛ الحجم $(stat -c%s "$OUT_FILE") بايت"
+            exit 0
           fi
 
           NPROC=$(nproc)
@@ -1528,25 +1496,6 @@ jobs:
           pattern: encoded-*
           path: all_encoded
           merge-multiple: true
-
-      - name: جمع تحذير نقص الإطارات النهائي
-        if: github.event.inputs.encode_mode == 'dt2'
-        run: |
-          set -euo pipefail
-          TOTAL_MISSING=0
-          while IFS= read -r file; do
-            [ -n "$file" ] || continue
-            VALUE=$(cat "$file")
-            [[ "$VALUE" =~ ^([1-9]|1[0-9]|2[0-4])$ ]] || { echo "Invalid DT2 frame warning: $file" >&2; exit 1; }
-            TOTAL_MISSING=$((TOTAL_MISSING + VALUE))
-          done < <(find all_encoded -maxdepth 1 -type f -name 'encoded_*.frames.txt' -print 2>/dev/null | sort)
-          if [ "$TOTAL_MISSING" -gt 0 ]; then
-            echo "FRAME_WARNING=⚠️ تنبيه: الناتج ناقص ${TOTAL_MISSING} إطاراً من نهاية المصدر (نحو ثانية كحد أقصى)." >> "$GITHUB_ENV"
-            echo "DT2 final frame warning: ${TOTAL_MISSING} frame(s) missing; continuing to merge/send."
-          else
-            echo "FRAME_WARNING=" >> "$GITHUB_ENV"
-            echo "DT2 frame count is exact."
-          fi
 
       - name: تنزيل الصوت وعيّنة المصدر
         uses: actions/download-artifact@v4
