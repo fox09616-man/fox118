@@ -1299,24 +1299,25 @@ jobs:
           if [ "$ENCODE_MODE" = "filters" ] && { [ "$FILTER_PRESET" = "modern-anime" ] || [ "$FILTER_PRESET" = "old-anime" ]; }; then
             [ "$ENCODE_METHOD" = "crf" ] || { echo 'مسارا الأنمي الحديث والقديم يدعمان CRF فقط حالياً' >&2; exit 1; }
             [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
-            [ "$IS_HDR" != "true" ] || { echo 'مسار المطابقة 16x9 الحالي مخصص لمصدر SDR؛ اختر الواقعي أو بدون فلاتر لمصدر HDR' >&2; exit 1; }
+            [ "$IS_HDR" != "true" ] || { echo 'مسار المطابقة بدليل 240px مخصص لمصدر SDR؛ اختر الواقعي أو بدون فلاتر لمصدر HDR' >&2; exit 1; }
             SPATIAL_PY="$HOME/.venvs/spatial/bin/python"
             PROFILE=modern
+            GUIDE_HEIGHT=240
             LUT_ARGS=()
             if [ "$FILTER_PRESET" = "old-anime" ]; then
               PROFILE=old
               test -s grade_blend_warm_start16.cube || { echo 'ملف grade_blend_warm_start16.cube غير موجود في جذر المستودع' >&2; exit 1; }
               LUT_ARGS=(--lut3d grade_blend_warm_start16.cube)
-              echo 'مسار الأنمي القديم: تصحيح الأصل بـLUT ثم المطابقة مع دليل 16x9 المكبّر'
+              echo 'مسار الأنمي القديم: تصحيح الأصل بـLUT ثم المطابقة بدليل مكبّر ارتفاعه 240px'
             else
-              echo 'مسار الأنمي الحديث: دليل 16x9 مكبّر ثم المطابقة مع الأصل دون LUT'
+              echo 'مسار الأنمي الحديث: دليل مكبّر ارتفاعه 240px ثم المطابقة مع الأصل دون LUT'
             fi
             RES_ARGS=()
             [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
             COLOR_INFO_ARGS=(--color-space "$SRC_COLORSPACE" --color-primaries "$SRC_PRIMARIES" --color-trc "$SRC_TRANSFER" --color-range "$SRC_RANGE")
             "$SPATIAL_PY" spatial_match_stream.py "$IN" "$OUT_FILE" \
               --profile "$PROFILE" --crf "$TARGET_VALUE" --preset "${PRESET_INPUT/none/4}" \
-              --fps "$OUT_FPS" "${RES_ARGS[@]}" "${LUT_ARGS[@]}" "${COLOR_INFO_ARGS[@]}"
+              --fps "$OUT_FPS" --guide-height "$GUIDE_HEIGHT" "${RES_ARGS[@]}" "${LUT_ARGS[@]}" "${COLOR_INFO_ARGS[@]}"
             test -s "$OUT_FILE" || { echo 'ملف ناتج المطابقة المكانية فارغ' >&2; exit 1; }
             echo "تمت معالجة الجزء $CHUNK_ID؛ الحجم $(stat -c%s "$OUT_FILE") بايت"
             exit 0
