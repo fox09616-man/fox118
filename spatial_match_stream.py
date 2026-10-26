@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """تنعيم مكاني عبر دليل منخفض الدقة، بلا DT أو ملفات إطارات وسيطة.
 
-الحديث: الأصل -> دليل 16x9 مكبّر -> Joint Bilateral Filter على الأصل.
-القديم: الأصل + LUT على الأصل -> الدليل من الأصل -> Joint Bilateral Filter على الأصل المصحح.
+الحديث: الأصل -> دليل منخفض بارتفاع 240px مكبّر -> Joint Bilateral Filter على الأصل.
+القديم: الأصل + LUT على الأصل -> دليل 240px من الأصل -> Joint Bilateral Filter على الأصل المصحح.
 """
 import argparse
 import os
@@ -63,8 +63,8 @@ def main():
     ap.add_argument("--fps", default="24000/1001")
     ap.add_argument("--height", type=int, default=0,
                     help="ارتفاع الإخراج؛ 0 يحافظ على دقة المصدر بعد المطابقة")
-    ap.add_argument("--guide-height", type=int, default=9,
-                    help="ارتفاع دليل التصغير؛ الافتراضي 9 بكسلات")
+    ap.add_argument("--guide-height", type=int, default=240,
+                    help="ارتفاع دليل التصغير؛ الافتراضي 240 بكسل لكلا مساري الأنمي")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--color-space", default="")
     ap.add_argument("--color-primaries", default="")
