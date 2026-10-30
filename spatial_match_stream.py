@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """تنعيم مكاني عبر دليل منخفض الدقة، بلا DT أو ملفات إطارات وسيطة.
 
-الحديث: الأصل -> دليل منخفض بارتفاع 240px مكبّر -> Joint Bilateral Filter على الأصل.
-القديم: الأصل + LUT على الأصل -> دليل 240px من الأصل -> Joint Bilateral Filter على الأصل المصحح.
+الحديث: الأصل -> دليل منخفض بارتفاع 9px مكبّر -> Joint Bilateral Filter على الأصل.
+القديم: الأصل + LUT على الأصل -> دليل 9px من الأصل -> Joint Bilateral Filter على الأصل المصحح.
 """
 import argparse
 import os
@@ -50,6 +50,45 @@ def even_dimensions(width, height, target_height):
     return out_w, out_h
 
 
+def restore_clean_edges(reference, matched, strength):
+    """Add a denoised, thin source-edge band-pass to the matched frame only."""
+    if strength <= 0:
+        return matched
+
+    # BT.709 luma for edge detection; use mild bilateral denoising so grain is
+    # not reintroduced as edge detail.
+    b, g, r = cv2.split(reference.astype(np.float32))
+    y = 0.0722 * b + 0.7152 * g + 0.2126 * r
+    y8 = np.clip(np.rint(y), 0, 255).astype(np.uint8)
+    clean = cv2.bilateralFilter(y8, d=5, sigmaColor=12, sigmaSpace=1.2)
+
+    edge = cv2.Canny(clean, 30, 75, L2gradient=True)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(edge, 8)
+    valid = stats[:, cv2.CC_STAT_AREA] >= 2
+    valid[0] = False
+    keep = (valid[labels].astype(np.uint8) * 255)
+
+    # Thin the detected contour where contrib is available; otherwise retain
+    # the cleaned Canny contour. A narrow feather avoids hard pasted outlines.
+    if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "thinning"):
+        thin = cv2.ximgproc.thinning(keep)
+    else:
+        thin = keep
+    band = cv2.dilate(thin, np.ones((3, 3), np.uint8), iterations=1)
+    mask = cv2.GaussianBlur(band.astype(np.float32) / 255.0, (0, 0), 0.45)
+
+    # A denoised Laplacian band-pass carries edge transitions, not source pixels.
+    base = clean.astype(np.float32)
+    detail = (cv2.GaussianBlur(base, (0, 0), 0.55) -
+              cv2.GaussianBlur(base, (0, 0), 1.30))
+    delta = np.clip(detail, -10.0, 10.0) * float(strength) * mask
+
+    # Add the same offset to B/G/R: this changes luma while preserving channel
+    # differences (chroma) unless a value reaches the legal 8-bit gamut limit.
+    out = matched.astype(np.float32) + delta[..., None]
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input")
@@ -63,8 +102,10 @@ def main():
     ap.add_argument("--fps", default="24000/1001")
     ap.add_argument("--height", type=int, default=0,
                     help="ارتفاع الإخراج؛ 0 يحافظ على دقة المصدر بعد المطابقة")
-    ap.add_argument("--guide-height", type=int, default=240,
-                    help="ارتفاع دليل التصغير؛ الافتراضي 240 بكسل لكلا مساري الأنمي")
+    ap.add_argument("--guide-height", type=int, default=9,
+                    help="ارتفاع دليل التصغير؛ الافتراضي 9 بكسلات لكلا مساري الأنمي")
+    ap.add_argument("--edge-strength", type=float, default=0.65,
+                    help="قوة استرجاع نطاق الحواف المنقّى من الأصل؛ 0 يعطّلها، والمدى المقترح 0.4-0.7")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--color-space", default="")
     ap.add_argument("--color-primaries", default="")
@@ -84,6 +125,8 @@ def main():
         raise ValueError("يجب أن يكون CRF بين 0 و63")
     if args.height < 0 or args.guide_height < 1 or args.threads < 1:
         raise ValueError("قيمة height أو guide-height أو threads غير صالحة")
+    if not 0.0 <= args.edge_strength <= 1.0:
+        raise ValueError("edge-strength يجب أن يكون بين 0 و1")
     if not hasattr(cv2, "ximgproc") or not hasattr(cv2.ximgproc, "jointBilateralFilter"):
         raise RuntimeError("يلزم opencv-contrib-python-headless مع ximgproc.jointBilateralFilter")
 
@@ -153,6 +196,7 @@ def main():
             matched = cv2.ximgproc.jointBilateralFilter(
                 guide, corrected, d=9, sigmaColor=12.0, sigmaSpace=3.5,
                 borderType=cv2.BORDER_REFLECT)
+            matched = restore_clean_edges(reference, matched, args.edge_strength)
             if output_width != width or output_height != height:
                 matched = cv2.resize(matched, (output_width, output_height),
                                       interpolation=cv2.INTER_AREA)
