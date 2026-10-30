@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """تنعيم مكاني عبر دليل منخفض الدقة، بلا DT أو ملفات إطارات وسيطة.
 
-الحديث: الأصل -> دليل منخفض بارتفاع 240px مكبّر -> Joint Bilateral Filter على الأصل.
-القديم: الأصل + LUT على الأصل -> دليل 240px من الأصل -> Joint Bilateral Filter على الأصل المصحح.
+الحديث: الأصل -> إزالة ضجيج مكانية/زمنية -> دليل منخفض بارتفاع 9px -> مطابقة -> استعادة تفاصيل الحواف.
+القديم: الأصل -> إزالة ضجيج -> LUT ومطابقة مكانية -> استعادة تفاصيل الحواف من الأصل المنقّى.
 """
 import argparse
 import os
@@ -50,6 +50,22 @@ def even_dimensions(width, height, target_height):
     return out_w, out_h
 
 
+def restore_edge_detail(base, edge_source, detail_source, strength, low_threshold, high_threshold):
+    """أعد تفاصيل الحواف المستخرجة من المصدر فوق الإطار المعالج."""
+    if strength <= 0:
+        return base
+    gray = cv2.cvtColor(edge_source, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, low_threshold, high_threshold, L2gradient=True)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
+    alpha = cv2.GaussianBlur(edges.astype(np.float32) / 255.0,
+                             (0, 0), sigmaX=0.7, sigmaY=0.7)[:, :, None]
+    detail_source_f = detail_source.astype(np.float32)
+    smooth = cv2.GaussianBlur(detail_source_f, (0, 0), sigmaX=1.0, sigmaY=1.0)
+    detail_layer = detail_source_f - smooth
+    restored = base.astype(np.float32) + strength * alpha * detail_layer
+    return np.clip(restored, 0, 255).astype(np.uint8)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("input")
@@ -63,8 +79,16 @@ def main():
     ap.add_argument("--fps", default="24000/1001")
     ap.add_argument("--height", type=int, default=0,
                     help="ارتفاع الإخراج؛ 0 يحافظ على دقة المصدر بعد المطابقة")
-    ap.add_argument("--guide-height", type=int, default=240,
-                    help="ارتفاع دليل التصغير؛ الافتراضي 240 بكسل لكلا مساري الأنمي")
+    ap.add_argument("--guide-height", type=int, default=9,
+                    help="ارتفاع دليل التصغير؛ الافتراضي 9 بكسلات لكلا مساري الأنمي")
+    ap.add_argument("--edge-strength", type=float, default=1.8,
+                    help="قوة إعادة تفاصيل الحواف الأصلية؛ 1.8 توازن الوضوح والحجم، و0 لتعطيلها")
+    ap.add_argument("--edge-low", type=int, default=28,
+                    help="عتبة Canny الدنيا لاستخراج الحواف من الأصل")
+    ap.add_argument("--edge-high", type=int, default=75,
+                    help="عتبة Canny العليا لاستخراج الحواف من الأصل")
+    ap.add_argument("--denoise", type=float, default=1.5,
+                    help="قوة إزالة الضجيج قبل المطابقة؛ 0 تعطيل، 1.5 متوسط، والحد الأعلى 3")
     ap.add_argument("--threads", type=int, default=4)
     ap.add_argument("--color-space", default="")
     ap.add_argument("--color-primaries", default="")
@@ -82,8 +106,11 @@ def main():
         raise ValueError("لا يُطبّق LUT في مسار الأنمي الحديث")
     if not 0 <= args.crf <= 63:
         raise ValueError("يجب أن يكون CRF بين 0 و63")
-    if args.height < 0 or args.guide_height < 1 or args.threads < 1:
-        raise ValueError("قيمة height أو guide-height أو threads غير صالحة")
+    if (args.height < 0 or args.guide_height < 1 or args.threads < 1
+            or args.edge_strength < 0 or args.edge_low < 0
+            or args.edge_high <= args.edge_low or args.edge_high > 255
+            or not 0 <= args.denoise <= 3):
+        raise ValueError("قيم height أو guide-height أو threads أو الحواف أو denoise غير صالحة")
     if not hasattr(cv2, "ximgproc") or not hasattr(cv2.ximgproc, "jointBilateralFilter"):
         raise RuntimeError("يلزم opencv-contrib-python-headless مع ximgproc.jointBilateralFilter")
 
@@ -94,19 +121,25 @@ def main():
     old = args.profile == "old"
     decode_width = width * 2 if old else width
     frame_bytes = decode_width * height * 3
+    denoise_filter = ""
+    if args.denoise > 0:
+        strength = args.denoise
+        denoise_filter = (
+            f"hqdn3d={2.0*strength:.3f}:{1.5*strength:.3f}:"
+            f"{3.0*strength:.3f}:{2.25*strength:.3f},")
 
     decoder = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(src)]
     if old:
         lut = filter_escape(args.lut3d)
         graph = (
-            f"[0:v]fps={args.fps},split=2[original][graded];"
+            f"[0:v]fps={args.fps},{denoise_filter}split=2[original][graded];"
             "[original]format=bgr24[original_bgr];"
             f"[graded]lut3d=file={lut}:interp=tetrahedral,format=bgr24[graded_bgr];"
             "[original_bgr][graded_bgr]hstack=inputs=2[out]"
         )
         decoder += ["-filter_complex", graph, "-map", "[out]"]
     else:
-        decoder += ["-vf", f"fps={args.fps},format=bgr24"]
+        decoder += ["-vf", f"fps={args.fps},{denoise_filter}format=bgr24"]
     decoder += ["-fps_mode", "passthrough", "-an", "-f", "rawvideo",
                 "-pix_fmt", "bgr24", "pipe:1"]
 
@@ -131,7 +164,9 @@ def main():
     started = time.time()
     processed = 0
     print(f"المسار: {'أنمي قديم مع LUT' if old else 'أنمي حديث دون LUT'}؛ "
-          f"دليل {guide_width}x{guide_height}؛ المصدر {width}x{height}؛ "
+          f"تنقية {args.denoise:g}؛ دليل {guide_width}x{guide_height}؛ "
+          f"طبقة الحواف {args.edge_strength:g}؛ "
+          f"المصدر {width}x{height}؛ "
           f"المطابقة عند الدقة الأصلية ثم الإخراج {output_width}x{output_height}")
 
     try:
@@ -153,6 +188,9 @@ def main():
             matched = cv2.ximgproc.jointBilateralFilter(
                 guide, corrected, d=9, sigmaColor=12.0, sigmaSpace=3.5,
                 borderType=cv2.BORDER_REFLECT)
+            matched = restore_edge_detail(
+                matched, reference, corrected, args.edge_strength,
+                args.edge_low, args.edge_high)
             if output_width != width or output_height != height:
                 matched = cv2.resize(matched, (output_width, output_height),
                                       interpolation=cv2.INTER_AREA)
