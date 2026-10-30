@@ -1302,7 +1302,7 @@ jobs:
             [ "$IS_HDR" != "true" ] || { echo 'مسار المطابقة بدليل 240px مخصص لمصدر SDR؛ اختر الواقعي أو بدون فلاتر لمصدر HDR' >&2; exit 1; }
             SPATIAL_PY="$HOME/.venvs/spatial/bin/python"
             PROFILE=modern
-            GUIDE_HEIGHT=240
+            GUIDE_HEIGHT=9
             LUT_ARGS=()
             if [ "$FILTER_PRESET" = "old-anime" ]; then
               PROFILE=old
