@@ -337,11 +337,18 @@ jobs:
             export PATH="$HOME/.venvs/fetch/bin:$PATH"
           fi
 
-          # 1+2. تيليجرام (رسالة أو رابط): البوت أولاً، ثم الجلسة إن فشل
+          # Telegram routing: uploaded Telegram message -> bot; Telegram URL -> user session.
           if [ -n "$MESSAGE_ID" ] || { [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $TG_LINK_RE ]]; }; then
-            echo "Downloading from Telegram (bot first, then user session)..."
+            if [ -n "$MESSAGE_ID" ]; then
+              echo "Telegram uploaded video/document: bot download with retries..."
+              TG_MODE="bot_message"
+            else
+              echo "Telegram link: user-session download with retries..."
+              TG_MODE="session_link"
+            fi
+            export TG_MODE
             cat > tg_fetch.py <<'PYEOF'
-          import asyncio, os, sys
+          import asyncio, os, sys, time
           from urllib.parse import urlparse
           from telethon import TelegramClient
           from telethon.sessions import StringSession
@@ -354,8 +361,9 @@ jobs:
           MESSAGE_ID = os.environ.get("MESSAGE_ID", "").strip()
           URL = os.environ.get("VIDEO_URL", "").strip()
           CHAT_ID = os.environ.get("SOURCE_CHAT_ID", "").strip()
+          MODE = os.environ.get("TG_MODE", "")
           OUT = "raw_input.mp4"
-
+          MAX_ATTEMPTS = 10
 
           def parse_link(link):
               parts = [p for p in urlparse(link).path.split("/") if p]
@@ -366,86 +374,88 @@ jobs:
                   return PeerChannel(int(parts[1])), msg_id
               return parts[0], msg_id
 
-
-          def targets_for(kind):
-              if MESSAGE_ID:
-                  mid = int(MESSAGE_ID)
-                  chat = int(CHAT_ID)
-                  if kind == "bot":
-                      return [(chat, mid)]
-                  if chat < 0:
-                      return [(chat, mid)]
-                  print("[tg] session skipped: in private chats message ids differ between the bot and the user account")
-                  return []
-              peer, mid = parse_link(URL)
-              if peer is None:
-                  print("[tg] could not parse the Telegram link")
-                  return []
-              return [(peer, mid)]
-
-
-          async def attempt(kind):
-              targets = targets_for(kind)
-              if not targets:
+          def is_video_message(message):
+              if getattr(message, "video", None):
+                  return True
+              doc = getattr(message, "document", None)
+              if not doc:
                   return False
-              if kind == "bot":
+              mime = (getattr(doc, "mime_type", "") or "").lower()
+              if mime.startswith("video/"):
+                  return True
+              video_exts = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".mpeg", ".mpg")
+              for attr in getattr(doc, "attributes", []) or []:
+                  name = getattr(attr, "file_name", "") or ""
+                  if name.lower().endswith(video_exts):
+                      return True
+              return False
+
+          def get_target():
+              if MODE == "bot_message":
+                  if not MESSAGE_ID or not CHAT_ID:
+                      raise RuntimeError("message_id أو chat_id مفقود")
+                  return int(CHAT_ID), int(MESSAGE_ID)
+              if MODE == "session_link":
+                  peer, mid = parse_link(URL)
+                  if peer is None:
+                      raise RuntimeError("تعذر تحليل رابط تيليجرام أو رقم الرسالة")
+                  return peer, mid
+              raise RuntimeError(f"وضع تحميل تيليجرام غير معروف: {MODE}")
+
+          async def main():
+              peer, mid = get_target()
+              if MODE == "bot_message":
                   if not BOT_TOKEN:
-                      print("[tg] bot: BOT_TOKEN missing")
-                      return False
+                      raise RuntimeError("BOT_TOKEN غير مضبوط")
                   client = TelegramClient(StringSession(), API_ID, API_HASH)
               else:
                   if not TG_SESSION:
-                      print("[tg] session: TG_SESSION missing")
-                      return False
+                      raise RuntimeError("TG_SESSION غير مضبوط للرابط")
                   client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
+
               try:
-                  if kind == "bot":
+                  if MODE == "bot_message":
                       await client.start(bot_token=BOT_TOKEN)
                   else:
                       await client.connect()
                       if not await client.is_user_authorized():
-                          print("[tg] session: not authorized")
-                          return False
-                      try:
-                          await client.get_dialogs(limit=200)
-                      except Exception:
-                          pass
-                  for peer, mid in targets:
-                      try:
-                          message = await client.get_messages(peer, ids=mid)
-                          if message is None or not message.media:
-                              print(f"[tg] {kind}: message {mid} not found or has no media")
-                              continue
-                          await client.download_media(message, file=OUT)
-                          if os.path.exists(OUT) and os.path.getsize(OUT) > 0:
-                              print(f"[tg] {kind}: download OK")
-                              return True
-                      except Exception as e:
-                          print(f"[tg] {kind}: {type(e).__name__}: {str(e)[:150]}")
+                          raise RuntimeError("جلسة تيليجرام غير مصرح بها")
+
+                  for attempt in range(1, MAX_ATTEMPTS + 1):
                       if os.path.exists(OUT):
                           os.remove(OUT)
-                  return False
-              except Exception as e:
-                  print(f"[tg] {kind}: {type(e).__name__}: {str(e)[:150]}")
-                  return False
+                      try:
+                          message = await client.get_messages(peer, ids=mid)
+                          if message is None or not is_video_message(message):
+                              raise RuntimeError("الرسالة غير موجودة أو لا تحتوي فيديو/مستند فيديو")
+                          result = await client.download_media(message, file=OUT)
+                          if result and os.path.exists(OUT) and os.path.getsize(OUT) > 0:
+                              print(f"[tg] {MODE}: video download succeeded on attempt {attempt}")
+                              return 0
+                          raise RuntimeError("تنزيل تيليجرام لم يُنشئ ملفًا صالحًا")
+                      except Exception as exc:
+                          if os.path.exists(OUT):
+                              os.remove(OUT)
+                          if attempt >= MAX_ATTEMPTS:
+                              print(f"[tg] {MODE}: failed after {attempt} attempts: {type(exc).__name__}: {str(exc)[:250]}")
+                              return 1
+                          # Respect Telegram FloodWait where available; otherwise use capped backoff.
+                          wait = getattr(exc, "seconds", None)
+                          if not isinstance(wait, (int, float)) or wait <= 0:
+                              wait = min(45, 3 * (2 ** (attempt - 1)))
+                          wait = min(120, max(2, int(wait)))
+                          print(f"[tg] {MODE}: attempt {attempt}/{MAX_ATTEMPTS} failed ({type(exc).__name__}: {str(exc)[:180]}), retrying in {wait}s", flush=True)
+                          await asyncio.sleep(wait)
+                  return 1
               finally:
                   try:
                       await client.disconnect()
                   except Exception:
                       pass
 
-
-          async def main():
-              for kind in ("bot", "session"):
-                  if await attempt(kind):
-                      return 0
-                  print(f"[tg] {kind} attempt failed")
-              return 1
-
-
           sys.exit(asyncio.run(main()))
           PYEOF
-            "$PYTHON" tg_fetch.py || { echo 'Telegram download failed (bot and session)' >&2; exit 1; }
+            "$PYTHON" tg_fetch.py || { echo "Telegram source download failed after retries (route: $TG_MODE)" >&2; exit 1; }
 
           # 3. رابط HLS / DASH مباشر
           elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $HLS_RE ]]; then
