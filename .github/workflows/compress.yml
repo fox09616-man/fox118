@@ -404,54 +404,53 @@ jobs:
 
           async def main():
               peer, mid = get_target()
-              if MODE == "bot_message":
-                  if not BOT_TOKEN:
-                      raise RuntimeError("BOT_TOKEN غير مضبوط")
-                  client = TelegramClient(StringSession(), API_ID, API_HASH)
-              else:
-                  if not TG_SESSION:
-                      raise RuntimeError("TG_SESSION غير مضبوط للرابط")
-                  client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
+              if MODE == "bot_message" and not BOT_TOKEN:
+                  raise RuntimeError("BOT_TOKEN غير مضبوط")
+              if MODE == "session_link" and not TG_SESSION:
+                  raise RuntimeError("TG_SESSION غير مضبوط للرابط")
 
-              try:
-                  if MODE == "bot_message":
-                      await client.start(bot_token=BOT_TOKEN)
-                  else:
-                      await client.connect()
-                      if not await client.is_user_authorized():
-                          raise RuntimeError("جلسة تيليجرام غير مصرح بها")
+              for attempt in range(1, MAX_ATTEMPTS + 1):
+                  client = (TelegramClient(StringSession(), API_ID, API_HASH)
+                            if MODE == "bot_message" else
+                            TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH))
+                  try:
+                      # Include connection/authentication in the retry loop.
+                      if MODE == "bot_message":
+                          await client.start(bot_token=BOT_TOKEN)
+                      else:
+                          await client.connect()
+                          if not await client.is_user_authorized():
+                              raise RuntimeError("جلسة تيليجرام غير مصرح بها")
 
-                  for attempt in range(1, MAX_ATTEMPTS + 1):
                       if os.path.exists(OUT):
                           os.remove(OUT)
+                      message = await client.get_messages(peer, ids=mid)
+                      if message is None or not is_video_message(message):
+                          raise RuntimeError("الرسالة غير موجودة أو لا تحتوي فيديو/مستند فيديو")
+                      result = await client.download_media(message, file=OUT)
+                      if result and os.path.exists(OUT) and os.path.getsize(OUT) > 0:
+                          print(f"[tg] {MODE}: video download succeeded on attempt {attempt}")
+                          return 0
+                      raise RuntimeError("تنزيل تيليجرام لم يُنشئ ملفًا صالحًا")
+                  except Exception as exc:
+                      if os.path.exists(OUT):
+                          os.remove(OUT)
+                      if attempt >= MAX_ATTEMPTS:
+                          print(f"[tg] {MODE}: failed after {attempt} attempts: {type(exc).__name__}: {str(exc)[:250]}")
+                          return 1
+                      # Respect Telegram FloodWait exactly where possible; otherwise exponential backoff.
+                      wait = getattr(exc, "seconds", None)
+                      if not isinstance(wait, (int, float)) or wait <= 0:
+                          wait = min(45, 3 * (2 ** (attempt - 1)))
+                      wait = min(120, max(2, int(wait)))
+                      print(f"[tg] {MODE}: attempt {attempt}/{MAX_ATTEMPTS} failed ({type(exc).__name__}: {str(exc)[:180]}), retrying in {wait}s", flush=True)
+                      await asyncio.sleep(wait)
+                  finally:
                       try:
-                          message = await client.get_messages(peer, ids=mid)
-                          if message is None or not is_video_message(message):
-                              raise RuntimeError("الرسالة غير موجودة أو لا تحتوي فيديو/مستند فيديو")
-                          result = await client.download_media(message, file=OUT)
-                          if result and os.path.exists(OUT) and os.path.getsize(OUT) > 0:
-                              print(f"[tg] {MODE}: video download succeeded on attempt {attempt}")
-                              return 0
-                          raise RuntimeError("تنزيل تيليجرام لم يُنشئ ملفًا صالحًا")
-                      except Exception as exc:
-                          if os.path.exists(OUT):
-                              os.remove(OUT)
-                          if attempt >= MAX_ATTEMPTS:
-                              print(f"[tg] {MODE}: failed after {attempt} attempts: {type(exc).__name__}: {str(exc)[:250]}")
-                              return 1
-                          # Respect Telegram FloodWait where available; otherwise use capped backoff.
-                          wait = getattr(exc, "seconds", None)
-                          if not isinstance(wait, (int, float)) or wait <= 0:
-                              wait = min(45, 3 * (2 ** (attempt - 1)))
-                          wait = min(120, max(2, int(wait)))
-                          print(f"[tg] {MODE}: attempt {attempt}/{MAX_ATTEMPTS} failed ({type(exc).__name__}: {str(exc)[:180]}), retrying in {wait}s", flush=True)
-                          await asyncio.sleep(wait)
-                  return 1
-              finally:
-                  try:
-                      await client.disconnect()
-                  except Exception:
-                      pass
+                          await client.disconnect()
+                      except Exception:
+                          pass
+              return 1
 
           sys.exit(asyncio.run(main()))
           PYEOF
