@@ -59,9 +59,9 @@ function normalizeSpatialCrf(value) {
   return /^(?:[0-9]|[1-5][0-9]|6[0-3])$/.test(text) ? text : "48";
 }
 
-// امتدادات الوسائط فقط.
+// امتدادات الوسائط (فيديو + صوت) والأرشيف.
 const MEDIA_EXT_RE =
-  /\.(mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mts|vob|3gp|3g2|ogv|mpeg|mpg|m3u8|mp3|m4a|aac|opus|ogg|wav|flac)$/i;
+  /\.(tar\.gz|tar\.bz2|tar\.xz|mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mts|vob|3gp|3g2|ogv|mpeg|mpg|m3u8|mp3|m4a|aac|opus|ogg|oga|wav|flac|wma|amr|ac3|dts|mka|aiff|zip|rar|7z|tar|gz|tgz|bz2|xz|zst|iso)$/i;
 
 export default {
   async fetch(request, env) {
@@ -115,10 +115,15 @@ export default {
 // المعالجات الرئيسية
 // ---------------------------------------------------------------------------
 
+// يقبل أي ملف: فيديو، صوت، رسالة صوتية، فيديو دائري، GIF، أرشيف، أو أي مستند.
 function isVideoMessage(message) {
   return Boolean(
     message.video ||
-      (message.document && (message.document.mime_type || "").startsWith("video/")),
+      message.audio ||
+      message.voice ||
+      message.video_note ||
+      message.animation ||
+      message.document,
   );
 }
 
@@ -383,7 +388,7 @@ async function handleText(env, cfg, message) {
     return;
   }
 
-  await sendMessage(cfg.botToken, chatId, "📤 أرسل فيديو مباشرة أو أي رابط للبدء، أو استخدم /setup لحفظ إعداد تلقائي.");
+  await sendMessage(cfg.botToken, chatId, "📤 أرسل فيديو أو ملفاً صوتياً أو أرشيفاً أو أي رابط للبدء، أو استخدم /setup لحفظ إعداد تلقائي.");
 }
 
 async function handleUnauthorizedText(env, cfg, message, rawText) {
@@ -704,7 +709,13 @@ function cleanFileName(value) {
 }
 
 function extractDefaultName(message) {
-  const raw = message.caption || message.document?.file_name || message.video?.file_name || null;
+  const raw =
+    message.caption ||
+    message.document?.file_name ||
+    message.video?.file_name ||
+    message.audio?.file_name ||
+    message.audio?.title ||
+    null;
   if (!raw) return null;
   return cleanFileName(raw) || null;
 }
@@ -1002,10 +1013,12 @@ function presetStatusText(preset) {
 
 function startMessage(preset) {
   return [
-    "🚀 أرسل فيديو مباشرة أو أي رابط للبدء.",
+    "🚀 أرسل فيديو أو ملفاً مباشرة أو أي رابط للبدء.",
     "",
     "📎 يمكنك إرسال:",
     "- فيديو مباشر من جهازك",
+    "- ملف صوتي أو رسالة صوتية",
+    "- أرشيف (zip, rar, 7z, tar...)",
     "- أي رابط فيديو (يوتيوب، تيليجرام، Google Drive، وغيرها)",
     "- أي رابط مباشر",
     "",
