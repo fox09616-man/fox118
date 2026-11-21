@@ -2200,8 +2200,8 @@ jobs:
           asyncio.run(main())
           PY
 
-          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \\
-            --data-urlencode "chat_id=${CHAT_ID}" \\
+          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=✅ اكتمل ضغط الصوت بالمعدل المدخل ${TARGET_VALUE}. أُنشئ الناتج بعد نجاح كل عمليات الترميز المتوازية."
 
   # ============================================================
