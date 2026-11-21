@@ -1035,8 +1035,8 @@ function startMessage(preset) {
     "",
     "🧩 مسارات الفلاتر:",
     "- أنمي حديث: تنعيم مكاني بلا LUT",
-    "- أنمي قديم: LUT ثم مطابقة مكانية",
-    "- محتوى واقعي: hqdn3d",
+    "- أنمي قديم: منحنى لوني دافئ وتنعيم مكاني محافظ (بلا ملف LUT)",
+    "- محتوى واقعي: إزالة ضجيج خفيفة مع الحفاظ على الملمس",
     preset?.active ? "" : null,
     preset?.active ? "▶️ الوضع التلقائي مفعّل حالياً." : null,
   ]
@@ -1251,7 +1251,7 @@ function filterPresetKeyboardMarkup() {
   return {
     inline_keyboard: [
       [{ text: "🌸 أنمي حديث — تنعيم مكاني", callback_data: "fpreset_modern-anime" }],
-      [{ text: "📜 أنمي قديم — LUT + تنعيم", callback_data: "fpreset_old-anime" }],
+      [{ text: "📜 أنمي قديم — توازن لوني + تنعيم", callback_data: "fpreset_old-anime" }],
       [{ text: "🎬 محتوى واقعي — hqdn3d", callback_data: "fpreset_realistic" }],
       [{ text: "🚫 إلغاء", callback_data: "cancel" }],
     ],
@@ -1261,8 +1261,8 @@ function filterPresetKeyboardMarkup() {
 function filterPresetLabel(preset) {
   const labels = {
     "modern-anime": "أنمي حديث — تنعيم مكاني بلا LUT",
-    "old-anime": "أنمي قديم — LUT ثم مطابقة مكانية",
-    realistic: "محتوى واقعي — hqdn3d",
+    "old-anime": "أنمي قديم — توازن لوني + تنعيم مكاني (بلا LUT)",
+    realistic: "محتوى واقعي — إزالة ضجيج خفيفة",
     off: "بدون فلاتر",
   };
   return labels[preset] || labels.realistic;
