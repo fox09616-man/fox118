@@ -1804,8 +1804,8 @@ jobs:
   process-audio-input:
     name: ضغط الصوت/أرشيف الصوت بالتوازي
     needs: [split-video]
-    # يعتمد تشغيل job على خيار المستخدم مباشرةً، لا على output قد يضيع بين jobs.
-    if: ${{ github.event.inputs.codec == 'audio' }}
+    # يتجاوز skipped الموروث من prepare-codec-build، مع اشتراط نجاح تنزيل/تصنيف المصدر.
+    if: ${{ always() && github.event.inputs.codec == 'audio' && needs.split-video.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
