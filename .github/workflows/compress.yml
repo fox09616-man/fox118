@@ -1804,7 +1804,8 @@ jobs:
   process-audio-input:
     name: ضغط الصوت/أرشيف الصوت بالتوازي
     needs: [split-video]
-    if: ${{ needs.split-video.outputs.input_kind == 'audio_archive' || needs.split-video.outputs.input_kind == 'audio_single' }}
+    # يعتمد تشغيل job على خيار المستخدم مباشرةً، لا على output قد يضيع بين jobs.
+    if: ${{ github.event.inputs.codec == 'audio' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -1842,7 +1843,7 @@ jobs:
           from pathlib import Path, PurePosixPath
 
           INPUT = Path("input_dl/raw_input.mp4")
-          KIND = os.environ["INPUT_KIND"]
+          KIND = os.environ.get("INPUT_KIND", "").strip()
           SOURCE_NAME = os.environ.get("SOURCE_NAME", "").strip() or "audio"
           BITRATE = os.environ.get("TARGET_VALUE", "").strip()
           CHAT_ID = os.environ["CHAT_ID"]
@@ -1856,6 +1857,19 @@ jobs:
 
           if not INPUT.is_file() or INPUT.stat().st_size == 0:
               raise SystemExit("Downloaded audio/archive is missing or empty")
+          source_lower = SOURCE_NAME.lower()
+          signature = INPUT.open("rb").read(16)
+          archive_exts = (".zip", ".rar", ".7z", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".gz", ".bz2", ".xz", ".zst", ".iso")
+          looks_archive = (
+              zipfile.is_zipfile(INPUT) or tarfile.is_tarfile(INPUT)
+              or signature.startswith((b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd"))
+              or source_lower.endswith(archive_exts)
+          )
+          if looks_archive:
+              KIND = "audio_archive"
+          elif KIND not in ("audio_archive", "audio_single"):
+              KIND = "audio_single"
+          print(f"Resolved input kind: {KIND} (job output was {os.environ.get('INPUT_KIND', '')!r})")
           if not __import__("re").fullmatch(r"[1-9][0-9]{0,2}k?", BITRATE):
               raise SystemExit(f"Invalid Opus target bitrate: {BITRATE!r}")
           amount = int(BITRATE[:-1] if BITRATE.endswith("k") else BITRATE)
