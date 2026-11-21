@@ -16,50 +16,48 @@ on:
         required: true
       filename:
         description: 'الاسم النهائي، من دون امتداد.'
-        required: true
+        required: false
+        default: ''
       codec:
-        description: 'المرمّز: av1 للفيديو أو audio للصوت فقط.'
+        description: 'av1 أو audio'
         required: true
         default: 'av1'
         type: choice
         options: ['av1', 'audio']
       preset:
-        description: 'AV1: رقم من 0 إلى 13. يُهمَل عند اختيار audio.'
+        description: 'AV1: رقم 0-13.'
         required: true
-        default: '4'
-        type: choice
-        options: ['none', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
+        default: '8'
       encode_mode:
-        description: 'filters لاختيار مسار التنعيم أو الواقعي، nofilters دون فلاتر، audio للصوت فقط.'
+        description: 'filters أو nofilters أو audio'
         required: true
         default: 'nofilters'
         type: choice
         options: ['filters', 'nofilters', 'audio']
+      filter_profile:
+        description: 'anime أو realistic أو none'
+        required: true
+        default: 'none'
+        type: choice
+        options: ['anime', 'realistic', 'none']
       encode_method:
-        description: 'طريقة الترميز: crf بجودة ثابتة، twopass بمعدل بت، auto بهدف VMAF، audio لاستخراج الصوت.'
+        description: 'AV1: crf أو twopass. صوت: audio.'
         required: true
         default: 'crf'
         type: choice
-        options: ['crf', 'twopass', 'auto', 'audio']
+        options: ['crf', 'twopass', 'audio']
       target_value:
-        description: 'CRF من 0 إلى 63، أو معدل بت مثل 500k، أو هدف VMAF من 50 إلى 99 مع auto.'
+        description: 'CRF أو معدل البت، مثل 28 أو 500k.'
         required: true
-        default: '48'
+        default: '28'
       resolution:
-        description: 'الارتفاع النهائي مثل 480 أو 720 أو 1080، أو auto للإبقاء على دقة المصدر.'
+        description: 'الارتفاع النهائي (مثل 480 أو 720 أو 1080)، أو auto لإبقاء دقة المصدر.'
         required: true
-        default: '720'
+        default: '480'
       frame_rate:
-        description: 'معدل الإطارات: 23.976 أو 24000/1001 للأنمي، 25 للبث الأوروبي، 30 أو 29.97 للبث الأمريكي، أو auto للإبقاء على معدل المصدر.'
+        description: 'معدل الإطارات النهائي. القيمة الافتراضية 24 لأقل حجم للمسلسلات والأنمي.'
         required: true
-        default: '23.976'
-
-      filter_preset:
-        description: 'عند اختيار filters: modern-anime أو old-anime؛ realistic للمحتوى الواقعي. اختر off مع nofilters.'
-        required: true
-        default: 'off'
-        type: choice
-        options: ['off', 'modern-anime', 'old-anime', 'realistic']
+        default: '24'
 
 concurrency:
   group: video-compression-${{ github.event.inputs.chat_id }}
@@ -70,158 +68,51 @@ permissions:
   contents: read
 
 jobs:
-  # ============================================================
-  # 1. بناء الأدوات
-  # ============================================================
   prepare-codec-build:
-    name: بناء FFmpeg و Av1an
+    name: بناء FFmpeg الموحد
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: استعادة البناء الموحد من الكاش
+      - name: استعادة بناء FFmpeg الموحد
         if: github.event.inputs.codec != 'audio'
         id: cache-build
         uses: actions/cache@v4
         with:
-          path: |
-            ~/codec-build
-            ~/.cargo
-            ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
 
-      - name: استعادة بيئة المطابقة المكانية من الكاش
-        if: >-
-          github.event.inputs.codec != 'audio' &&
-          github.event.inputs.encode_mode == 'filters' &&
-          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime')
-        id: cache-spatial-python
-        uses: actions/cache@v4
-        with:
-          path: ~/.venvs/spatial
-          key: spatial-match-opencv-ubuntu-24.04-python312-v1
-
-      - name: إنشاء بيئة المطابقة عند الحاجة فقط
-        if: >-
-          github.event.inputs.codec != 'audio' &&
-          github.event.inputs.encode_mode == 'filters' &&
-          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime') &&
-          steps.cache-spatial-python.outputs.cache-hit != 'true'
-        run: |
-          set -euo pipefail
-          python3 -m venv "$HOME/.venvs/spatial"
-          "$HOME/.venvs/spatial/bin/python" -m pip install opencv-contrib-python-headless==4.10.0.84 numpy==1.26.4
-          "$HOME/.venvs/spatial/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter"); print("OpenCV", cv2.__version__, "NumPy", numpy.__version__)'
-
-      - name: بناء SVT-AV1 v4.2.0 و VMAF v3.0.0 و FFmpeg
+      - name: بناء المرّمّزات والمفكك وFFmpeg
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
-        timeout-minutes: 90
         run: |
           set -euo pipefail
-
-          FREE_GB=$(df -BG / | awk 'NR==2{gsub("G",""); print $4}')
-          echo "Free disk space: ${FREE_GB}GB"
-          [ "$FREE_GB" -ge 8 ] || { echo "Not enough disk space: ${FREE_GB}GB" >&2; exit 1; }
-
-          sudo apt-get update -qq
-          sudo apt-get install -y build-essential cmake git nasm pkg-config \
-            libdav1d-dev libopus-dev meson ninja-build
+          sudo apt update
+          sudo apt install -y build-essential cmake git nasm pkg-config libdav1d-dev libogg-dev libopus-dev
           rm -rf "$HOME/codec-build" "$HOME/codec-sources"
           mkdir -p "$HOME/codec-build" "$HOME/codec-sources"
           cd "$HOME/codec-sources"
-
           git clone --depth 1 --branch v4.2.0 https://gitlab.com/AOMediaCodec/SVT-AV1.git
-          cmake -S SVT-AV1 -B SVT-AV1/Build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=ON \
-            -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
+          cmake -S SVT-AV1 -B SVT-AV1/Build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DCMAKE_INSTALL_PREFIX="$HOME/codec-build"
           cmake --build SVT-AV1/Build --parallel "$(nproc)"
           cmake --install SVT-AV1/Build
-
-          git clone --depth 1 --branch v3.0.0 https://github.com/Netflix/vmaf.git
-          meson setup vmaf/libvmaf/build vmaf/libvmaf \
-            --buildtype release \
-            --prefix="$HOME/codec-build" \
-            --libdir=lib \
-            -Denable_tests=false \
-            -Denable_docs=false
-          ninja -C vmaf/libvmaf/build
-          ninja -C vmaf/libvmaf/build install
-
           git clone --depth 1 https://github.com/FFmpeg/FFmpeg.git
           export PKG_CONFIG_PATH="$HOME/codec-build/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           cd FFmpeg
-          ./configure \
-            --prefix="$HOME/codec-build" \
-            --enable-gpl \
-            --enable-version3 \
-            --disable-doc \
-            --enable-libopus \
-            --enable-libdav1d \
-            --enable-libsvtav1 \
-            --enable-libvmaf \
-            --extra-cflags="-I$HOME/codec-build/include" \
-            --extra-ldflags="-L$HOME/codec-build/lib"
+          ./configure --prefix="$HOME/codec-build" --enable-gpl --enable-version3 --disable-doc --enable-libopus --enable-libdav1d --enable-libsvtav1 --extra-cflags="-I$HOME/codec-build/include" --extra-ldflags="-L$HOME/codec-build/lib"
           make -j"$(nproc)"
           make install
 
-      - name: استعادة حزم Homebrew لـ Av1an عند الحاجة فقط
-        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
-        uses: actions/cache@v4
-        with:
-          path: |
-            /home/linuxbrew/.linuxbrew/Cellar/av1an
-            /home/linuxbrew/.linuxbrew/opt/av1an
-            /home/linuxbrew/.linuxbrew/bin/av1an
-            ~/.cache/Homebrew
-          key: av1an-homebrew-ubuntu-24.04-v1
-
-      - name: تثبيت av1an عند الحاجة فقط
-        if: >-
-          github.event.inputs.codec != 'audio' &&
-          github.event.inputs.encode_method == 'auto'
-        run: |
-          set -euo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          if ! av1an --version >/dev/null 2>&1; then brew install av1an; fi
-          AV1AN_VER=$(av1an --version 2>/dev/null || true)
-          echo "av1an: $AV1AN_VER"
-
-      - name: التحقق من البناء
+      - name: فحص البناء الموحد
         if: github.event.inputs.codec != 'audio'
         run: |
           set -euo pipefail
-          sudo apt-get install -y libdav1d7 libopus0
-          export PATH="$HOME/codec-build/bin:$PATH"
+          sudo apt update
+          sudo apt install -y libdav1d-dev libopus0
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
+          test -x "$HOME/codec-build/bin/ffmpeg"
+          "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
+          "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
 
-          echo "=== Tool versions ==="
-          "$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1
-          "$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || true
-
-          if [ "${{ github.event.inputs.encode_method }}" = "auto" ]; then
-            export HOMEBREW_NO_AUTO_UPDATE=1
-            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-            av1an --version 2>/dev/null | head -1 || echo "av1an unavailable"
-          fi
-
-          echo "=== Encoders check ==="
-          "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders 2>/dev/null | grep -q 'libsvtav1' \
-            && echo "OK libsvtav1" || { echo 'MISSING libsvtav1' >&2; exit 1; }
-          "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders 2>/dev/null | grep -q 'libdav1d' \
-            && echo "OK libdav1d" || { echo 'MISSING libdav1d' >&2; exit 1; }
-          "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf ' \
-            && echo "OK libvmaf" || { echo 'MISSING libvmaf' >&2; exit 1; }
-
-      - name: تخطي بناء أدوات الفيديو عند اختيار الصوت فقط
-        if: github.event.inputs.codec == 'audio'
-        run: |
-          echo "Audio-only mode: AV1/DT tools are not required."
-
-  # ============================================================
-  # 2. تحميل المصدر وفحصه وتقطيعه
-  # ============================================================
   split-video:
     name: تحميل المصدر وفحصه وتقطيعه
     needs: prepare-codec-build
@@ -229,94 +120,25 @@ jobs:
     timeout-minutes: 360
     outputs:
       chunks: ${{ steps.segment.outputs.chunks }}
-      chunk_specs: ${{ steps.segment.outputs.chunk_specs }}
-      source_info: ${{ steps.probe_source.outputs.source_info }}
     steps:
-      - name: تحديد اعتماديات المصدر المطلوبة
-        id: fetch-profile
-        env:
-          INPUT_URL: ${{ github.event.inputs.url }}
-          MESSAGE_ID: ${{ github.event.inputs.message_id }}
-        run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import os, re
-          from urllib.parse import urlparse
-          u = os.environ.get("INPUT_URL", "").strip()
-          path = urlparse(u).path.lower()
-          if os.environ.get("MESSAGE_ID", "").strip() or re.match(r"^https?://(t\.me|telegram\.me|telegram\.dog)/", u, re.I):
-              profile = "telegram"
-          elif re.search(r"\.(m3u8|mpd)$", path):
-              profile = "hls"
-          elif re.search(r"\.(mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)$", path):
-              profile = "direct"
-          elif u:
-              profile = "web"
-          else:
-              profile = "direct"
-          print(f"profile={profile}")
-          PY
-
-      - name: استعادة بيئة تنزيل Python حسب نوع المصدر
-        if: steps.fetch-profile.outputs.profile != 'direct'
-        uses: actions/cache@v4
-        with:
-          path: ~/.venvs/fetch
-          key: fetch-ubuntu-24.04-python312-${{ steps.fetch-profile.outputs.profile }}-v1
-
-      - name: تثبيت حزم المصدر المطلوبة عند الحاجة فقط
-        if: steps.fetch-profile.outputs.profile != 'direct'
-        env:
-          FETCH_PROFILE: ${{ steps.fetch-profile.outputs.profile }}
+      - name: تجهيز أدوات التحميل
         run: |
           set -euo pipefail
-          VENV="$HOME/.venvs/fetch"
-          if [ ! -x "$VENV/bin/python" ]; then python3 -m venv "$VENV"; fi
-          case "$FETCH_PROFILE" in
-            telegram) "$VENV/bin/python" -c 'import telethon' 2>/dev/null || "$VENV/bin/python" -m pip install telethon ;;
-            hls) "$VENV/bin/python" -c 'import yt_dlp' 2>/dev/null || "$VENV/bin/python" -m pip install yt-dlp ;;
-            web) "$VENV/bin/python" -c 'import requests, bs4, yt_dlp' 2>/dev/null || "$VENV/bin/python" -m pip install requests beautifulsoup4 yt-dlp ;;
-            *) echo "Unknown fetch profile: $FETCH_PROFILE" >&2; exit 1 ;;
-          esac
-          echo "$VENV/bin" >> "$GITHUB_PATH"
+          sudo apt update
+          sudo apt install -y ffmpeg jq libdav1d-dev libopus0 python3-pip curl
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user telethon requests beautifulsoup4 lxml yt-dlp
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "✅ تم تثبيت جميع الأدوات"
 
-      - name: تجهيز أدوات النظام اللازمة للتنزيل والفحص
-        env:
-          CODEC: ${{ github.event.inputs.codec }}
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          if [ "$CODEC" = "audio" ]; then
-            sudo apt-get install -y ffmpeg jq
-          else
-            sudo apt-get install -y jq libdav1d7 libopus0
-          fi
-
-      - name: استعادة FFmpeg الموحد
+      - name: استعادة FFmpeg الموحد عند الحاجة
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
-          path: |
-            ~/codec-build
-            ~/.cargo
-            ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
 
-      - name: تهيئة FFmpeg المبني للمهمة
-        if: github.event.inputs.codec != 'audio'
-        run: |
-          echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-
-      - name: استعادة بيئة المتصفح الاختيارية للصفحات التي تتطلبها
-        if: steps.fetch-profile.outputs.profile == 'web'
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.venvs/fetch-browser
-            ~/.cache/ms-playwright
-          key: fetch-browser-ubuntu-24.04-python312-v1
-
-      - name: تحميل الفيديو المصدر
+      - name: تحميل الفيديو المصدر والتحقق منه
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -328,752 +150,470 @@ jobs:
         run: |
           set -euo pipefail
 
-          TG_LINK_RE='^https?://(t\.me|telegram\.me|telegram\.dog)/'
-          HLS_RE='\.(m3u8|mpd)(\?.*)?$'
-          DIRECT_RE='\.(mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)(\?.*)?$'
-          PYTHON=python3
-          if [ -x "$HOME/.venvs/fetch/bin/python" ]; then
-            PYTHON="$HOME/.venvs/fetch/bin/python"
-            export PATH="$HOME/.venvs/fetch/bin:$PATH"
-          fi
+          # 1. تحميل من رسالة تيليجرام
+          if [ -n "$MESSAGE_ID" ]; then
+            echo "📥 تحميل من رسالة تيليجرام..."
+            python3 <<'PYEOF'
+          import asyncio, os, sys
+          from telethon import TelegramClient
+          from telethon.sessions import StringSession
+          async def main():
+              client = TelegramClient(StringSession(), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              await client.start(bot_token=os.environ["BOT_TOKEN"])
+              async with client:
+                  message = await client.get_messages(int(os.environ["SOURCE_CHAT_ID"]), ids=int(os.environ["MESSAGE_ID"]))
+                  if message is None or not message.media:
+                      sys.exit("لم يتم العثور على فيديو.")
+                  await client.download_media(message, file="raw_input.mp4")
+          asyncio.run(main())
+          PYEOF
 
-          # Telegram routing: uploaded Telegram message -> bot; Telegram URL -> user session.
-          if [ -n "$MESSAGE_ID" ] || { [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $TG_LINK_RE ]]; }; then
-            if [ -n "$MESSAGE_ID" ]; then
-              echo "Telegram uploaded video/document: bot download with retries..."
-              TG_MODE="bot_message"
-            else
-              echo "Telegram link: user-session download with retries..."
-              TG_MODE="session_link"
-            fi
-            export TG_MODE
-            cat > tg_fetch.py <<'PYEOF'
-          import asyncio, os, sys, time
-          from urllib.parse import urlparse
+          # 2. تحميل من رابط تيليجرام
+          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ ^https?://(t\.me|telegram\.me|telegram\.dog)/ ]]; then
+            echo "📥 تحميل من رابط تيليجرام..."
+            python3 <<'PYEOF'
+          import asyncio, os, sys, re
           from telethon import TelegramClient
           from telethon.sessions import StringSession
           from telethon.tl.types import PeerChannel
-
-          API_ID = int(os.environ["TG_API_ID"])
-          API_HASH = os.environ["TG_API_HASH"]
-          BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-          TG_SESSION = os.environ.get("TG_SESSION", "")
-          MESSAGE_ID = os.environ.get("MESSAGE_ID", "").strip()
-          URL = os.environ.get("VIDEO_URL", "").strip()
-          CHAT_ID = os.environ.get("SOURCE_CHAT_ID", "").strip()
-          MODE = os.environ.get("TG_MODE", "")
-          OUT = "raw_input.mp4"
-          MAX_ATTEMPTS = 10
-
-          def parse_link(link):
-              parts = [p for p in urlparse(link).path.split("/") if p]
-              if len(parts) < 2 or not parts[-1].isdigit():
-                  return None, None
-              msg_id = int(parts[-1])
-              if parts[0] == "c" and len(parts) >= 3 and parts[1].isdigit():
-                  return PeerChannel(int(parts[1])), msg_id
-              return parts[0], msg_id
-
-          def is_video_message(message):
-              if getattr(message, "video", None):
-                  return True
-              doc = getattr(message, "document", None)
-              if not doc:
-                  return False
-              mime = (getattr(doc, "mime_type", "") or "").lower()
-              if mime.startswith("video/"):
-                  return True
-              video_exts = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".mpeg", ".mpg")
-              for attr in getattr(doc, "attributes", []) or []:
-                  name = getattr(attr, "file_name", "") or ""
-                  if name.lower().endswith(video_exts):
-                      return True
-              return False
-
-          def get_target():
-              if MODE == "bot_message":
-                  if not MESSAGE_ID or not CHAT_ID:
-                      raise RuntimeError("message_id أو chat_id مفقود")
-                  return int(CHAT_ID), int(MESSAGE_ID)
-              if MODE == "session_link":
-                  peer, mid = parse_link(URL)
-                  if peer is None:
-                      raise RuntimeError("تعذر تحليل رابط تيليجرام أو رقم الرسالة")
-                  return peer, mid
-              raise RuntimeError(f"وضع تحميل تيليجرام غير معروف: {MODE}")
-
           async def main():
-              peer, mid = get_target()
-              if MODE == "bot_message" and not BOT_TOKEN:
-                  raise RuntimeError("BOT_TOKEN غير مضبوط")
-              if MODE == "session_link" and not TG_SESSION:
-                  raise RuntimeError("TG_SESSION غير مضبوط للرابط")
-
-              for attempt in range(1, MAX_ATTEMPTS + 1):
-                  client = (TelegramClient(StringSession(), API_ID, API_HASH)
-                            if MODE == "bot_message" else
-                            TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH))
-                  try:
-                      # Include connection/authentication in the retry loop.
-                      if MODE == "bot_message":
-                          await client.start(bot_token=BOT_TOKEN)
-                      else:
-                          await client.connect()
-                          if not await client.is_user_authorized():
-                              raise RuntimeError("جلسة تيليجرام غير مصرح بها")
-
-                      if os.path.exists(OUT):
-                          os.remove(OUT)
-                      message = await client.get_messages(peer, ids=mid)
-                      if message is None or not is_video_message(message):
-                          raise RuntimeError("الرسالة غير موجودة أو لا تحتوي فيديو/مستند فيديو")
-                      result = await client.download_media(message, file=OUT)
-                      if result and os.path.exists(OUT) and os.path.getsize(OUT) > 0:
-                          print(f"[tg] {MODE}: video download succeeded on attempt {attempt}")
-                          return 0
-                      raise RuntimeError("تنزيل تيليجرام لم يُنشئ ملفًا صالحًا")
-                  except Exception as exc:
-                      if os.path.exists(OUT):
-                          os.remove(OUT)
-                      if attempt >= MAX_ATTEMPTS:
-                          print(f"[tg] {MODE}: failed after {attempt} attempts: {type(exc).__name__}: {str(exc)[:250]}")
-                          return 1
-                      # Respect Telegram FloodWait exactly where possible; otherwise exponential backoff.
-                      wait = getattr(exc, "seconds", None)
-                      if not isinstance(wait, (int, float)) or wait <= 0:
-                          wait = min(45, 3 * (2 ** (attempt - 1)))
-                      wait = min(120, max(2, int(wait)))
-                      print(f"[tg] {MODE}: attempt {attempt}/{MAX_ATTEMPTS} failed ({type(exc).__name__}: {str(exc)[:180]}), retrying in {wait}s", flush=True)
-                      await asyncio.sleep(wait)
-                  finally:
+              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              await client.start()
+              url = os.environ["VIDEO_URL"]
+              async with client:
+                  # أولاً: نمط t.me/c/<id>/<msg_id> (قنوات خاصة)
+                  match = re.search(r't\.me/(?:c/)?([^/]+)/(\d+)', url)
+                  if match and not match.group(1).startswith('+'):
+                      ident = match.group(1)
+                      msg_id = int(match.group(2))
                       try:
-                          await client.disconnect()
-                      except Exception:
-                          pass
-              return 1
-
-          sys.exit(asyncio.run(main()))
+                          if ident.isdigit():
+                              entity = await client.get_entity(PeerChannel(int(ident)))
+                          else:
+                              entity = await client.get_entity(ident)
+                          message = await client.get_messages(entity, ids=msg_id)
+                          if message and message.media:
+                              await client.download_media(message, file="raw_input.mp4")
+                              return
+                          else:
+                              sys.exit("لم يتم العثور على فيديو.")
+                      except Exception as e:
+                          sys.exit(f"فشل: {str(e)}")
+                  # ثانياً: رابط مباشر لملف
+                  if re.search(r'\.(mp4|mkv|avi|mov|webm)$', url, re.IGNORECASE):
+                      try:
+                          await client.download_file(url, file="raw_input.mp4")
+                          return
+                      except Exception as e:
+                          sys.exit(f"فشل: {str(e)}")
+                  # ثالثاً: رابط قناة عامة أو منشور
+                  try:
+                      entity = await client.get_entity(url)
+                      async for message in client.iter_messages(entity, limit=10):
+                          if message.media and hasattr(message.media, 'document'):
+                              await client.download_media(message, file="raw_input.mp4")
+                              return
+                      sys.exit("لم يتم العثور على فيديو.")
+                  except Exception as e:
+                      sys.exit(f"فشل: {str(e)}")
+          asyncio.run(main())
           PYEOF
-            "$PYTHON" tg_fetch.py || { echo "Telegram source download failed after retries (route: $TG_MODE)" >&2; exit 1; }
 
-          # 3. رابط HLS / DASH مباشر
-          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $HLS_RE ]]; then
-            echo "Downloading HLS/DASH stream via ffmpeg..."
-            ffmpeg -hide_banner -nostdin -y -loglevel error \
-              -protocol_whitelist file,http,https,tcp,tls,crypto \
-              -i "$VIDEO_URL" -c copy raw_input.mp4 \
-              || yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
-              || { echo 'Download failed' >&2; exit 1; }
-
-          # 4. رابط ملف مباشر
-          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $DIRECT_RE ]]; then
-            echo "Downloading direct file..."
+          # 3. تحميل من رابط مباشر
+          # ملاحظة: m3u8 مستبعد عمداً هنا — فهو ملف قائمة تشغيل (manifest) نصّي
+          # وليس فيديو، وتحميله بـ curl ينزّل النص فقط لا المقاطع. روابط m3u8
+          # تُترك للمسار الذكي (4) الذي يستعمل yt-dlp أو ffmpeg لتجميع HLS فعلياً.
+          elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ \.(mp4|mkv|avi|mov|webm|flv|ts)(\?.*)?$ ]]; then
+            echo "📥 تحميل من رابط مباشر..."
             curl -fL --retry 3 --retry-delay 2 --connect-timeout 30 -o raw_input.mp4 "$VIDEO_URL"
 
-          # 5. صفحة ويب: استخراج متعدد المستويات، ثم yt-dlp كاحتياط
+          # 4. تحميل ذكي
           elif [ -n "$VIDEO_URL" ]; then
-            echo "Downloading from web page (multi-level extraction)..."
-            cat > fetch_page.py <<'PYEOF'
-          import os, sys, re, base64, subprocess, time
+            echo "📥 تحميل ذكي من الرابط..."
+            python3 <<'PYEOF'
+          import os, sys, re, json, base64, subprocess, shutil
           import requests
           from bs4 import BeautifulSoup
-          from urllib.parse import urljoin
-
-          try:
-              from curl_cffi import requests as cffi_requests
-              HAS_CFFI = True
-          except ImportError:
-              HAS_CFFI = False
-
-          try:
-              from playwright.sync_api import sync_playwright
-              HAS_PLAYWRIGHT = True
-          except ImportError:
-              HAS_PLAYWRIGHT = False
-
-          print(f"curl_cffi available: {HAS_CFFI} | playwright available: {HAS_PLAYWRIGHT}")
+          from urllib.parse import urljoin, urlparse
 
           url = os.environ["VIDEO_URL"]
-          print("=" * 60)
-          print("URL:", url)
-          print("=" * 60)
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.5',
+              'Referer': url,
+          }
 
-          USER_AGENTS = [
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          ]
-          VIDEO_URL_RE = re.compile(r'\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv|m4a|mp3|aac|ogg|opus|wav|flac)(?=$|[?#&/"\'])', re.IGNORECASE)
-          HLS_RE = re.compile(r'\.(?:m3u8|mpd)(?=$|[?#&/"\'])', re.IGNORECASE)
-          CANDIDATE = "candidate.mp4"
-          MIN_DUR = 61
-          tried = set()
-
-
-          def make_headers(i=0, ref=True):
-              h = {
-                  'User-Agent': USER_AGENTS[i % len(USER_AGENTS)],
-                  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                  'Accept-Language': 'en-US,en;q=0.9,ar;q=0.8',
-                  'Upgrade-Insecure-Requests': '1',
-              }
-              if ref:
-                  h['Referer'] = url
-              return h
-
-
-          def probe_duration(path):
+          def get_video_duration(path):
               try:
-                  out = subprocess.run(
-                      ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', path],
-                      capture_output=True, text=True, timeout=120).stdout.strip()
-                  return int(float(out)) if out else 0
-              except Exception:
-                  return 0
+                  r = subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','csv=p=0',path], capture_output=True, text=True, timeout=30)
+                  if r.returncode == 0 and r.stdout.strip() and r.stdout.strip() != 'N/A':
+                      return int(float(r.stdout.strip()))
+              except: pass
+              return 0
 
+          def get_video_size(path):
+              try: return os.path.getsize(path)
+              except: return 0
 
-          def fetch_html():
-              if HAS_CFFI:
-                  try:
-                      r = cffi_requests.get(url, impersonate="chrome120", timeout=30)
-                      print(f"[page] curl_cffi status={r.status_code} len={len(r.text)}")
-                      if r.status_code == 200 and len(r.text) > 500:
-                          return r.text
-                  except Exception as e:
-                      print(f"[page] curl_cffi failed: {str(e)[:150]}")
-              for i in range(3):
-                  try:
-                      r = requests.get(url, headers=make_headers(i), timeout=30, allow_redirects=True)
-                      print(f"[page] requests attempt {i + 1} status={r.status_code} len={len(r.text)}")
-                      if r.status_code == 200 and len(r.text) > 500:
-                          return r.text
-                  except Exception as e:
-                      print(f"[page] requests attempt {i + 1} failed: {str(e)[:150]}")
-                  time.sleep(2)
-              print("[page] could not load page")
-              return ""
-
-
-          def print_indicators(html):
-              low = html.lower()
-              keys = ['m3u8', '.mp4', '.ts', 'video', 'player', 'jwplayer', 'hls', 'cloudflare', 'recaptcha']
-              print("[page] indicators: " + " | ".join(f"{k}={low.count(k)}" for k in keys))
-
-
-          def expected_duration(html):
-              for p in [r'"duration"\s*:\s*"?(\d+(?:\.\d+)?)"?',
-                        r'"durationSeconds"\s*:\s*"?(\d+)"?',
-                        r'"videoDuration"\s*:\s*"?(\d+)"?']:
+          def extract_expected_duration(html):
+              # البحث عن duration في JSON
+              for p in [r'"duration"\s*:\s*"?(\d+)"?', r'"durationSeconds"\s*:\s*"?(\d+)"?']:
                   m = re.findall(p, html, re.IGNORECASE)
                   if m:
                       try:
-                          v = int(float(m[0]))
-                          if 30 < v < 86400:
-                              return v, 'json'
-                      except Exception:
-                          pass
-              for m in re.findall(r'itemprop=["\']duration["\'][^>]*content=["\']([^"\']+)["\']', html, re.IGNORECASE):
-                  mm = re.match(r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?', m, re.IGNORECASE)
-                  if mm:
-                      v = int(mm.group(1) or 0) * 3600 + int(mm.group(2) or 0) * 60 + int(float(mm.group(3) or 0))
-                      if 30 < v < 86400:
-                          return v, 'itemprop'
-              for m in re.findall(r'(\d{1,2}:\d{2}(?::\d{2})?)', html):
-                  parts = m.split(':')
+                          v = int(m[0])
+                          if 30 < v < 7200: return v
+                      except: pass
+              # PT#M#S
+              m = re.findall(r'itemprop="duration"[^>]*content="PT(\d+)M(\d+)S"', html)
+              if m:
                   try:
-                      if len(parts) == 2:
-                          v = int(parts[0]) * 60 + int(parts[1])
-                      elif len(parts) == 3:
-                          v = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-                      else:
-                          continue
-                      if v > 60:
-                          return v, 'text'
-                  except Exception:
-                      pass
-              return 0, ''
+                      v = int(m[0][0])*60 + int(m[0][1])
+                      if 30 < v < 7200: return v
+                  except: pass
+              # تنسيق الوقت HH:MM:SS أو MM:SS
+              for p in [r'"duration"\s*:\s*"(\d+):(\d+)(?::(\d+))?"', r'>(\d+):(\d+)(?::(\d+))?<', r'(\d+):(\d+)(?::(\d+))?\s*(?:min|دقيقة)']:
+                  m = re.findall(p, html)
+                  if m:
+                      parts = [int(x) for x in m[0] if x]
+                      try:
+                          if len(parts)==2: v = parts[0]*60+parts[1]
+                          elif len(parts)==3: v = parts[0]*3600+parts[1]*60+parts[2]
+                          else: continue
+                          if 30 < v < 7200: return v
+                      except: pass
+              return 0
 
+          def extract_expected_size(html):
+              for p in [r'"size"\s*:\s*"?(\d+)"?', r'"filesize"\s*:\s*"?(\d+)"?', r'"fileSize"\s*:\s*"?(\d+)"?']:
+                  m = re.findall(p, html, re.IGNORECASE)
+                  if m:
+                      try:
+                          v = int(m[0])
+                          if v > 5000000: return v  # أكبر من 5MB
+                      except: pass
+              m = re.findall(r'(\d+(?:\.\d+)?)\s*(GB|MB|KB)', html, re.IGNORECASE)
+              if m:
+                  try:
+                      num = float(m[0][0]); unit = m[0][1].upper()
+                      if unit=='GB': v = int(num*1073741824)
+                      elif unit=='KB': v = int(num*1024)
+                      else: v = int(num*1048576)
+                      if v > 5000000: return v
+                  except: pass
+              return 0
 
-          def norm(u):
-              if isinstance(u, list):
-                  u = u[0] if u else ''
-              u = (u or '').strip()
-              if not u:
-                  return ''
-              if u.startswith('//'):
-                  u = 'https:' + u
-              elif u.startswith('/'):
-                  u = urljoin(url, u)
-              return u if u.startswith('http') else ''
+          def is_valid_video_url(u):
+              if not u or not isinstance(u, str): return False
+              if not u.startswith(('http://','https://')): return False
+              if '.' not in urlparse(u).netloc: return False
+              return bool(re.search(r'\.(mp4|m3u8|webm|flv|ts)(\?.*)?$', u, re.IGNORECASE))
 
-
-          def extract_urls(html):
-              soup = BeautifulSoup(html, 'html.parser')
-              strong, weak = [], []
-
-              for tag in soup.find_all(['video', 'source', 'audio']):
-                  for a in ['src', 'data-src', 'data-url', 'data-source', 'data-video']:
-                      v = norm(tag.get(a))
-                      if v:
-                          strong.append(v)
-
-              for meta in soup.find_all('meta'):
-                  prop = (meta.get('property') or meta.get('name') or '').lower()
-                  if prop in ('og:video', 'og:video:url', 'og:video:secure_url', 'twitter:player:stream', 'video:url'):
-                      v = norm(meta.get('content'))
-                      if v:
-                          strong.append(v)
-
-              for a in soup.find_all('a', href=True):
-                  v = norm(a['href'])
-                  if v and VIDEO_URL_RE.search(v):
-                      strong.append(v)
-
+          def get_quality_score(u):
+              ul = u.lower()
+              # البحث عن أنماط الجودة ككلمات منفصلة
               patterns = [
-                  r'["\']((?:https?:)?//[^"\']+\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv|m4a|mp3|aac|ogg|opus|wav|flac)[^"\']*)["\']',
-                  r'(?:videoUrl|video_url|videoURL|videoSrc|video_src|sourceUrl|playUrl|mediaUrl|streamUrl|hlsUrl|dashUrl|file|src)\s*[:=]\s*["\']([^"\']+)["\']',
-                  r'data-(?:video|src|url|source|stream|file|hls|dash)\s*=\s*["\']([^"\']+)["\']',
+                  (r'(?:^|[/_.-])(2160p|4k|uhd)(?:[/_.-]|$)', 10),
+                  (r'(?:^|[/_.-])(1440p|2k|qhd)(?:[/_.-]|$)', 9),
+                  (r'(?:^|[/_.-])(1080p|fhd|fullhd)(?:[/_.-]|$)', 8),
+                  (r'(?:^|[/_.-])(720p|hd)(?:[/_.-]|$)', 7),
+                  (r'(?:^|[/_.-])(480p)(?:[/_.-]|$)', 6),
+                  (r'(?:^|[/_.-])(360p)(?:[/_.-]|$)', 5),
+                  (r'(?:^|[/_.-])(240p)(?:[/_.-]|$)', 4),
+                  (r'(?:^|[/_.-])(180p)(?:[/_.-]|$)', 3),
+                  (r'(?:^|[/_.-])(120p)(?:[/_.-]|$)', 2),
+              ]
+              for pat, sc in patterns:
+                  if re.search(pat, ul, re.IGNORECASE):
+                      return sc
+              return 0
+
+          def extract_all_video_urls(html, base):
+              urls = []
+              # أنماط البحث
+              patterns = [
+                  r'["\'](https?://[^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
+                  r'videoUrl["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+                  r'video_url["\']?\s*[:=]\s*["\']([^"\']+)["\']',
+                  r'file["\']?\s*[:=]\s*["\']([^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
+                  r'src["\']?\s*[:=]\s*["\']([^"\']+\.(?:mp4|m3u8|webm|flv|ts)[^"\']*)["\']',
+                  r'data-(?:video|src|url)["\']?\s*[:=]\s*["\']([^"\']+)["\']',
               ]
               for p in patterns:
                   for m in re.findall(p, html, re.IGNORECASE):
-                      v = norm(m)
-                      if v:
-                          weak.append(v)
-
-              for p in [r'base64,([A-Za-z0-9+/=]{20,})', r'atob\(["\']([A-Za-z0-9+/=]{20,})["\']\)']:
+                      if isinstance(m, tuple): m = m[-1] if m else ''
+                      if not isinstance(m, str): continue
+                      if is_valid_video_url(m): urls.append(m)
+                      elif m.startswith('//'): urls.append('https:'+m)
+                      elif m.startswith('/'): urls.append(urljoin(base, m))
+              # base64
+              for p in [r'base64,([A-Za-z0-9+/=]+)', r'atob\(["\']([A-Za-z0-9+/=]+)["\']\)']:
                   for m in re.findall(p, html):
                       try:
                           d = base64.b64decode(m).decode('utf-8', errors='ignore')
-                          for dm in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|mpd|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)[^\s"\'<>]*', d):
-                              weak.append(dm)
-                      except Exception:
-                          pass
-
-              weak = [u for u in weak if VIDEO_URL_RE.search(u)]
-              return list(dict.fromkeys(strong + weak))
-
-
-          def capture_with_playwright():
-              captured = []
-              if not HAS_PLAYWRIGHT:
-                  return captured
-              print("[playwright] starting")
-              try:
-                  with sync_playwright() as p:
-                      browser = p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+                          urls.extend(re.findall(r'https?://[^\s"\']+\.(?:mp4|m3u8|webm|flv|ts)[^\s"\']*', d))
+                      except: pass
+              soup = BeautifulSoup(html, 'html.parser')
+              for meta in soup.find_all('meta'):
+                  if meta.get('property') in ['og:video','og:video:url','og:video:secure_url']:
+                      c = meta.get('content')
+                      if c and is_valid_video_url(c): urls.append(c)
+              for v in soup.find_all('video'):
+                  for a in ['src','data-src']:
+                      val = v.get(a)
+                      if val and is_valid_video_url(val): urls.append(val)
+                  for s in v.find_all('source'):
+                      for a in ['src','data-src']:
+                          val = s.get(a)
+                          if val and is_valid_video_url(val): urls.append(val)
+              # iframes
+              for iframe in soup.find_all('iframe'):
+                  src = iframe.get('src', '')
+                  if src and 'http' in src:
                       try:
-                          ctx = browser.new_context(user_agent=USER_AGENTS[0],
-                                                    viewport={'width': 1920, 'height': 1080},
-                                                    ignore_https_errors=True)
-                          page = ctx.new_page()
+                          ir = requests.get(src, headers=headers, timeout=15)
+                          if ir.status_code == 200:
+                              urls.extend(extract_all_video_urls(ir.text, src))
+                      except: pass
+              return urls
 
-                          def on_response(resp):
-                              try:
-                                  u = resp.url
-                                  ct = resp.headers.get('content-type', '')
-                                  if any(x in ct for x in ['video/', 'mpegurl', 'dash+xml']) or VIDEO_URL_RE.search(u):
-                                      captured.append(u)
-                                      print(f"[playwright] network: {u[:120]}")
-                              except Exception:
-                                  pass
-
-                          page.on('response', on_response)
-                          try:
-                              page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                          except Exception as e:
-                              print(f"[playwright] goto warning: {str(e)[:100]}")
-                          page.wait_for_timeout(10000)
-                          try:
-                              page.evaluate("""() => {
-                                  document.querySelectorAll('video').forEach(v => {
-                                      v.muted = true;
-                                      v.play().catch(() => {});
-                                  });
-                              }""")
-                              page.wait_for_timeout(8000)
-                          except Exception as e:
-                              print(f"[playwright] play warning: {str(e)[:100]}")
-                      finally:
-                          browser.close()
-              except Exception as e:
-                  print(f"[playwright] failed: {str(e)[:200]}")
-              captured = list(dict.fromkeys(captured))
-              if any(HLS_RE.search(u) for u in captured):
-                  captured = [u for u in captured if not re.search(r'\.(?:ts|m4s)(?=$|[?#])', u, re.IGNORECASE)]
-              print(f"[playwright] captured {len(captured)} urls")
-              return captured
-
-
-          def accept_candidate():
-              if not os.path.exists(CANDIDATE):
-                  return False
-              size = os.path.getsize(CANDIDATE)
-              dur = probe_duration(CANDIDATE) if size > 500000 else 0
-              print(f"     size={size}B duration={dur}s (need >= {MIN_DUR}s)")
-              if dur >= MIN_DUR:
-                  os.replace(CANDIDATE, "raw_input.mp4")
-                  return True
-              os.remove(CANDIDATE)
-              return False
-
-
-          def download_hls(u):
-              h = make_headers(0, True)
-              hdrs = f"Referer: {h['Referer']}\r\nAccept-Language: {h['Accept-Language']}\r\n"
-              cmd = ['ffmpeg', '-y', '-hide_banner', '-nostdin', '-loglevel', 'error',
-                     '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
-                     '-headers', hdrs, '-user_agent', h['User-Agent'],
-                     '-i', u, '-c', 'copy', CANDIDATE]
+          def download_with_ytdlp(url):
               try:
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-              except Exception as e:
-                  print(f"     ffmpeg error: {str(e)[:100]}")
-                  return False
-              if r.returncode != 0:
-                  print(f"     ffmpeg rc={r.returncode} {r.stderr[:150]}")
-                  return False
-              return True
-
-
-          def download_direct(u):
-              for ua_idx in range(2):
-                  h = make_headers(ua_idx, ua_idx > 0)
-                  try:
-                      with requests.get(u, headers=h, timeout=(30, 1800), stream=True, allow_redirects=True) as r:
-                          if r.status_code != 200:
-                              print(f"     status={r.status_code}")
-                              continue
-                          total = int(r.headers.get('content-length', 0) or 0)
-                          ct = r.headers.get('content-type', '')
-                          print(f"     status=200 size={total}B type={ct[:50]}")
-                          if ct.startswith('text/') or 'html' in ct:
-                              return False
-                          if 0 < total < 50000:
-                              return False
-                          with open(CANDIDATE, 'wb') as f:
-                              for chunk in r.iter_content(chunk_size=262144):
-                                  if chunk:
-                                      f.write(chunk)
-                          return True
-                  except Exception as e:
-                      print(f"     error: {str(e)[:100]}")
+                  cmd = ['yt-dlp', '--no-playlist', '-o', 'ytdlp_output.%(ext)s',
+                         '--user-agent', headers['User-Agent'], '--referer', url,
+                         '--max-filesize', '10G', url]
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  if r.returncode == 0:
+                      for f in os.listdir('.'):
+                          if f.startswith('ytdlp_output'):
+                              shutil.move(f, 'raw_input.mp4')
+                              return True
+              except: pass
               return False
 
-
-          def try_candidates(urls):
-              hls = [u for u in urls if HLS_RE.search(u)]
-              rest = [u for u in urls if u not in hls]
-              ordered = [u for u in hls + rest if u not in tried][:40]
-              print(f"[try] {len(ordered)} candidates (HLS: {len([u for u in ordered if u in hls])})")
-              for idx, u in enumerate(ordered, 1):
-                  tried.add(u)
-                  print(f"  [{idx}/{len(ordered)}] {u[:110]}")
-                  ok = download_hls(u) if u in hls else download_direct(u)
-                  if ok and accept_candidate():
-                      print("     OK: accepted")
+          def download_m3u8_with_ffmpeg(m3u8_url):
+              try:
+                  headers_str = '\r\n'.join([f'{k}: {v}' for k, v in headers.items()])
+                  cmd = ['ffmpeg', '-y', '-protocol_whitelist', 'file,http,https,tcp,tls,crypto',
+                         '-headers', headers_str, '-i', m3u8_url, '-c', 'copy', 'raw_input.mp4']
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  if r.returncode == 0 and os.path.exists('raw_input.mp4') and os.path.getsize('raw_input.mp4') > 1000000:
                       return True
-                  if os.path.exists(CANDIDATE):
-                      os.remove(CANDIDATE)
+                  # حذف الملف إذا فشل
+                  if os.path.exists('raw_input.mp4'):
+                      os.remove('raw_input.mp4')
+              except: pass
               return False
 
+          try:
+              print("📄 تحميل الصفحة...")
+              r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
+              r.raise_for_status()
+              html = r.text
 
-          html = fetch_html()
-          urls = []
-          exp, src = 0, ''
-          if html:
-              html = html.replace('\\/', '/')
-              with open('debug_page.html', 'w', encoding='utf-8') as f:
-                  f.write(html)
-              print_indicators(html)
-              exp, src = expected_duration(html)
-              urls = extract_urls(html)
+              exp_dur = extract_expected_duration(html)
+              exp_size = extract_expected_size(html)
+              print(f"⏱️ المدة المتوقعة: {exp_dur} ثانية")
+              print(f"📦 الحجم المتوقع: {exp_size} بايت")
 
-          if exp and src in ('json', 'itemprop'):
-              MIN_DUR = max(61, int(exp * 0.8))
-          print(f"[page] expected duration: {exp}s (source: {src or 'unknown'}) -> minimum accepted: {MIN_DUR}s")
-          print(f"[page] extracted {len(urls)} urls")
-          for u in urls[:15]:
-              print(f"   - {u[:120]}")
+              # محاولة yt-dlp أولاً
+              print("🔄 محاولة yt-dlp...")
+              if download_with_ytdlp(url):
+                  fd = get_video_duration("raw_input.mp4")
+                  fs = get_video_size("raw_input.mp4")
+                  print(f"✅ yt-dlp نجح: 📦 {fs} بايت | ⏱️ {fd} ثانية")
+                  if fd > 60:
+                      print("✅ تم العثور على الفيديو الكامل")
+                      sys.exit(0)
+                  else:
+                      os.remove("raw_input.mp4")
+                      print("⚠️ الفيديو قصير، محاولة طرق أخرى...")
 
-          if try_candidates(urls):
-              sys.exit(0)
+              urls = list(set(extract_all_video_urls(html, url)))
+              if not urls:
+                  print("❌ لم يتم العثور على روابط فيديو")
+                  sys.exit(1)
 
-          if HAS_PLAYWRIGHT:
-              extra = [u for u in capture_with_playwright() if u not in tried]
-              if try_candidates(extra):
-                  sys.exit(0)
+              print(f"🔗 تم العثور على {len(urls)} رابط محتمل")
 
-          print("All methods failed")
-          sys.exit(1)
+              # فصل روابط HLS
+              m3u8_urls = [u for u in urls if 'm3u8' in u.lower()]
+              direct_urls = [u for u in urls if 'm3u8' not in u.lower()]
+
+              # ترتيب حسب الجودة
+              m3u8_urls.sort(key=get_quality_score, reverse=True)
+              direct_urls.sort(key=get_quality_score, reverse=True)
+
+              # محاولة HLS أولاً
+              if m3u8_urls:
+                  print(f"📺 روابط HLS: {len(m3u8_urls)}")
+                  for m3u8_url in m3u8_urls[:5]:
+                      print(f"🔄 محاولة HLS: {m3u8_url[:80]}...")
+                      if download_m3u8_with_ffmpeg(m3u8_url):
+                          fd = get_video_duration("raw_input.mp4")
+                          fs = get_video_size("raw_input.mp4")
+                          print(f"✅ HLS: 📦 {fs} بايت | ⏱️ {fd} ثانية")
+                          if fd > 60:
+                              print("✅ تم العثور على الفيديو الكامل")
+                              sys.exit(0)
+                          else:
+                              os.remove("raw_input.mp4")
+
+              # محاولة الروابط المباشرة
+              best_duration = 0
+              best_file = None
+
+              for i, vu in enumerate(direct_urls[:10]):
+                  if not is_valid_video_url(vu): continue
+                  q = get_quality_score(vu)
+                  print(f"\n🔄 محاولة {i+1}: الجودة {q}/10 | {vu[:80]}...")
+                  tf = f"temp_video_{i}.mp4"
+                  try:
+                      vr = requests.get(vu, headers=headers, timeout=300, stream=True, allow_redirects=True)
+                      if vr.status_code == 200:
+                          ct = vr.headers.get('content-type','')
+                          cl = int(vr.headers.get('content-length',0))
+                          if 'm3u8' in ct:
+                              # HLS stream
+                              print("   📺 HLS stream detected")
+                              if download_m3u8_with_ffmpeg(vu):
+                                  fd = get_video_duration("raw_input.mp4")
+                                  if fd > best_duration and fd > 60:
+                                      best_duration = fd
+                                      print(f"   ✅ HLS: {fd} ثانية")
+                                      break
+                              continue
+                          if 'video' in ct or 'octet-stream' in ct or cl > 5000000:
+                              with open(tf,'wb') as f:
+                                  for ch in vr.iter_content(chunk_size=8192):
+                                      if ch: f.write(ch)
+                              fs = get_video_size(tf)
+                              fd = get_video_duration(tf)
+                              print(f"   📦 {fs} بايت | ⏱️ {fd} ثانية")
+                              
+                              # إذا كانت المدة قريبة من المتوقع، اقبل فوراً
+                              if exp_dur > 0 and fd > 0:
+                                  diff = abs(fd - exp_dur)
+                                  if diff < 60:
+                                      print("   ✅ المدة تطابق المتوقع")
+                                      shutil.copy(tf, "raw_input.mp4")
+                                      if os.path.exists(tf): os.remove(tf)
+                                      sys.exit(0)
+                              
+                              # حفظ أفضل ملف حتى الآن
+                              if fd > best_duration:
+                                  best_duration = fd
+                                  if best_file and os.path.exists(best_file):
+                                      os.remove(best_file)
+                                  best_file = tf
+                                  shutil.copy(tf, "raw_input.mp4")
+                                  if os.path.exists(tf): os.remove(tf)
+                              else:
+                                  if os.path.exists(tf): os.remove(tf)
+                          else:
+                              if os.path.exists(tf): os.remove(tf)
+                      else:
+                          if os.path.exists(tf): os.remove(tf)
+                  except Exception as e:
+                      print(f"   ❌ خطأ: {str(e)[:50]}")
+                      if os.path.exists(tf): os.remove(tf)
+
+              # التحقق النهائي
+              if os.path.exists("raw_input.mp4"):
+                  fs = get_video_size("raw_input.mp4")
+                  fd = get_video_duration("raw_input.mp4")
+                  print(f"\n✅ النهائي: 📦 {fs} بايت | ⏱️ {fd} ثانية")
+                  if fd > 60 and fs > 1000000:
+                      sys.exit(0)
+                  else:
+                      print("⚠️ الفيديو قصير جداً")
+                      sys.exit(1)
+              else:
+                  print("❌ لم يتم العثور على فيديو مناسب")
+                  sys.exit(1)
+          except Exception as e:
+              print(f"❌ خطأ: {str(e)}")
+              sys.exit(1)
           PYEOF
-            if ! "$PYTHON" fetch_page.py; then
-              echo "Basic extraction failed; trying optional browser tooling..."
-              BROWSER_VENV="$HOME/.venvs/fetch-browser"
-              if [ ! -x "$BROWSER_VENV/bin/python" ]; then python3 -m venv "$BROWSER_VENV"; fi
-              "$BROWSER_VENV/bin/python" -c 'import requests, bs4, yt_dlp, curl_cffi, playwright' 2>/dev/null || \
-                "$BROWSER_VENV/bin/python" -m pip install requests beautifulsoup4 yt-dlp curl_cffi playwright
-              if ! find "$HOME/.cache/ms-playwright" -maxdepth 1 -type d -name 'chromium-*' -print -quit 2>/dev/null | grep -q .; then
-                "$BROWSER_VENV/bin/python" -m playwright install --with-deps chromium || \
-                  echo "Playwright browser install failed; try yt-dlp fallback"
-              fi
-              if ! "$BROWSER_VENV/bin/python" fetch_page.py; then
-                echo "Browser extraction failed, falling back to yt-dlp..."
-                rm -f raw_input.mp4 candidate.mp4
-                yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
-                  || { echo 'Download failed' >&2; exit 1; }
-              fi
-            fi
-
           else
-            echo 'No message or URL provided.' >&2; exit 1
+            echo '❌ لا توجد رسالة تيليجرام ولا رابط مباشر.' >&2
+            exit 1
           fi
 
-          [ -s raw_input.mp4 ] || { echo "Download failed" >&2; exit 1; }
-          echo "File size: $(stat -c%s raw_input.mp4) bytes"
-
-      - name: فحص المصدر التفصيلي
-        id: probe_source
-        run: |
-          set -euo pipefail
-          if [ -x "$HOME/codec-build/bin/ffprobe" ]; then
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
-            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          else
-            FFPROBE=ffprobe
+          # التحقق النهائي
+          if [ ! -s raw_input.mp4 ]; then
+            echo "❌ فشل التحميل" >&2
+            exit 1
           fi
+          echo "✅ حجم الملف: $(stat -c%s raw_input.mp4) بايت"
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
+          echo "✅ المدة: $DURATION ثانية"
+          ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1 raw_input.mp4 >/dev/null
 
-          COLOR_SPACE=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=color_space -of csv=p=0 raw_input.mp4 | head -1)
-          COLOR_PRIMARIES=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=color_primaries -of csv=p=0 raw_input.mp4 | head -1)
-          COLOR_TRANSFER=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=color_transfer -of csv=p=0 raw_input.mp4 | head -1)
-          COLOR_RANGE=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=color_range -of csv=p=0 raw_input.mp4 | head -1)
-          PIX_FMT=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=pix_fmt -of csv=p=0 raw_input.mp4 | head -1)
-          SRC_W=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=width -of csv=p=0 raw_input.mp4 | head -1)
-          SRC_H=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=height -of csv=p=0 raw_input.mp4 | head -1)
-          SRC_FPS=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=avg_frame_rate -of csv=p=0 raw_input.mp4 | head -1)
-          SRC_BITRATE=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=bit_rate -of csv=p=0 raw_input.mp4 | head -1)
-
-          is_bt2020=false
-          is_hdr=false
-          is_hlg=false
-
-          case "$COLOR_PRIMARIES" in bt2020|bt2020*) is_bt2020=true ;; esac
-          case "$COLOR_TRANSFER" in
-            smpte2084)     is_hdr=true ;;
-            arib-std-b67)  is_hdr=true; is_hlg=true ;;
-          esac
-
-          BIT_DEPTH=8
-          case "$PIX_FMT" in
-            *p10*|*10le*|*10be*) BIT_DEPTH=10 ;;
-            *p12*|*12le*|*12be*) BIT_DEPTH=12 ;;
-          esac
-
-          echo "Measuring noise level..."
-          NOISE_SCORE=$(ffmpeg -v error -t 10 -i raw_input.mp4 \
-            -vf "split[a][b];[a]settb=1/25[aa];[b]settb=1/25,trim=start_frame=1[bb];[aa][bb]psnr" \
-            -f null - 2>&1 | grep -o 'psnr_avg:[0-9.]*' | tail -1 | cut -d: -f2 || echo "45")
-
-          echo "Inter-frame PSNR noise: $NOISE_SCORE"
-
-          NOISE_CLASS="clean"
-          if awk "BEGIN{exit !($NOISE_SCORE < 40)}"; then
-            NOISE_CLASS="noisy"
-          elif awk "BEGIN{exit !($NOISE_SCORE < 50)}"; then
-            NOISE_CLASS="medium"
-          fi
-
-          echo "=== Source info ==="
-          echo "Resolution: ${SRC_W}x${SRC_H}"
-          echo "Color: $COLOR_PRIMARIES / $COLOR_TRANSFER / $COLOR_SPACE"
-          echo "Range: $COLOR_RANGE"
-          echo "Bit depth: ${BIT_DEPTH}-bit $PIX_FMT"
-          echo "BT.2020: $is_bt2020 | HDR: $is_hdr | HLG: $is_hlg"
-          echo "Noise class: $NOISE_CLASS psnr=$NOISE_SCORE"
-
-          SOURCE_INFO=$(jq -cn \
-            --arg w "$SRC_W" \
-            --arg h "$SRC_H" \
-            --arg fps "$SRC_FPS" \
-            --arg cs "$COLOR_SPACE" \
-            --arg cp "$COLOR_PRIMARIES" \
-            --arg ct "$COLOR_TRANSFER" \
-            --arg cr "$COLOR_RANGE" \
-            --arg pf "$PIX_FMT" \
-            --arg bd "$BIT_DEPTH" \
-            --arg bt2020 "$is_bt2020" \
-            --arg hdr "$is_hdr" \
-            --arg hlg "$is_hlg" \
-            --arg noise "$NOISE_CLASS" \
-            --arg noise_score "$NOISE_SCORE" \
-            '{w:$w,h:$h,fps:$fps,color_space:$cs,color_primaries:$cp,color_transfer:$ct,color_range:$cr,pix_fmt:$pf,bit_depth:$bd,is_bt2020:$bt2020,is_hdr:$hdr,is_hlg:$hlg,noise_class:$noise,noise_score:$noise_score}')
-
-          echo "source_info: $SOURCE_INFO"
-
-          {
-            echo "source_info<<__EOF__"
-            echo "$SOURCE_INFO"
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: ضغط الصوت من المصدر الكامل
-        env:
-          CODEC: ${{ github.event.inputs.codec }}
-        run: |
-          set -euo pipefail
-          if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
-            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          else
-            FFMPEG=ffmpeg; FFPROBE=ffprobe
-          fi
-
-          HAS_AUDIO=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name \
-               -of csv=p=0 raw_input.mp4 | grep -c . || true)
-
-          if [ "${HAS_AUDIO:-0}" -gt 0 ]; then
-            echo "Compressing audio (Opus 14k mono)..."
-            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 \
-              -map 0:a:0 \
-              -vn \
-              -c:a libopus \
-              -b:a 14k \
-              -ac 1 \
-              -ar 48000 \
-              audio_compressed.opus
-            echo "Audio size: $(stat -c%s audio_compressed.opus) bytes"
-          else
-            if [ "$CODEC" = "audio" ]; then
-              echo 'Audio-only requested but source has no audio stream.' >&2
-              exit 1
-            fi
-            echo "No audio in source"
-            : > audio_compressed.opus
-          fi
-
-          SRC_DUR=$("$FFPROBE" -v error -show_entries format=duration \
-            -of csv=p=0 raw_input.mp4 | cut -d. -f1)
-          SAMPLE_START=$(( SRC_DUR / 2 - 45 ))
-          [ "$SAMPLE_START" -lt 0 ] && SAMPLE_START=0
-          SAMPLE_DUR=90
-          if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$SRC_DUR" ]; then
-            SAMPLE_DUR=$(( SRC_DUR - SAMPLE_START ))
-          fi
-          HAS_VIDEO=$($FFPROBE -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 raw_input.mp4 | grep -c . || true)
-          if [ "${HAS_VIDEO:-0}" -gt 0 ] && [ "$SAMPLE_DUR" -gt 0 ]; then
-            echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
-            "$FFMPEG" -hide_banner -nostdin -y \
-              -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
-              -i raw_input.mp4 \
-              -map 0:v:0 -c:v copy \
-              source_sample.mkv
-            test -s source_sample.mkv
-            echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
-          else
-            echo "No usable video sample; continuing without source_sample.mkv"
-          fi
-
-      - name: تقسيم المصدر إلى أجزاء
+      - name: تقسيم المصدر إلى أجزاء MKV مستقلة
         id: segment
         run: |
           set -euo pipefail
           mkdir -p chunks_raw
-
-          if [ "${{ github.event.inputs.codec }}" = "audio" ]; then
-            echo 'chunks=["000"]' >> "$GITHUB_OUTPUT"
-            echo 'chunk_specs={}' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           else
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           fi
+          DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 raw_input.mp4 | cut -d. -f1)
+          test -n "$DURATION"
+          # -map 0 كانت تأخذ كل المسارات كما هي، بما فيها أي مسار "Data" غير
+          # قياسي (مثل مسار فصول HandBrake المصنَّف bin_data رغم اسمه الداخلي
+          # SubtitleHandler). حاوية Matroska ترفض أي مسار Data صراحةً، فيفشل
+          # التقطيع بالكامل. نحدد الفيديو والصوت الأولين فقط — وهو نفس ما
+          # تستخدمه خطوة الترميز لاحقاً أصلاً (الترجمة كانت ستُسقَط هناك بأي حال).
 
-          DURATION_FULL=$("$FFPROBE" -v error -show_entries format=duration \
-            -of csv=p=0 raw_input.mp4)
-          [[ "$DURATION_FULL" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo 'Invalid source duration' >&2; exit 1; }
-          DURATION=${DURATION_FULL%%.*}
-          echo "Duration: $DURATION seconds"
-
+          # عدد القطع متكيّف مع المدة بدل عدد ثابت أو حجم قطعة ثابت:
+          # - تحت SPLIT_THRESHOLD: قطعة واحدة (تكلفة تشغيل job إضافي لا تستحق).
+          # - فوقه: نزيد عدد القطع حتى MAX_PARALLEL (يطابق max-parallel في
+          #   مصفوفة encode-chunks) طالما كل قطعة لا تقل عن MIN_CHUNK_SECONDS
+          #   (يمنع الإفراط في التقطيع لفيديو متوسط الطول ويُبقي تكلفة تشغيل
+          #   كل job الثابتة — apt install، رفع/تنزيل artifact — أصغر نسبياً
+          #   من وقت الترميز الفعلي للقطعة).
+          # - MAX_CHUNK_SECONDS سقف أمان: يمنع أن تكبر القطعة أكثر من اللازم
+          #   لفيديو طويل جداً مع preset بطيء جداً، فتخاطر بتجاوز مهلة الـ6
+          #   ساعات لكل job (لا يُفعَّل عادة إلا لفيديوهات تتجاوز ساعات كثيرة).
           SPLIT_THRESHOLD=300
-          MIN_CHUNK=90
-          MAX_CHUNK=2400
+          MIN_CHUNK_SECONDS=90
+          MAX_CHUNK_SECONDS=2400
           MAX_PARALLEL=10
 
           if [ "$DURATION" -gt "$SPLIT_THRESHOLD" ]; then
-            N=$(( DURATION / MIN_CHUNK ))
-            [ "$N" -gt "$MAX_PARALLEL" ] && N=$MAX_PARALLEL
-            [ "$N" -lt 1 ] && N=1
-            N_SAFETY=$(( (DURATION + MAX_CHUNK - 1) / MAX_CHUNK ))
-            [ "$N_SAFETY" -gt "$N" ] && N=$N_SAFETY
+            N=$(( DURATION / MIN_CHUNK_SECONDS ))
+            (( N > MAX_PARALLEL )) && N=$MAX_PARALLEL
+            (( N < 1 )) && N=1
+            N_SAFETY=$(( (DURATION + MAX_CHUNK_SECONDS - 1) / MAX_CHUNK_SECONDS ))
+            (( N_SAFETY > N )) && N=$N_SAFETY
             SEGMENT_TIME=$(( (DURATION + N - 1) / N ))
-            echo "Splitting into ~${N} chunks, ${SEGMENT_TIME}s each"
-
-            echo "Splitting on existing keyframes; stream-copy cannot force new keyframes"
-
-            "$FFMPEG" -hide_banner -nostdin -y \
-              -i raw_input.mp4 \
-              -map 0:v:0 \
-              -c:v copy \
-              -f segment \
-              -segment_time "$SEGMENT_TIME" \
-              -break_non_keyframes 0 \
-              -reset_timestamps 1 \
-              -avoid_negative_ts make_zero \
-              'chunks_raw/chunk_%03d.mkv'
+            echo "🔀 تقسيم إلى ~${N} قطعة (~${SEGMENT_TIME} ثانية لكل قطعة)"
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -f segment -segment_time "$SEGMENT_TIME" \
+              -reset_timestamps 1 -avoid_negative_ts make_zero 'chunks_raw/chunk_%03d.mkv'
           else
-            "$FFMPEG" -hide_banner -nostdin -y \
-              -i raw_input.mp4 \
-              -map 0:v:0 \
-              -c copy \
-              -avoid_negative_ts make_zero \
-              chunks_raw/chunk_000.mkv
+            "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 -map 0:v:0 -map 0:a:0? -c copy -avoid_negative_ts make_zero chunks_raw/chunk_000.mkv
           fi
-
-          TOTAL_CHUNK_DUR=$(for f in chunks_raw/chunk_*.mkv; do
-            "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$f"
-          done | awk '{sum += $1} END {printf "%.3f", sum}')
-          DIFF=$(awk -v total="$TOTAL_CHUNK_DUR" -v source="$DURATION_FULL" 'BEGIN {d=total-source; if(d<0)d=-d; printf "%.3f",d}')
-          echo "Chunks check: total=${TOTAL_CHUNK_DUR}s source=${DURATION_FULL}s diff=${DIFF}s"
-          if awk -v d="$DIFF" 'BEGIN {exit !(d > 5)}'; then
-            echo 'Duration mismatch after split' >&2; exit 1
-          fi
-
-          find chunks_raw -maxdepth 1 -type f -name 'chunk_*.mkv' -size +0c | sort > /tmp/chunks.txt
+          find chunks_raw -maxdepth 1 -type f -name 'chunk_*.mkv' -size +0c | sort >/tmp/chunks.txt
           test -s /tmp/chunks.txt
           CHUNKS_JSON=$(sed 's#^.*/chunk_##; s#\.mkv$##' /tmp/chunks.txt | jq -R . | jq -s -c .)
           echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
 
-      - name: رفع الأجزاء الخام والصوت وعيّنة المصدر
+      - name: رفع الأجزاء الخام
         uses: actions/upload-artifact@v4
         with:
           name: raw-chunks
-          path: |
-            chunks_raw/
-            audio_compressed.opus
-            source_sample.mkv
+          path: chunks_raw/
           retention-days: 1
           if-no-files-found: error
 
-  # ============================================================
-  # 3. ترميز الأجزاء
-  # ============================================================
   encode-chunks:
     name: ضغط الأجزاء
     needs: [prepare-codec-build, split-video]
-    if: github.event.inputs.codec != 'audio'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
@@ -1082,96 +622,44 @@ jobs:
       matrix:
         chunk: ${{ fromJSON(needs.split-video.outputs.chunks) }}
     steps:
-      - name: تنزيل كود المستودع
-        uses: actions/checkout@v4
-
-      - name: تنزيل الأجزاء الخام
+      - name: تنزيل الجزء الخام
         uses: actions/download-artifact@v4
         with:
           name: raw-chunks
-          path: .
+          path: chunks_raw
 
-      - name: استعادة البناء الموحد
+      - name: استعادة FFmpeg الموحد
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
-          path: |
-            ~/codec-build
-            ~/.cargo
-            ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
 
-      - name: استعادة بيئة المطابقة المكانية
-        if: >-
-          github.event.inputs.codec != 'audio' &&
-          github.event.inputs.encode_mode == 'filters' &&
-          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime')
-        uses: actions/cache@v4
-        with:
-          path: ~/.venvs/spatial
-          key: spatial-match-opencv-ubuntu-24.04-python312-v1
-
-      - name: تجهيز أدوات الترميز المطلوبة فقط
+      - name: تجهيز الاعتماديات
         env:
           CODEC: ${{ github.event.inputs.codec }}
-          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
-          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          if [ "$CODEC" = "audio" ]; then
-            sudo apt-get install -y ffmpeg
-          else
-            sudo apt-get install -y libdav1d7 libopus0
-            if [ "$ENCODE_MODE" = "filters" ] && { [ "$FILTER_PRESET" = "modern-anime" ] || [ "$FILTER_PRESET" = "old-anime" ]; }; then
-              "$HOME/.venvs/spatial/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter")'
-            fi
-          fi
+          sudo apt update
+          sudo apt install -y ffmpeg libdav1d-dev libopus0
           if [ "$CODEC" != "audio" ]; then
-            echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
-            echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-            export PATH="$HOME/codec-build/bin:$PATH"
+            test -x "$HOME/codec-build/bin/ffmpeg"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-            echo "=== Tools check ==="
-            echo "ffmpeg: $("$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1)"
-            echo "SvtAv1EncApp: $("$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || echo 'unavailable')"
+            "$HOME/codec-build/bin/ffmpeg" -hide_banner -encoders | grep -q 'libsvtav1'
+            "$HOME/codec-build/bin/ffmpeg" -hide_banner -decoders | grep -q 'libdav1d'
           fi
 
-      - name: استعادة حزم Homebrew لـ Av1an عند الحاجة فقط
-        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
-        uses: actions/cache@v4
-        with:
-          path: |
-            /home/linuxbrew/.linuxbrew/Cellar/av1an
-            /home/linuxbrew/.linuxbrew/opt/av1an
-            /home/linuxbrew/.linuxbrew/bin/av1an
-            ~/.cache/Homebrew
-          key: av1an-homebrew-ubuntu-24.04-v1
-
-      - name: تثبيت av1an عند الحاجة فقط
-        if: >-
-          github.event.inputs.codec != 'audio' &&
-          github.event.inputs.encode_method == 'auto'
-        run: |
-          set -euo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          if ! av1an --version >/dev/null 2>&1; then brew install av1an; fi
-          echo "av1an: $(av1an --version 2>/dev/null | head -1)"
-
-      - name: ترميز الجزء
+      - name: ضغط الجزء
         env:
           CODEC: ${{ github.event.inputs.codec }}
           PRESET_INPUT: ${{ github.event.inputs.preset }}
           ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
+          FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
           ENCODE_METHOD: ${{ github.event.inputs.encode_method }}
           TARGET_VALUE: ${{ github.event.inputs.target_value }}
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
-          CHUNK_SPECS: ${{ needs.split-video.outputs.chunk_specs }}
           CHUNK_ID: ${{ matrix.chunk }}
-          SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
-          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
         run: |
           set -euo pipefail
           IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
@@ -1183,269 +671,106 @@ jobs:
           if [ "$CODEC" = "audio" ]; then
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           else
-            export PATH="$HOME/codec-build/bin:$PATH"
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
-
-            if [ "$ENCODE_METHOD" = "auto" ]; then
-              export HOMEBREW_NO_AUTO_UPDATE=1
-              eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-            fi
           fi
 
-          case "$CODEC" in av1|audio) ;; *) echo "Unsupported codec" >&2; exit 1 ;; esac
+          printf 'INPUTS: codec=%s preset=%s mode=%s filter=%s method=%s target=%s resolution=%s fps=%s chunk=%s\n' \
+            "$CODEC" "$PRESET_INPUT" "$ENCODE_MODE" "$FILTER_PROFILE" "$ENCODE_METHOD" "$TARGET_VALUE" "$RESOLUTION" "$FRAME_RATE" "$CHUNK_ID"
+
+          case "$CODEC" in av1|audio) ;; *) echo "مرمّز غير مدعوم" >&2; exit 1 ;; esac
           if [ "$RESOLUTION" != "auto" ]; then
-            [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'Invalid resolution' >&2; exit 1; }
+            [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'الدقة غير صحيحة' >&2; exit 1; }
+            # نفرض الأساس العشري صراحةً: بادئة صفر (مثل 0480) تُفسَّر ثمانياً في bash
+            # فيفشل الحساب أو يُعطي رقماً خاطئاً؛ 10#$RESOLUTION يمنع ذلك.
             RESOLUTION=$((10#$RESOLUTION))
-            [ "$RESOLUTION" -ge 144 ] && [ "$RESOLUTION" -le 2160 ] || { echo 'Resolution out of range' >&2; exit 1; }
+            (( RESOLUTION >= 144 && RESOLUTION <= 2160 )) || { echo 'الدقة خارج النطاق' >&2; exit 1; }
           fi
-          [[ "$FRAME_RATE" =~ ^(auto|[0-9]+(\.[0-9]+)?|[0-9]+/[0-9]+)$ ]] || \
-            { echo 'Invalid frame rate' >&2; exit 1; }
-          [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3]|none)$ ]] || { echo 'Invalid preset' >&2; exit 1; }
-          PRESET_ARGS=()
-          AV1AN_PRESET_ARGS=()
-          if [ "$PRESET_INPUT" != "none" ]; then
-            PRESET_ARGS=(-preset "$PRESET_INPUT")
-            AV1AN_PRESET_ARGS=(--preset "$PRESET_INPUT")
-          fi
+          [[ "$FRAME_RATE" =~ ^([1-9]|[1-5][0-9])$ ]] || { echo 'معدل الإطارات غير صحيح' >&2; exit 1; }
 
           if [ "$CODEC" = "audio" ]; then
-            [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'Invalid bitrate' >&2; exit 1; }
-            TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
-            "$FFMPEG" -hide_banner -nostdin -y -i "$IN" \
-              -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 1 "$OUT_FILE"
-            exit 0
-          fi
-
-          if [ "$ENCODE_MODE" = "filters" ]; then
-            case "$FILTER_PRESET" in
-              modern-anime|old-anime|realistic) ;;
-              *) echo 'مع filters اختر modern-anime أو old-anime أو realistic' >&2; exit 1 ;;
-            esac
-          elif [ "$ENCODE_MODE" = "nofilters" ]; then
-            [ "$FILTER_PRESET" = "off" ] || { echo 'مع nofilters يجب اختيار filter_preset=off' >&2; exit 1; }
+            [ "$ENCODE_MODE" = "audio" ] || { echo 'الصوت يتطلب encode_mode=audio' >&2; exit 1; }
+            [ "$ENCODE_METHOD" = "audio" ] || { echo 'الصوت يتطلب encode_method=audio' >&2; exit 1; }
+            [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
+            "$FFMPEG" -hide_banner -nostdin -y -i "$IN" -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 2 "$OUT_FILE"
           else
-            echo "قيمة encode_mode غير مدعومة للفيديو: $ENCODE_MODE" >&2; exit 1
-          fi
+            [[ "$PRESET_INPUT" =~ ^([0-9]|1[0-3])$ ]] || { echo 'AV1 preset غير صحيح' >&2; exit 1; }
+            [ "$ENCODE_METHOD" = "crf" ] || [ "$ENCODE_METHOD" = "twopass" ] || { echo 'طريقة AV1 غير صحيحة' >&2; exit 1; }
+            VIDEO_CODEC=libsvtav1; VIDEO_PRESET="$PRESET_INPUT"
 
-          # ============================================================
-          # المسار العام: بدون فلاتر أو hqdn3d للمحتوى الواقعي
-          # ============================================================
-          echo "Detecting source info..."
-          eval "$(echo "$SOURCE_INFO" | python3 -c "
-          import json, sys
-          try:
-              d = json.load(sys.stdin)
-          except Exception:
-              d = {}
-          print('IS_BT2020='    + str(d.get('is_bt2020','false')).lower())
-          print('IS_HDR='       + str(d.get('is_hdr','false')).lower())
-          print('IS_HLG='       + str(d.get('is_hlg','false')).lower())
-          print('SRC_PRIMARIES='+ d.get('color_primaries','bt709'))
-          print('SRC_TRANSFER=' + d.get('color_transfer','bt709'))
-          print('SRC_COLORSPACE='+ d.get('color_space','bt709'))
-          print('SRC_RANGE='    + d.get('color_range','tv'))
-          ")"
-
-          FILTERS=("setpts=PTS-STARTPTS")
-          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" = "realistic" ]; then
-            FILTERS+=("hqdn3d=1.5:1.5:3:3")
-            echo "المسار الواقعي: تطبيق hqdn3d"
-          elif [ "$ENCODE_MODE" = "nofilters" ]; then
-            echo "المسار دون فلاتر"
-          fi
-
-          if [ "$RESOLUTION" != "auto" ]; then
-            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
-          fi
-
-          COLOR_ARGS=()
-          OUT_PIX_FMT="yuv420p10le"
-
-          if [ "$IS_HDR" = "true" ] && [ "$IS_HLG" = "true" ]; then
-            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc arib-std-b67)
-          elif [ "$IS_HDR" = "true" ]; then
-            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc smpte2084)
-          elif [ "$IS_BT2020" = "true" ]; then
-            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc "$SRC_TRANSFER")
-          fi
-
-          FILTERS+=("format=${OUT_PIX_FMT}")
-          VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
-          echo "Filter chain: $VF_CHAIN"
-
-          SRC_FPS_RAW=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=avg_frame_rate -of csv=p=0 "$IN")
-
-          if [ "$FRAME_RATE" = "auto" ]; then
-            OUT_FPS="$SRC_FPS_RAW"
-            echo "FPS auto source=$SRC_FPS_RAW"
-          else
-            case "$FRAME_RATE" in
-              23.976|23.97) TARGET_FPS_FRAC="24000/1001" ;;
-              29.97)        TARGET_FPS_FRAC="30000/1001" ;;
-              59.94)        TARGET_FPS_FRAC="60000/1001" ;;
-              47.952)       TARGET_FPS_FRAC="48000/1001" ;;
-              */*)          TARGET_FPS_FRAC="$FRAME_RATE" ;;
-              *)            TARGET_FPS_FRAC="${FRAME_RATE%.*}/1" ;;
+            case "$ENCODE_MODE" in
+              nofilters) [ "$FILTER_PROFILE" = "none" ] || { echo 'بدون فلاتر يتطلب none' >&2; exit 1; };;
+              filters) [[ "$FILTER_PROFILE" = "anime" || "$FILTER_PROFILE" = "realistic" ]] || { echo 'الفلاتر غير صحيحة' >&2; exit 1; };;
+              *) echo 'encode_mode غير صحيح' >&2; exit 1;;
             esac
-            SRC_FPS_VAL=$(awk -v f="$SRC_FPS_RAW" \
-              'BEGIN{split(f,a,"/"); print (a[2]>0)?a[1]/a[2]:0}')
-            CAP_FPS_VAL=$(awk -v f="$TARGET_FPS_FRAC" \
-              'BEGIN{split(f,a,"/"); print (a[2]>0)?a[1]/a[2]:a[1]}')
 
-            USE_SRC=$(awk -v s="$SRC_FPS_VAL" -v c="$CAP_FPS_VAL" \
-              'BEGIN{print (s>0 && s <= c+0.01)?1:0}')
-            if [ "$USE_SRC" = "1" ]; then
-              OUT_FPS="$SRC_FPS_RAW"
-              echo "FPS keep source=$SRC_FPS_RAW target=$TARGET_FPS_FRAC"
-            else
-              OUT_FPS="$TARGET_FPS_FRAC"
-              echo "FPS downscale from $SRC_FPS_RAW to $OUT_FPS"
+            INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$IN")
+            DECODER_ARGS=()
+            if [ "$INPUT_CODEC" = "av1" ]; then DECODER_ARGS=(-c:v libdav1d); fi
+
+            FILTERS=("setpts=PTS-STARTPTS")
+            if [ "$RESOLUTION" != "auto" ]; then
+              FILTERS+=("scale=-2:${RESOLUTION}:flags=lanczos")
             fi
-          fi
-
-          if [ "$ENCODE_MODE" = "filters" ] && { [ "$FILTER_PRESET" = "modern-anime" ] || [ "$FILTER_PRESET" = "old-anime" ]; }; then
-            [ "$ENCODE_METHOD" = "crf" ] || { echo 'مسارا الأنمي الحديث والقديم يدعمان CRF فقط حالياً' >&2; exit 1; }
-            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
-            [ "$IS_HDR" != "true" ] || { echo 'مسار المطابقة بدليل 240px مخصص لمصدر SDR؛ اختر الواقعي أو بدون فلاتر لمصدر HDR' >&2; exit 1; }
-            SPATIAL_PY="$HOME/.venvs/spatial/bin/python"
-            PROFILE=modern
-            GUIDE_HEIGHT=240
-            LUT_ARGS=()
-            if [ "$FILTER_PRESET" = "old-anime" ]; then
-              PROFILE=old
-              test -s grade_blend_warm_start16.cube || { echo 'ملف grade_blend_warm_start16.cube غير موجود في جذر المستودع' >&2; exit 1; }
-              LUT_ARGS=(--lut3d grade_blend_warm_start16.cube)
-              echo 'مسار الأنمي القديم: تصحيح الأصل بـLUT ثم المطابقة بدليل مكبّر ارتفاعه 240px'
-            else
-              echo 'مسار الأنمي الحديث: دليل مكبّر ارتفاعه 240px ثم المطابقة مع الأصل دون LUT'
+            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
+              FILTERS+=("hqdn3d=1.5:1.0:1.5:1.0"); FILTERS+=("deband=1thr=0.02:2thr=0.02:3thr=0.02:range=16")
+            elif [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "realistic" ]; then
+              FILTERS+=("hqdn3d=0.5:0.5:0.5:0.5")
             fi
-            RES_ARGS=()
-            [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
-            COLOR_INFO_ARGS=(--color-space "$SRC_COLORSPACE" --color-primaries "$SRC_PRIMARIES" --color-trc "$SRC_TRANSFER" --color-range "$SRC_RANGE")
-            "$SPATIAL_PY" spatial_match_stream.py "$IN" "$OUT_FILE" \
-              --profile "$PROFILE" --crf "$TARGET_VALUE" --preset "${PRESET_INPUT/none/4}" \
-              --fps "$OUT_FPS" --guide-height "$GUIDE_HEIGHT" "${RES_ARGS[@]}" "${LUT_ARGS[@]}" "${COLOR_INFO_ARGS[@]}"
-            test -s "$OUT_FILE" || { echo 'ملف ناتج المطابقة المكانية فارغ' >&2; exit 1; }
-            echo "تمت معالجة الجزء $CHUNK_ID؛ الحجم $(stat -c%s "$OUT_FILE") بايت"
-            exit 0
-          fi
+            FILTERS+=("format=yuv420p10le")
+            VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
 
-          NPROC=$(nproc)
-          SVT_PARAMS="-svtav1-params tune=0:enable-qm=1:qm-min=0"
-          echo "Workers: $NPROC | SVT params: $SVT_PARAMS"
+            # جودة الصوت كانت ثابتة عند 32k بغضّ النظر عن دقة/جودة الفيديو المختارة،
+            # وهذا يعطي صوتاً غير واضح (خصوصاً مع موسيقى أو مؤثرات) ولا يتناسق مع
+            # باقي الإعدادات. نربطها الآن بمستوى الدقة المختار، ونحافظ على القناة
+            # الأحادية لو كان المصدر أحادياً أصلاً بدل إهدار البت رايت على تكرار قناة.
+            if [ "$RESOLUTION" = "auto" ] || (( RESOLUTION >= 1000 )); then
+              AUDIO_BITRATE="128k"
+            elif (( RESOLUTION >= 720 )); then
+              AUDIO_BITRATE="96k"
+            elif (( RESOLUTION >= 480 )); then
+              AUDIO_BITRATE="80k"
+            else
+              AUDIO_BITRATE="64k"
+            fi
+            AUDIO_CHANNELS=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$IN" 2>/dev/null || true)
+            if [ "$AUDIO_CHANNELS" = "1" ]; then
+              AC_ARGS=(-ac 1)
+            else
+              AC_ARGS=(-ac 2)
+            fi
 
-          case "$ENCODE_METHOD" in
-            crf)
-              [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
-                { echo 'Invalid CRF range 0-63' >&2; exit 1; }
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
-                -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
-                -c:v libsvtav1 \
-                "${PRESET_ARGS[@]}" \
-                -crf "$TARGET_VALUE" \
-                -g 240 \
-                "${COLOR_ARGS[@]}" \
-                $SVT_PARAMS \
-                -an \
-                "$OUT_FILE"
-              CRF_USED="$TARGET_VALUE"
-              ;;
-
-            twopass)
-              [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || \
-                { echo 'Invalid bitrate' >&2; exit 1; }
-              TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
+            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'AV1 CRF غير صحيح' >&2; exit 1; }
+            SVT_PARAMS='-svtav1-params tune=0:enable-qm=1:qm-min=0:keyint=2s:enable-variance-boost=1:variance-boost-strength=2:film-grain=6:film-grain-denoise=0'
+            if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PROFILE" = "anime" ]; then
+              SVT_PARAMS='-svtav1-params tune=0:enable-qm=1:qm-min=0:enable-overlays=1:film-grain=6:film-grain-denoise=0'
+            fi
+            if [ "$ENCODE_METHOD" = "crf" ]; then
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -crf "$TARGET_VALUE" -g 48 $SVT_PARAMS \
+                -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
+            else
+              [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'معدل بت غير صحيح' >&2; exit 1; }
               PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 48 -pass 1 -passlogfile "$PASSLOG" -an -f null /dev/null
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none "${DECODER_ARGS[@]}" -y -i "$IN" -vf "$VF_CHAIN" -r "$FRAME_RATE" -fps_mode cfr \
+                -c:v "$VIDEO_CODEC" -preset "$VIDEO_PRESET" -b:v "$TARGET_VALUE" -g 48 -pass 2 -passlogfile "$PASSLOG" $SVT_PARAMS \
+                -af 'asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0' -map 0:v:0 -map 0:a:0? -c:a libopus -b:a "$AUDIO_BITRATE" "${AC_ARGS[@]}" -shortest "$OUT_FILE"
+            fi
+          fi
 
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
-                -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
-                -c:v libsvtav1 \
-                "${PRESET_ARGS[@]}" \
-                -b:v "$TARGET_VALUE" \
-                -g 240 \
-                "${COLOR_ARGS[@]}" \
-                $SVT_PARAMS \
-                -pass 1 -passlogfile "$PASSLOG" \
-                -an -f null /dev/null
-
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
-                -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
-                -c:v libsvtav1 \
-                "${PRESET_ARGS[@]}" \
-                -b:v "$TARGET_VALUE" \
-                -g 240 \
-                "${COLOR_ARGS[@]}" \
-                $SVT_PARAMS \
-                -pass 2 -passlogfile "$PASSLOG" \
-                -an \
-                "$OUT_FILE"
-              CRF_USED="twopass-${TARGET_VALUE}"
-              ;;
-
-            auto)
-              [[ "$TARGET_VALUE" =~ ^([5-9][0-9])$ ]] || \
-                { echo 'VMAF target must be 50-99' >&2; exit 1; }
-              VMAF_TARGET="$TARGET_VALUE"
-
-              FREE_GB=$(df -BG . | awk 'NR==2{gsub("G",""); print $4}')
-              echo "Free space: ${FREE_GB}GB"
-              if [ "$FREE_GB" -lt 5 ]; then
-                echo "Not enough space for ffv1 intermediate: ${FREE_GB}GB" >&2
-                echo "Use crf or twopass mode instead of auto" >&2
-                exit 1
-              fi
-
-              PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
-              "$FFMPEG" -hide_banner -nostdin -y \
-                -i "$IN" \
-                -map 0:v:0 \
-                -vf "$VF_CHAIN" \
-                -r "$OUT_FPS" -fps_mode cfr \
-                -c:v ffv1 \
-                "$PRE_FILE"
-              test -s "$PRE_FILE"
-
-              RAM_MB=$(awk '/MemAvailable/{print int($2/1024*0.8)}' /proc/meminfo)
-
-              av1an \
-                -i "$PRE_FILE" \
-                -o "$OUT_FILE" \
-                -e svt-av1 \
-                -v "${AV1AN_PRESET_ARGS[*]} --crf 30 --tune 0 --enable-qm 1" \
-                --target-quality "$VMAF_TARGET" \
-                --probes 4 \
-                --probing-rate 4 \
-                --min-q 20 \
-                --max-q 60 \
-                -w "$NPROC" \
-                --sc-method standard \
-                --min-scene-len 24 \
-                --extra-split 240 \
-                --chunk-method segment \
-                --audio-params "-c:a copy" \
-                --max-ram "${RAM_MB}M" \
-                --ffmpeg-location "$HOME/codec-build/bin"
-
-              rm -f "$PRE_FILE"
-              CRF_USED="Av1an-VMAF${VMAF_TARGET}"
-              ;;
-          esac
-
-          test -s "$OUT_FILE" || { echo 'Empty output file' >&2; exit 1; }
-
-          OUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | head -1)
-          [ "$OUT_CODEC" = "av1" ] || { echo "Output is not AV1: $OUT_CODEC" >&2; exit 1; }
-
-          IN_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$IN")
-          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
-          echo "Duration: in=$IN_DUR out=$OUT_DUR | crf=${CRF_USED:-NA}"
+          test -s "$OUT_FILE"
+          if [ "$CODEC" != "audio" ]; then
+            "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | grep -Eq '^av1$' || { echo 'خطأ: لا يوجد فيديو AV1' >&2; exit 1; }
+          fi
+          HAS_INPUT_AUDIO=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$IN" | head -n 1 || true)
+          if [ "$CODEC" = "audio" ] || [ -n "$HAS_INPUT_AUDIO" ]; then
+            "$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$OUT_FILE" | grep -q 'opus' || { echo 'خطأ: لا يوجد صوت Opus' >&2; exit 1; }
+          fi
+          IN_DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$IN")
+          OUT_DURATION=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
+          printf 'DURATION CHECK: input=%s output=%s\n' "$IN_DURATION" "$OUT_DURATION"
 
       - name: رفع الجزء المضغوط
         uses: actions/upload-artifact@v4
@@ -1455,108 +780,53 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # ============================================================
-  # 4. دمج الناتج وإرساله
-  # ============================================================
   merge-and-send:
     name: دمج الناتج وإرساله
     needs: [prepare-codec-build, split-video, encode-chunks]
-    if: >-
-      ${{ always() && (needs.prepare-codec-build.result == 'success' || (github.event.inputs.codec == 'audio' && needs.prepare-codec-build.result == 'skipped')) && needs.split-video.result == 'success' &&
-          (needs.encode-chunks.result == 'success' || (github.event.inputs.codec == 'audio' && needs.encode-chunks.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
-      - name: استعادة FFmpeg للدمج
+      - name: استعادة FFmpeg الموحد للدمج
         if: github.event.inputs.codec != 'audio'
         uses: actions/cache@v4
         with:
-          path: |
-            ~/codec-build
-            ~/.cargo
-            ~/.rustup
-          key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
+          path: ~/codec-build
+          key: codec-universal-av1-vvc-dav1d-ubuntu-24.04-v4
 
-      - name: استعادة بيئة Telegram Python
-        uses: actions/cache@v4
-        with:
-          path: ~/.venvs/telegram
-          key: telegram-telethon-ubuntu-24.04-python312-v1
-
-      - name: تجهيز أدوات الدمج المطلوبة فقط
-        env:
-          CODEC: ${{ github.event.inputs.codec }}
+      - name: تجهيز أدوات الدمج والإرسال
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          if [ "$CODEC" = "audio" ]; then
-            sudo apt-get install -y ffmpeg
-          else
-            sudo apt-get install -y libdav1d7 libopus0
-            echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
-            echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          fi
-          if [ ! -x "$HOME/.venvs/telegram/bin/python" ]; then python3 -m venv "$HOME/.venvs/telegram"; fi
-          "$HOME/.venvs/telegram/bin/python" -c 'import telethon' 2>/dev/null || \
-            "$HOME/.venvs/telegram/bin/python" -m pip install telethon
+          sudo apt update
+          sudo apt install -y ffmpeg libdav1d-dev libopus0
+          python3 -m pip install --user telethon
 
-      - name: تنزيل الأجزاء المضغوطة
-        if: github.event.inputs.codec != 'audio'
+      - name: تنزيل جميع الأجزاء المضغوطة
         uses: actions/download-artifact@v4
         with:
           pattern: encoded-*
           path: all_encoded
           merge-multiple: true
 
-      - name: تنزيل الصوت وعيّنة المصدر
-        uses: actions/download-artifact@v4
-        with:
-          name: raw-chunks
-          path: audio_dl
-
-      - name: إنشاء الناتج النهائي (فيديو أو صوت)
+      - name: دمج الأجزاء
         env:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           if [ "$CODEC" = "audio" ]; then
-            AUDIO_FILE="audio_dl/audio_compressed.opus"
-            [ -s "$AUDIO_FILE" ] || { echo 'Compressed audio file is missing or empty' >&2; exit 1; }
-            cp "$AUDIO_FILE" output.opus
-            OUTPUT_FILE=output.opus
-            FFPROBE=ffprobe
+            FFMPEG=ffmpeg; FFPROBE=ffprobe
           else
-            export PATH="$HOME/codec-build/bin:$PATH"
+            FFMPEG="$HOME/codec-build/bin/ffmpeg"; FFPROBE="$HOME/codec-build/bin/ffprobe"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
-            cd all_encoded
-            find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
-            test -s /tmp/encoded_files.txt
-            sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
-            "$FFMPEG" -hide_banner -nostdin -y \
-              -f concat -safe 0 -i concat_list.txt \
-              -map 0:v -c:v copy "../video_only.mkv"
-            test -s "../video_only.mkv"
-            cd ..
-            AUDIO_FILE="audio_dl/audio_compressed.opus"
-            if [ -s "$AUDIO_FILE" ]; then
-              "$FFMPEG" -hide_banner -nostdin -y \
-                -i video_only.mkv -i "$AUDIO_FILE" \
-                -map 0:v -map 1:a -c:v copy -c:a copy output.mkv
-            else
-              echo "No audio, video-only output"
-              cp video_only.mkv output.mkv
-            fi
-            OUTPUT_FILE=output.mkv
-            "$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" | \
-              grep -Eq '^av1$' || { echo 'Merge lost AV1 video' >&2; exit 1; }
           fi
-          test -s "$OUTPUT_FILE"
-          echo "OUTPUT_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
-          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE" | cut -d. -f1)
-          echo "Final duration: ${OUT_DUR}s"
+          cd all_encoded
+          find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
+          test -s /tmp/encoded_files.txt
+          sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
+          "$FFMPEG" -hide_banner -nostdin -y -f concat -safe 0 -i concat_list.txt -map 0 -c copy "../output.mkv"
+          test -s "../output.mkv"
+          if [ "$CODEC" != "audio" ]; then
+            "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "../output.mkv" | grep -Eq '^av1$' || { echo 'الدمج فقد الفيديو' >&2; exit 1; }
+          fi
 
       - name: استخراج معلومات الناتج
         id: videoinfo
@@ -1564,79 +834,35 @@ jobs:
           CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
-          DURATION_SEC=$(ffprobe -v error -show_entries format=duration \
-            -of csv=p=0 "$OUTPUT_FILE" | cut -d. -f1)
-          H=$((DURATION_SEC/3600)); M=$(((DURATION_SEC%3600)/60)); S=$((DURATION_SEC%60))
-          echo "duration_fmt=$(printf '%02d:%02d:%02d' $H $M $S)" >> "$GITHUB_OUTPUT"
-
+          DURATION_SEC=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "output.mkv" | cut -d. -f1)
+          H=$((DURATION_SEC / 3600)); M=$(((DURATION_SEC % 3600) / 60)); S=$((DURATION_SEC % 60))
+          echo "duration_fmt=$(printf '%02d:%02d:%02d' "$H" "$M" "$S")" >> "$GITHUB_OUTPUT"
           if [ "$CODEC" = "audio" ]; then
-            echo 'actual_res=audio only' >> "$GITHUB_OUTPUT"
-            echo 'video_info=audio' >> "$GITHUB_OUTPUT"
+            echo 'actual_res=صوت فقط' >> "$GITHUB_OUTPUT"
           else
-            ACTUAL_RES=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=width,height -of csv=s=x:p=0 "$OUTPUT_FILE")
+            ACTUAL_RES=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
             echo "actual_res=$ACTUAL_RES" >> "$GITHUB_OUTPUT"
-
-            V_CODEC=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" | head -1)
-            V_PIX=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=pix_fmt -of csv=p=0 "$OUTPUT_FILE" | head -1)
-            V_FPS=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=avg_frame_rate -of csv=p=0 "$OUTPUT_FILE" | head -1)
-            echo "video_info=${V_CODEC} ${V_PIX} ${V_FPS}" >> "$GITHUB_OUTPUT"
           fi
-
-          A_CODEC=$(ffprobe -v error -select_streams a:0 \
-            -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null | head -1 || true)
-          if [ -z "$A_CODEC" ]; then
-            echo "actual_abr=no audio" >> "$GITHUB_OUTPUT"
+          # نقيس بت‑ريت الصوت الفعلي من الناتج المدموج (وليس من قيمة مفترضة)
+          # حتى تكون الرسالة النهائية للمستخدم مطابقة لما حدث فعلاً، لا تخميناً.
+          ABR_RAW=$(ffprobe -v error -select_streams a:0 -show_entries stream=bit_rate -of csv=p=0 "output.mkv" 2>/dev/null || true)
+          if [[ "$ABR_RAW" =~ ^[0-9]+$ ]]; then
+            echo "actual_abr=$((ABR_RAW / 1000)) kbps" >> "$GITHUB_OUTPUT"
           else
-            A_CH=$(ffprobe -v error -select_streams a:0 \
-              -show_entries stream=channels -of csv=p=0 "$OUTPUT_FILE" | head -1)
-            A_BR=$(ffprobe -v error -select_streams a:0 \
-              -show_entries stream=bit_rate -of csv=p=0 "$OUTPUT_FILE" | head -1)
-            A_LABEL="$A_CODEC"
-            if [ "$A_CH" = "1" ]; then
-              A_LABEL="$A_LABEL mono"
-            else
-              A_LABEL="$A_LABEL stereo"
-            fi
-            if [[ "$A_BR" =~ ^[0-9]+$ ]]; then
-              A_LABEL="$A_LABEL ~$((A_BR/1000))k"
-            elif [ "$A_CH" = "1" ] && [ -s "audio_dl/audio_compressed.opus" ]; then
-              A_LABEL="$A_LABEL ~14k"
-            fi
-            echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
+            echo "actual_abr=بلا صوت" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: إعداد الاسم المخصص الحقيقي للملف
+      - name: إعداد الاسم النهائي
         id: naming
         env:
           FILENAME: ${{ github.event.inputs.filename }}
-          CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
-          SAFE_NAME=$(python3 -c '
-          import os, unicodedata, re
-          s = os.environ.get("FILENAME", "")
-          s = unicodedata.normalize("NFC", s)
-          s = re.sub(r"[\\/*?\"<>|:]", "_", s)
-          s = " ".join(s.split())
-          s = re.sub(r"\.(?:mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)$", "", s, flags=re.I)
-          print(s[:80])
-          ')
+          sanitize() { printf '%s' "$1" | head -n1 | tr -d '\r' | sed 's#[/\\:*?"<>|]# #g; s/  */ /g; s/^ *//; s/ *$//'; }
+          SAFE_FILENAME=$(sanitize "$FILENAME")
+          echo "final_name=${SAFE_FILENAME:-video}" >> "$GITHUB_OUTPUT"
 
-          if [ -z "$SAFE_NAME" ]; then
-            echo "يجب إدخال اسم الملف النهائي." >&2
-            exit 1
-          fi
-
-          EXT=mkv
-          [ "$CODEC" = "audio" ] && EXT=opus
-          echo "final_file_name=${SAFE_NAME}.${EXT}" >> "$GITHUB_OUTPUT"
-          echo "Display Name: ${SAFE_NAME}.${EXT}"
-
-      - name: رفع الناتج وإشعار المستخدم بالاسم الحقيقي
+      - name: رفع الناتج وإشعار المستخدم
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -1644,82 +870,35 @@ jobs:
           TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
-          FINAL_FILE_NAME: ${{ steps.naming.outputs.final_file_name }}
+          FINAL_NAME: ${{ steps.naming.outputs.final_name }}
           DURATION_FMT: ${{ steps.videoinfo.outputs.duration_fmt }}
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
-          VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
-          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
           CODEC: ${{ github.event.inputs.codec }}
-          FRAME_WARNING: ${{ env.FRAME_WARNING }}
-          IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
-          NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
+          FILTER_PROFILE: ${{ github.event.inputs.filter_profile }}
         run: |
           set -euo pipefail
-          mv "$OUTPUT_FILE" "$FINAL_FILE_NAME"
-          FILE_SIZE=$(stat -c%s "$FINAL_FILE_NAME")
-          SIZE_MB=$(awk -v s="$FILE_SIZE" 'BEGIN{printf "%.1f",s/1048576}')
-
-          COLOR_TAG=""
-          [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | 🎨 BT.2020"
-
-          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
-            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
-            "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
-            "$ENCODE_MODE" "$NOISE_CLASS" "$COLOR_TAG")
-          if [ -n "$FRAME_WARNING" ]; then
-            CAPTION="${CAPTION}"$'\n'"${FRAME_WARNING}"
-          fi
-          export FINAL_FILE_NAME CAPTION
-
-          "$HOME/.venvs/telegram/bin/python" <<'PYEOF'
-          import asyncio, os, sys
+          UPLOAD_FILE="${FINAL_NAME}.mkv"
+          mv "output.mkv" "$UPLOAD_FILE"
+          FILE_SIZE=$(stat -c%s "$UPLOAD_FILE")
+          SIZE_MB=$(awk -v size="$FILE_SIZE" 'BEGIN {printf "%.1f", size / 1048576}')
+          CAPTION=$(printf '🎬 %s\n📦 %s MB\n📐 %s\n🔊 %s\n⏱️ %s\n🎞️ %s\n⚙️ فلاتر: %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$DURATION_FMT" "$CODEC" "$FILTER_PROFILE")
+          export UPLOAD_FILE CAPTION
+          python3 <<'PYEOF'
+          import asyncio, os
           from telethon import TelegramClient
           from telethon.sessions import StringSession
-
           async def main():
-              channel = os.environ.get("TG_CHANNEL_ID", "").strip()
-              if not channel:
-                  print("TG_CHANNEL_ID غير مضبوط في الأسرار", file=sys.stderr)
-                  return 1
-              client = TelegramClient(
-                  StringSession(os.environ["TG_SESSION"]),
-                  int(os.environ["TG_API_ID"]),
-                  os.environ["TG_API_HASH"])
-              await client.connect()
-              try:
-                  if not await client.is_user_authorized():
-                      print("TG_SESSION غير صالحة أو منتهية، أعد توليدها", file=sys.stderr)
-                      return 1
-                  path = os.environ["FINAL_FILE_NAME"]
-                  size = os.path.getsize(path)
-                  if size > 2 * 1024 ** 3:
-                      print(f"الملف أكبر من حد تيليجرام: {size} bytes", file=sys.stderr)
-                      return 1
-                  await client.send_file(int(channel), path,
-                                         caption=os.environ["CAPTION"],
-                                         force_document=True)
-                  print("sent to channel")
-                  return 0
-              finally:
-                  await client.disconnect()
-
-          sys.exit(asyncio.run(main()))
+              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+              await client.start()
+              async with client:
+                  await client.send_file(int(os.environ["TG_CHANNEL_ID"]), os.environ["UPLOAD_FILE"], caption=os.environ["CAPTION"], force_document=True)
+          asyncio.run(main())
           PYEOF
+          MESSAGE=$(printf '✅ تم الضغط بنجاح!\n\n🎬 %s\n📦 %s MB\n📐 %s\n⏱️ %s' "$FINAL_NAME" "$SIZE_MB" "$ACTUAL_RES" "$DURATION_FMT")
+          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MESSAGE}"
 
-          MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s' \
-            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$DURATION_FMT")
-          if [ -n "$FRAME_WARNING" ]; then
-            MESSAGE="${MESSAGE}"$'\n'"${FRAME_WARNING}"
-          fi
-          curl --fail --silent --show-error \
-            -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}"
-
-  # ============================================================
-  # 5. إشعار الفشل
-  # ============================================================
   notify-failure:
     name: إشعار فشل العملية
     needs: [prepare-codec-build, split-video, encode-chunks, merge-and-send]
@@ -1732,16 +911,15 @@ jobs:
       ) }}
     runs-on: ubuntu-24.04
     steps:
-      - name: إرسال رابط السجل
+      - name: إرسال رابط سجل الفشل
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
+          set -euo pipefail
           RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          MESSAGE=$(printf '❌ فشلت عملية الضغط.\n\n📋 السجل:\n%s' "$RUN_URL")
-          curl --fail --silent --show-error \
-            -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${MESSAGE}"
+          MESSAGE=$(printf '❌ فشلت عملية الضغط.\n\n📋 افتح السجل لمعرفة المرحلة والخطأ:\n%s' "$RUN_URL")
+          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MESSAGE}"
