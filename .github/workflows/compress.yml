@@ -63,10 +63,6 @@ on:
         type: choice
         options: ['off', 'modern-anime', 'old-anime', 'realistic']
 
-concurrency:
-  group: video-compression-${{ github.event.inputs.chat_id }}
-  cancel-in-progress: false
-
 permissions:
   contents: read
 
@@ -720,7 +716,6 @@ jobs:
         id: classify_source
         env:
           CODEC: ${{ github.event.inputs.codec }}
-          SOURCE_NAME: ${{ github.event.inputs.filename }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -730,8 +725,6 @@ jobs:
           if not p.is_file() or p.stat().st_size == 0:
               raise SystemExit("Downloaded input is empty")
           sig = p.open("rb").read(16)
-          name = os.environ.get("SOURCE_NAME", "").lower()
-          archive_ext = (".zip", ".rar", ".7z", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".gz", ".bz2", ".xz", ".zst", ".iso")
           is_archive = (
               zipfile.is_zipfile(p) or tarfile.is_tarfile(p)
               or sig.startswith(b"7z\xbc\xaf\x27\x1c")
@@ -740,8 +733,17 @@ jobs:
               or sig.startswith(b"BZh")
               or sig.startswith(b"\xfd7zXZ\x00")
               or sig.startswith(b"\x28\xb5\x2f\xfd")
-              or name.endswith(archive_ext)
           )
+          if not is_archive:
+              # The bot's output filename may omit the source extension; ask libarchive
+              # to identify/list the container by content before treating it as media.
+              try:
+                  listed = subprocess.run(
+                      ["bsdtar", "-tf", str(p)], capture_output=True, text=True, timeout=30
+                  )
+                  is_archive = listed.returncode == 0
+              except (FileNotFoundError, subprocess.TimeoutExpired):
+                  pass
           codec = os.environ.get("CODEC", "av1")
           if is_archive:
               if codec != "audio":
