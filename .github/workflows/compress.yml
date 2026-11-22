@@ -744,18 +744,28 @@ jobs:
                   is_archive = listed.returncode == 0
               except (FileNotFoundError, subprocess.TimeoutExpired):
                   pass
+          probe_path = p
+          if not is_archive:
+              # Downloads are stored as raw_input.mp4 even when they are MP3/M4A.
+              # FFprobe can trust that misleading suffix and reject a valid audio file.
+              probe_path = Path("ffprobe_input.bin")
+              try:
+                  probe_path.unlink(missing_ok=True)
+                  os.link(p, probe_path)
+              except OSError:
+                  probe_path = p
           codec = os.environ.get("CODEC", "av1")
           if is_archive:
               if codec != "audio":
                   raise SystemExit("This input is an archive. Choose Audio-only in the bot; archives are handled as audio batches.")
               kind = "audio_archive"
           elif codec == "audio":
-              probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(p)], capture_output=True, text=True)
+              probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(probe_path)], capture_output=True, text=True)
               if probe.returncode != 0 or not probe.stdout.strip():
-                  raise SystemExit("Audio-only mode requires a media file with at least one audio stream.")
+                  raise SystemExit(f"Audio-only mode requires a media file with at least one audio stream; ffprobe rc={probe.returncode}: {(probe.stderr or probe.stdout).strip()[-500:]}")
               kind = "audio_single"
           else:
-              probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(p)], capture_output=True, text=True)
+              probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(probe_path)], capture_output=True, text=True)
               if probe.returncode != 0 or not probe.stdout.strip():
                   raise SystemExit("AV1 mode requires a video stream. For audio files or audio archives, choose Audio-only.")
               kind = "video"
