@@ -16,8 +16,7 @@ on:
         required: true
       filename:
         description: 'الاسم النهائي، من دون امتداد.'
-        required: false
-        default: ''
+        required: true
       codec:
         description: 'المرمّز: av1 للفيديو أو audio للصوت فقط.'
         required: true
@@ -27,13 +26,13 @@ on:
       preset:
         description: 'AV1: رقم من 0 إلى 13. يُهمَل عند اختيار audio.'
         required: true
-        default: '6'
+        default: '4'
         type: choice
         options: ['none', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13']
       encode_mode:
-        description: 'وضع الفلاتر: filters مع فلاتر، nofilters بدونها، audio للصوت.'
+        description: 'filters لاختيار مسار التنعيم أو الواقعي، nofilters دون فلاتر، audio للصوت فقط.'
         required: true
-        default: 'filters'
+        default: 'nofilters'
         type: choice
         options: ['filters', 'nofilters', 'audio']
       encode_method:
@@ -43,9 +42,9 @@ on:
         type: choice
         options: ['crf', 'twopass', 'auto', 'audio']
       target_value:
-        description: 'CRF للأنمي، أو معدل بت للصوت/Two-Pass مثل 14k أو 500k، أو هدف VMAF مع auto.'
+        description: 'CRF من 0 إلى 63، أو معدل بت مثل 500k، أو هدف VMAF من 50 إلى 99 مع auto.'
         required: true
-        default: '38'
+        default: '48'
       resolution:
         description: 'الارتفاع النهائي مثل 480 أو 720 أو 1080، أو auto للإبقاء على دقة المصدر.'
         required: true
@@ -55,13 +54,17 @@ on:
         required: true
         default: '23.976'
 
-      # ============ تشكيلات الفلاتر الجاهزة (مطابقة للبوت) ============
       filter_preset:
-        description: 'مسار الفلترة الذي يرسله بوت تيليجرام.'
+        description: 'عند اختيار filters: modern-anime أو old-anime؛ realistic للمحتوى الواقعي. اختر off مع nofilters.'
         required: true
         default: 'off'
         type: choice
         options: ['off', 'modern-anime', 'old-anime', 'realistic']
+
+concurrency:
+  group: video-compression-${{ github.event.inputs.chat_id }}
+  queue: max
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -72,7 +75,6 @@ jobs:
   # ============================================================
   prepare-codec-build:
     name: بناء FFmpeg و Av1an
-    if: github.event.inputs.codec != 'audio'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -87,6 +89,29 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
+      - name: استعادة بيئة المطابقة المكانية من الكاش
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_mode == 'filters' &&
+          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime')
+        id: cache-spatial-python
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/spatial
+          key: spatial-match-opencv-ubuntu-24.04-python312-v1
+
+      - name: إنشاء بيئة المطابقة عند الحاجة فقط
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_mode == 'filters' &&
+          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime') &&
+          steps.cache-spatial-python.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$HOME/.venvs/spatial"
+          "$HOME/.venvs/spatial/bin/python" -m pip install opencv-contrib-python-headless==4.10.0.84 numpy==1.26.4
+          "$HOME/.venvs/spatial/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter"); print("OpenCV", cv2.__version__, "NumPy", numpy.__version__)'
+
       - name: بناء SVT-AV1 v4.2.0 و VMAF v3.0.0 و FFmpeg
         if: github.event.inputs.codec != 'audio' && steps.cache-build.outputs.cache-hit != 'true'
         timeout-minutes: 90
@@ -99,7 +124,7 @@ jobs:
 
           sudo apt-get update -qq
           sudo apt-get install -y build-essential cmake git nasm pkg-config \
-            libdav1d-dev libogg-dev libopus-dev meson ninja-build xxd
+            libdav1d-dev libopus-dev meson ninja-build
           rm -rf "$HOME/codec-build" "$HOME/codec-sources"
           mkdir -p "$HOME/codec-build" "$HOME/codec-sources"
           cd "$HOME/codec-sources"
@@ -140,6 +165,17 @@ jobs:
           make -j"$(nproc)"
           make install
 
+      - name: استعادة حزم Homebrew لـ Av1an عند الحاجة فقط
+        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/linuxbrew/.linuxbrew/Cellar/av1an
+            /home/linuxbrew/.linuxbrew/opt/av1an
+            /home/linuxbrew/.linuxbrew/bin/av1an
+            ~/.cache/Homebrew
+          key: av1an-homebrew-ubuntu-24.04-v1
+
       - name: تثبيت av1an عند الحاجة فقط
         if: >-
           github.event.inputs.codec != 'audio' &&
@@ -148,7 +184,7 @@ jobs:
           set -euo pipefail
           export HOMEBREW_NO_AUTO_UPDATE=1
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew install av1an
+          if ! av1an --version >/dev/null 2>&1; then brew install av1an; fi
           AV1AN_VER=$(av1an --version 2>/dev/null || true)
           echo "av1an: $AV1AN_VER"
 
@@ -156,7 +192,7 @@ jobs:
         if: github.event.inputs.codec != 'audio'
         run: |
           set -euo pipefail
-          sudo apt-get install -y libdav1d-dev libopus0
+          sudo apt-get install -y libdav1d7 libopus0
           export PATH="$HOME/codec-build/bin:$PATH"
           export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
 
@@ -178,28 +214,83 @@ jobs:
           "$HOME/codec-build/bin/ffmpeg" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf ' \
             && echo "OK libvmaf" || { echo 'MISSING libvmaf' >&2; exit 1; }
 
+      - name: تخطي بناء أدوات الفيديو عند اختيار الصوت فقط
+        if: github.event.inputs.codec == 'audio'
+        run: |
+          echo "Audio-only mode: AV1/DT tools are not required."
+
   # ============================================================
   # 2. تحميل المصدر وفحصه وتقطيعه
   # ============================================================
   split-video:
     name: تحميل المصدر وفحصه وتقطيعه
     needs: prepare-codec-build
-    if: ${{ always() && (needs.prepare-codec-build.result == 'success' || needs.prepare-codec-build.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     outputs:
-      chunks: ${{ steps.segment.outputs.chunks || '[0]' }}
-      source_info: ${{ steps.probe_source.outputs.source_info || '{}' }}
-      input_kind: ${{ steps.classify_source.outputs.input_kind }}
+      chunks: ${{ steps.segment.outputs.chunks }}
+      chunk_specs: ${{ steps.segment.outputs.chunk_specs }}
+      source_info: ${{ steps.probe_source.outputs.source_info }}
+      is_archive: ${{ steps.probe_source.outputs.is_archive }}
     steps:
-      - name: تجهيز أدوات التحميل
+      - name: تحديد اعتماديات المصدر المطلوبة
+        id: fetch-profile
+        env:
+          INPUT_URL: ${{ github.event.inputs.url }}
+          MESSAGE_ID: ${{ github.event.inputs.message_id }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, re
+          from urllib.parse import urlparse
+          u = os.environ.get("INPUT_URL", "").strip()
+          path = urlparse(u).path.lower()
+          if os.environ.get("MESSAGE_ID", "").strip() or re.match(r"^https?://(t\.me|telegram\.me|telegram\.dog)/", u, re.I):
+              profile = "telegram"
+          elif re.search(r"\.(m3u8|mpd)$", path):
+              profile = "hls"
+          elif re.search(r"\.(tar\.(?:gz|bz2|xz|zst)|zip|rar|7z|tar|tgz|gz|bz2|xz|zst|mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)$", path):
+              profile = "direct"
+          elif u:
+              profile = "web"
+          else:
+              profile = "direct"
+          print(f"profile={profile}")
+          PY
+
+      - name: استعادة بيئة تنزيل Python حسب نوع المصدر
+        if: steps.fetch-profile.outputs.profile != 'direct'
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/fetch
+          key: fetch-ubuntu-24.04-python312-${{ steps.fetch-profile.outputs.profile }}-v1
+
+      - name: تثبيت حزم المصدر المطلوبة عند الحاجة فقط
+        if: steps.fetch-profile.outputs.profile != 'direct'
+        env:
+          FETCH_PROFILE: ${{ steps.fetch-profile.outputs.profile }}
+        run: |
+          set -euo pipefail
+          VENV="$HOME/.venvs/fetch"
+          if [ ! -x "$VENV/bin/python" ]; then python3 -m venv "$VENV"; fi
+          case "$FETCH_PROFILE" in
+            telegram) "$VENV/bin/python" -c 'import telethon' 2>/dev/null || "$VENV/bin/python" -m pip install telethon ;;
+            hls) "$VENV/bin/python" -c 'import yt_dlp' 2>/dev/null || "$VENV/bin/python" -m pip install yt-dlp ;;
+            web) "$VENV/bin/python" -c 'import requests, bs4, yt_dlp' 2>/dev/null || "$VENV/bin/python" -m pip install requests beautifulsoup4 yt-dlp ;;
+            *) echo "Unknown fetch profile: $FETCH_PROFILE" >&2; exit 1 ;;
+          esac
+          echo "$VENV/bin" >> "$GITHUB_PATH"
+
+      - name: تجهيز أدوات النظام اللازمة للتنزيل والفحص
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg jq libdav1d-dev libopus0 python3-pip curl libarchive-tools zip unzip zstd
-          python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user telethon requests beautifulsoup4 lxml yt-dlp
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          if [ "$CODEC" = "audio" ]; then
+            sudo apt-get install -y ffmpeg jq p7zip-full
+          else
+            sudo apt-get install -y jq libdav1d7 libopus0
+          fi
 
       - name: استعادة FFmpeg الموحد
         if: github.event.inputs.codec != 'audio'
@@ -211,17 +302,20 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: تجهيز Playwright و curl_cffi (للروابط العامة فقط)
-        if: >-
-          github.event.inputs.url != '' &&
-          github.event.inputs.message_id == '' &&
-          !contains(github.event.inputs.url, 't.me/') &&
-          !contains(github.event.inputs.url, 'telegram.')
+      - name: تهيئة FFmpeg المبني للمهمة
+        if: github.event.inputs.codec != 'audio'
         run: |
-          set -euo pipefail
-          python3 -m pip install --user curl_cffi playwright
-          python3 -m playwright install --with-deps chromium \
-            || echo "Playwright browser install failed (non-fatal)"
+          echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: استعادة بيئة المتصفح الاختيارية للصفحات التي تتطلبها
+        if: steps.fetch-profile.outputs.profile == 'web'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.venvs/fetch-browser
+            ~/.cache/ms-playwright
+          key: fetch-browser-ubuntu-24.04-python312-v1
 
       - name: تحميل الفيديو المصدر
         env:
@@ -237,13 +331,25 @@ jobs:
 
           TG_LINK_RE='^https?://(t\.me|telegram\.me|telegram\.dog)/'
           HLS_RE='\.(m3u8|mpd)(\?.*)?$'
-          DIRECT_RE='\.(tar\.gz|tar\.bz2|tar\.xz|mp4|mkv|avi|mov|wmv|flv|webm|m4v|ts|m2ts|mts|vob|3gp|3g2|ogv|mpeg|mpg|m3u8|mp3|m4a|aac|opus|ogg|oga|wav|flac|wma|amr|ac3|dts|mka|aiff|zip|rar|7z|tar|tgz|gz|bz2|xz|zst|iso)(\?.*)?$'
+          DIRECT_RE='\.(tar\.(gz|bz2|xz|zst)|zip|rar|7z|tar|tgz|gz|bz2|xz|zst|mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)(\?.*)?$'
+          PYTHON=python3
+          if [ -x "$HOME/.venvs/fetch/bin/python" ]; then
+            PYTHON="$HOME/.venvs/fetch/bin/python"
+            export PATH="$HOME/.venvs/fetch/bin:$PATH"
+          fi
 
-          # 1+2. تيليجرام (رسالة أو رابط): البوت أولاً، ثم الجلسة إن فشل
+          # Telegram routing: uploaded Telegram message -> bot; Telegram URL -> user session.
           if [ -n "$MESSAGE_ID" ] || { [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $TG_LINK_RE ]]; }; then
-            echo "Downloading from Telegram (bot first, then user session)..."
+            if [ -n "$MESSAGE_ID" ]; then
+              echo "Telegram uploaded video/document: bot download with retries..."
+              TG_MODE="bot_message"
+            else
+              echo "Telegram link: user-session download with retries..."
+              TG_MODE="session_link"
+            fi
+            export TG_MODE
             cat > tg_fetch.py <<'PYEOF'
-          import asyncio, os, sys
+          import asyncio, os, sys, time
           from urllib.parse import urlparse
           from telethon import TelegramClient
           from telethon.sessions import StringSession
@@ -256,8 +362,9 @@ jobs:
           MESSAGE_ID = os.environ.get("MESSAGE_ID", "").strip()
           URL = os.environ.get("VIDEO_URL", "").strip()
           CHAT_ID = os.environ.get("SOURCE_CHAT_ID", "").strip()
+          MODE = os.environ.get("TG_MODE", "")
           OUT = "raw_input.mp4"
-
+          MAX_ATTEMPTS = 10
 
           def parse_link(link):
               parts = [p for p in urlparse(link).path.split("/") if p]
@@ -268,86 +375,97 @@ jobs:
                   return PeerChannel(int(parts[1])), msg_id
               return parts[0], msg_id
 
-
-          def targets_for(kind):
-              if MESSAGE_ID:
-                  mid = int(MESSAGE_ID)
-                  chat = int(CHAT_ID)
-                  if kind == "bot":
-                      return [(chat, mid)]
-                  if chat < 0:
-                      return [(chat, mid)]
-                  print("[tg] session skipped: in private chats message ids differ between the bot and the user account")
-                  return []
-              peer, mid = parse_link(URL)
-              if peer is None:
-                  print("[tg] could not parse the Telegram link")
-                  return []
-              return [(peer, mid)]
-
-
-          async def attempt(kind):
-              targets = targets_for(kind)
-              if not targets:
+          def is_supported_media_message(message):
+              if any(getattr(message, key, None) for key in ("video", "audio", "voice", "video_note", "animation")):
+                  return True
+              doc = getattr(message, "document", None)
+              if not doc:
                   return False
-              if kind == "bot":
-                  if not BOT_TOKEN:
-                      print("[tg] bot: BOT_TOKEN missing")
-                      return False
-                  client = TelegramClient(StringSession(), API_ID, API_HASH)
-              else:
-                  if not TG_SESSION:
-                      print("[tg] session: TG_SESSION missing")
-                      return False
-                  client = TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH)
-              try:
-                  if kind == "bot":
-                      await client.start(bot_token=BOT_TOKEN)
-                  else:
-                      await client.connect()
-                      if not await client.is_user_authorized():
-                          print("[tg] session: not authorized")
-                          return False
-                      try:
-                          await client.get_dialogs(limit=200)
-                      except Exception:
-                          pass
-                  for peer, mid in targets:
-                      try:
-                          message = await client.get_messages(peer, ids=mid)
-                          if message is None or not message.media:
-                              print(f"[tg] {kind}: message {mid} not found or has no media")
-                              continue
-                          await client.download_media(message, file=OUT)
-                          if os.path.exists(OUT) and os.path.getsize(OUT) > 0:
-                              print(f"[tg] {kind}: download OK")
-                              return True
-                      except Exception as e:
-                          print(f"[tg] {kind}: {type(e).__name__}: {str(e)[:150]}")
-                      if os.path.exists(OUT):
-                          os.remove(OUT)
-                  return False
-              except Exception as e:
-                  print(f"[tg] {kind}: {type(e).__name__}: {str(e)[:150]}")
-                  return False
-              finally:
-                  try:
-                      await client.disconnect()
-                  except Exception:
-                      pass
+              mime = (getattr(doc, "mime_type", "") or "").lower()
+              if mime.startswith(("video/", "audio/")) or mime in {
+                  "application/zip", "application/x-zip-compressed", "application/x-7z-compressed",
+                  "application/vnd.rar", "application/x-rar-compressed", "application/x-tar",
+                  "application/gzip", "application/x-gzip", "application/x-bzip2",
+                  "application/x-xz", "application/zstd", "application/x-iso9660-image",
+              }:
+                  return True
+              media_exts = (
+                  ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".mpeg", ".mpg",
+                  ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".oga", ".wav", ".flac", ".wma",
+                  ".amr", ".ac3", ".dts", ".mka", ".aiff", ".zip", ".rar", ".7z", ".tar",
+                  ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".gz", ".bz2", ".xz", ".zst",
+              )
+              for attr in getattr(doc, "attributes", []) or []:
+                  name = getattr(attr, "file_name", "") or ""
+                  if name.lower().endswith(media_exts):
+                      return True
+              return False
 
+          def get_target():
+              if MODE == "bot_message":
+                  if not MESSAGE_ID or not CHAT_ID:
+                      raise RuntimeError("message_id أو chat_id مفقود")
+                  return int(CHAT_ID), int(MESSAGE_ID)
+              if MODE == "session_link":
+                  peer, mid = parse_link(URL)
+                  if peer is None:
+                      raise RuntimeError("تعذر تحليل رابط تيليجرام أو رقم الرسالة")
+                  return peer, mid
+              raise RuntimeError(f"وضع تحميل تيليجرام غير معروف: {MODE}")
 
           async def main():
-              for kind in ("bot", "session"):
-                  if await attempt(kind):
-                      return 0
-                  print(f"[tg] {kind} attempt failed")
-              return 1
+              peer, mid = get_target()
+              if MODE == "bot_message" and not BOT_TOKEN:
+                  raise RuntimeError("BOT_TOKEN غير مضبوط")
+              if MODE == "session_link" and not TG_SESSION:
+                  raise RuntimeError("TG_SESSION غير مضبوط للرابط")
 
+              for attempt in range(1, MAX_ATTEMPTS + 1):
+                  client = (TelegramClient(StringSession(), API_ID, API_HASH)
+                            if MODE == "bot_message" else
+                            TelegramClient(StringSession(TG_SESSION), API_ID, API_HASH))
+                  try:
+                      # Include connection/authentication in the retry loop.
+                      if MODE == "bot_message":
+                          await client.start(bot_token=BOT_TOKEN)
+                      else:
+                          await client.connect()
+                          if not await client.is_user_authorized():
+                              raise RuntimeError("جلسة تيليجرام غير مصرح بها")
+
+                      if os.path.exists(OUT):
+                          os.remove(OUT)
+                      message = await client.get_messages(peer, ids=mid)
+                      if message is None or not is_supported_media_message(message):
+                          raise RuntimeError("الرسالة غير موجودة أو لا تحتوي فيديو أو صوتاً أو أرشيفاً")
+                      result = await client.download_media(message, file=OUT)
+                      if result and os.path.exists(OUT) and os.path.getsize(OUT) > 0:
+                          print(f"[tg] {MODE}: video download succeeded on attempt {attempt}")
+                          return 0
+                      raise RuntimeError("تنزيل تيليجرام لم يُنشئ ملفًا صالحًا")
+                  except Exception as exc:
+                      if os.path.exists(OUT):
+                          os.remove(OUT)
+                      if attempt >= MAX_ATTEMPTS:
+                          print(f"[tg] {MODE}: failed after {attempt} attempts: {type(exc).__name__}: {str(exc)[:250]}")
+                          return 1
+                      # Respect Telegram FloodWait exactly where possible; otherwise exponential backoff.
+                      wait = getattr(exc, "seconds", None)
+                      if not isinstance(wait, (int, float)) or wait <= 0:
+                          wait = min(45, 3 * (2 ** (attempt - 1)))
+                      wait = min(120, max(2, int(wait)))
+                      print(f"[tg] {MODE}: attempt {attempt}/{MAX_ATTEMPTS} failed ({type(exc).__name__}: {str(exc)[:180]}), retrying in {wait}s", flush=True)
+                      await asyncio.sleep(wait)
+                  finally:
+                      try:
+                          await client.disconnect()
+                      except Exception:
+                          pass
+              return 1
 
           sys.exit(asyncio.run(main()))
           PYEOF
-            python3 tg_fetch.py || { echo 'Telegram download failed (bot and session)' >&2; exit 1; }
+            "$PYTHON" tg_fetch.py || { echo "Telegram source download failed after retries (route: $TG_MODE)" >&2; exit 1; }
 
           # 3. رابط HLS / DASH مباشر
           elif [ -n "$VIDEO_URL" ] && [[ "$VIDEO_URL" =~ $HLS_RE ]]; then
@@ -395,7 +513,7 @@ jobs:
               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
               'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           ]
-          VIDEO_URL_RE = re.compile(r'\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv)(?=$|[?#&/"\'])', re.IGNORECASE)
+          VIDEO_URL_RE = re.compile(r'\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv|m4a|mp3|aac|ogg|opus|wav|flac)(?=$|[?#&/"\'])', re.IGNORECASE)
           HLS_RE = re.compile(r'\.(?:m3u8|mpd)(?=$|[?#&/"\'])', re.IGNORECASE)
           CANDIDATE = "candidate.mp4"
           MIN_DUR = 61
@@ -522,7 +640,7 @@ jobs:
                       strong.append(v)
 
               patterns = [
-                  r'["\']((?:https?:)?//[^"\']+\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv)[^"\']*)["\']',
+                  r'["\']((?:https?:)?//[^"\']+\.(?:mp4|m3u8|mpd|webm|flv|ts|mkv|m4a|mp3|aac|ogg|opus|wav|flac)[^"\']*)["\']',
                   r'(?:videoUrl|video_url|videoURL|videoSrc|video_src|sourceUrl|playUrl|mediaUrl|streamUrl|hlsUrl|dashUrl|file|src)\s*[:=]\s*["\']([^"\']+)["\']',
                   r'data-(?:video|src|url|source|stream|file|hls|dash)\s*=\s*["\']([^"\']+)["\']',
               ]
@@ -536,7 +654,7 @@ jobs:
                   for m in re.findall(p, html):
                       try:
                           d = base64.b64decode(m).decode('utf-8', errors='ignore')
-                          for dm in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|mpd|webm|flv|ts)[^\s"\'<>]*', d):
+                          for dm in re.findall(r'https?://[^\s"\'<>]+\.(?:mp4|m3u8|mpd|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)[^\s"\'<>]*', d):
                               weak.append(dm)
                       except Exception:
                           pass
@@ -698,11 +816,22 @@ jobs:
           print("All methods failed")
           sys.exit(1)
           PYEOF
-            if ! python3 fetch_page.py; then
-              echo "Page extraction failed, falling back to yt-dlp..."
-              rm -f raw_input.mp4 candidate.mp4
-              yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
-                || { echo 'Download failed' >&2; exit 1; }
+            if ! "$PYTHON" fetch_page.py; then
+              echo "Basic extraction failed; trying optional browser tooling..."
+              BROWSER_VENV="$HOME/.venvs/fetch-browser"
+              if [ ! -x "$BROWSER_VENV/bin/python" ]; then python3 -m venv "$BROWSER_VENV"; fi
+              "$BROWSER_VENV/bin/python" -c 'import requests, bs4, yt_dlp, curl_cffi, playwright' 2>/dev/null || \
+                "$BROWSER_VENV/bin/python" -m pip install requests beautifulsoup4 yt-dlp curl_cffi playwright
+              if ! find "$HOME/.cache/ms-playwright" -maxdepth 1 -type d -name 'chromium-*' -print -quit 2>/dev/null | grep -q .; then
+                "$BROWSER_VENV/bin/python" -m playwright install --with-deps chromium || \
+                  echo "Playwright browser install failed; try yt-dlp fallback"
+              fi
+              if ! "$BROWSER_VENV/bin/python" fetch_page.py; then
+                echo "Browser extraction failed, falling back to yt-dlp..."
+                rm -f raw_input.mp4 candidate.mp4
+                yt-dlp --no-playlist --merge-output-format mp4 -o raw_input.mp4 "$VIDEO_URL" \
+                  || { echo 'Download failed' >&2; exit 1; }
+              fi
             fi
 
           else
@@ -712,71 +841,10 @@ jobs:
           [ -s raw_input.mp4 ] || { echo "Download failed" >&2; exit 1; }
           echo "File size: $(stat -c%s raw_input.mp4) bytes"
 
-      - name: تصنيف الملف والتحقق من مسار الفيديو أو الصوت
-        id: classify_source
+      - name: فحص المصدر التفصيلي
+        id: probe_source
         env:
           CODEC: ${{ github.event.inputs.codec }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, subprocess, zipfile, tarfile
-          from pathlib import Path
-          p = Path("raw_input.mp4")
-          if not p.is_file() or p.stat().st_size == 0:
-              raise SystemExit("Downloaded input is empty")
-          sig = p.open("rb").read(16)
-          is_archive = (
-              zipfile.is_zipfile(p) or tarfile.is_tarfile(p)
-              or sig.startswith(b"7z\xbc\xaf\x27\x1c")
-              or sig.startswith(b"Rar!\x1a\x07")
-              or sig.startswith(b"\x1f\x8b")
-              or sig.startswith(b"BZh")
-              or sig.startswith(b"\xfd7zXZ\x00")
-              or sig.startswith(b"\x28\xb5\x2f\xfd")
-          )
-          if not is_archive:
-              # The bot's output filename may omit the source extension; ask libarchive
-              # to identify/list the container by content before treating it as media.
-              try:
-                  listed = subprocess.run(
-                      ["bsdtar", "-tf", str(p)], capture_output=True, text=True, timeout=30
-                  )
-                  is_archive = listed.returncode == 0
-              except (FileNotFoundError, subprocess.TimeoutExpired):
-                  pass
-          probe_path = p
-          if not is_archive:
-              # Downloads are stored as raw_input.mp4 even when they are MP3/M4A.
-              # FFprobe can trust that misleading suffix and reject a valid audio file.
-              probe_path = Path("ffprobe_input.bin")
-              try:
-                  probe_path.unlink(missing_ok=True)
-                  os.link(p, probe_path)
-              except OSError:
-                  probe_path = p
-          codec = os.environ.get("CODEC", "av1")
-          if is_archive:
-              if codec != "audio":
-                  raise SystemExit("This input is an archive. Choose Audio-only in the bot; archives are handled as audio batches.")
-              kind = "audio_archive"
-          elif codec == "audio":
-              probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(probe_path)], capture_output=True, text=True)
-              if probe.returncode != 0 or not probe.stdout.strip():
-                  raise SystemExit(f"Audio-only mode requires a media file with at least one audio stream; ffprobe rc={probe.returncode}: {(probe.stderr or probe.stdout).strip()[-500:]}")
-              kind = "audio_single"
-          else:
-              probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(probe_path)], capture_output=True, text=True)
-              if probe.returncode != 0 or not probe.stdout.strip():
-                  raise SystemExit("AV1 mode requires a video stream. For audio files or audio archives, choose Audio-only.")
-              kind = "video"
-          print(f"Detected input kind: {kind}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"input_kind={kind}\n")
-          PY
-
-      - name: فحص المصدر التفصيلي
-        if: steps.classify_source.outputs.input_kind == 'video'
-        id: probe_source
         run: |
           set -euo pipefail
           if [ -x "$HOME/codec-build/bin/ffprobe" ]; then
@@ -784,6 +852,24 @@ jobs:
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
           else
             FFPROBE=ffprobe
+          fi
+
+          echo 'is_archive=false' >> "$GITHUB_OUTPUT"
+          if [ "$CODEC" = "audio" ]; then
+            ARCHIVER="$(command -v 7zz || command -v 7z || true)"
+            if [ -n "$ARCHIVER" ] && "$ARCHIVER" t raw_input.mp4 >/dev/null 2>&1; then
+              echo 'is_archive=true' >> "$GITHUB_OUTPUT"
+              SOURCE_INFO='{"w":"","h":"","fps":"","color_space":"","color_primaries":"","color_transfer":"","color_range":"","pix_fmt":"","bit_depth":"0","is_bt2020":"false","is_hdr":"false","is_hlg":"false","noise_class":"not-applicable","noise_score":"NA"}'
+              { echo "source_info<<__EOF__"; echo "$SOURCE_INFO"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+              echo 'Detected supported archive; audio archive mode enabled.'
+              exit 0
+            fi
+            HAS_AUDIO=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 raw_input.mp4 | head -1 || true)
+            [ -n "$HAS_AUDIO" ] || { echo 'Audio mode source is neither a readable archive nor a file with an audio stream.' >&2; exit 1; }
+            SOURCE_INFO='{"w":"","h":"","fps":"","color_space":"","color_primaries":"","color_transfer":"","color_range":"","pix_fmt":"","bit_depth":"0","is_bt2020":"false","is_hdr":"false","is_hlg":"false","noise_class":"not-applicable","noise_score":"NA"}'
+            { echo "source_info<<__EOF__"; echo "$SOURCE_INFO"; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+            echo 'Detected standalone audio source.'
+            exit 0
           fi
 
           COLOR_SPACE=$("$FFPROBE" -v error -select_streams v:0 \
@@ -868,8 +954,10 @@ jobs:
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: ضغط الصوت من المصدر الكامل
-        if: steps.classify_source.outputs.input_kind == 'video'
+      - name: ضغط الصوت أو الملفات الصوتية داخل الأرشيف
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
+          IS_ARCHIVE: ${{ steps.probe_source.outputs.is_archive }}
         run: |
           set -euo pipefail
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
@@ -880,21 +968,156 @@ jobs:
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           fi
 
+          if [ "$CODEC" = "audio" ] && [ "$IS_ARCHIVE" = "true" ]; then
+            ARCHIVER="$(command -v 7zz || command -v 7z || true)"
+            [ -n "$ARCHIVER" ] || { echo '7z extractor is missing' >&2; exit 1; }
+            set -euo pipefail
+            ARCHIVER="$(command -v 7zz || command -v 7z || true)"
+            [ -n "$ARCHIVER" ] || { echo '7z extractor is missing' >&2; exit 1; }
+            "$ARCHIVER" t raw_input.mp4 >/dev/null
+            rm -rf archive_source archive_output
+            mkdir -p archive_source
+
+            # Validate archive paths and reject links/oversized archives before extraction.
+            python3 - <<'PY'
+          import os, re, subprocess, sys
+          from pathlib import PurePosixPath, PureWindowsPath
+          archiver = os.environ.get("ARCHIVER") or subprocess.check_output(["bash","-lc","command -v 7zz || command -v 7z"], text=True).strip()
+          result = subprocess.run([archiver, "l", "-slt", "raw_input.mp4"], capture_output=True, text=True)
+          if result.returncode:
+              sys.exit("تعذر قراءة قائمة الأرشيف: " + result.stderr[-500:])
+          sections = result.stdout.split("----------")
+          listing = sections[-1] if len(sections) > 1 else result.stdout
+          records = []
+          for block in re.split(r"\n\s*\n", listing):
+              rec = {}
+              for line in block.splitlines():
+                  if " = " in line:
+                      k, v = line.split(" = ", 1)
+                      rec[k.strip()] = v.strip()
+              path = rec.get("Path")
+              if not path:
+                  continue
+              if path in ("raw_input.mp4", os.path.basename(os.path.abspath("raw_input.mp4"))):
+                  continue
+              normalized = path.replace("\\", "/")
+              pp, wp = PurePosixPath(normalized), PureWindowsPath(path)
+              if pp.is_absolute() or wp.is_absolute() or re.match(r"^[A-Za-z]:", path) or ".." in pp.parts:
+                  sys.exit("رفض الأرشيف: مسار ملف غير آمن: " + path)
+              if rec.get("Symbolic Link") or rec.get("Hard Link") or "symbolic" in rec.get("Attributes", "").lower():
+                  sys.exit("رفض الأرشيف: الروابط الرمزية/الصلبة غير مسموحة: " + path)
+              records.append(rec)
+          if not records:
+              sys.exit("الأرشيف لا يحتوي ملفات قابلة للاستخراج")
+          if len(records) > 1000:
+              sys.exit("الأرشيف يحتوي أكثر من 1000 مدخل؛ الحد التشغيلي 1000")
+          total = sum(int(r.get("Size", "0") or 0) for r in records if r.get("Folder") != "+")
+          if total > 8 * 1024**3:
+              sys.exit("الحجم بعد فك الأرشيف يتجاوز الحد التشغيلي 8 GiB")
+          print(f"Archive validation passed: {len(records)} entries, {total} bytes uncompressed")
+          PY
+            "$ARCHIVER" x -y -aoa -oarchive_source raw_input.mp4 >/dev/null
+
+            ARCHIVER="$ARCHIVER" FFMPEG="$FFMPEG" FFPROBE="$FFPROBE" python3 - <<'PY'
+          import concurrent.futures, os, shutil, subprocess, sys, zipfile
+          from pathlib import Path
+          root = Path("archive_source")
+          output = Path("archive_output")
+          bitrate = "14k"
+          ffmpeg = os.environ.get("FFMPEG", "ffmpeg")
+          ffprobe = os.environ.get("FFPROBE", "ffprobe")
+          if not root.is_dir():
+              sys.exit("لم يتم إنشاء مجلد الاستخراج")
+          files = sorted(p for p in root.rglob("*") if p.is_file())
+          if any(p.is_symlink() for p in files):
+              sys.exit("رفض الأرشيف: عُثر على رابط رمزي")
+          if len(files) > 1000:
+              sys.exit("عدد الملفات يتجاوز الحد التشغيلي 1000")
+          audio_exts = {".mp3", ".m4a", ".aac", ".opus", ".ogg", ".oga", ".wav", ".flac", ".wma", ".amr", ".ac3", ".dts", ".mka", ".aiff", ".aif"}
+          candidates = [p for p in files if p.suffix.lower() in audio_exts]
+          audio = []
+          for source in candidates:
+              probe = subprocess.run([ffprobe, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(source)], capture_output=True, text=True)
+              if probe.returncode == 0 and probe.stdout.strip():
+                  audio.append(source)
+          if not audio:
+              sys.exit("لم يُعثر على ملفات صوتية مدعومة داخل الأرشيف")
+          shutil.copytree(root, output)
+          original_audio = {p.relative_to(root).as_posix() for p in audio}
+          for rel in original_audio:
+              path = output / Path(rel)
+              if path.exists():
+                  path.unlink()
+          occupied = {p.relative_to(output).as_posix() for p in output.rglob("*") if p.is_file()}
+          jobs = []
+          for index, source in enumerate(audio):
+              rel = source.relative_to(root)
+              desired = rel.with_suffix(".opus")
+              dest = desired
+              serial = 2
+              while dest.as_posix() in occupied:
+                  dest = desired.with_name(f"{desired.stem}__{serial}{desired.suffix}")
+                  serial += 1
+              occupied.add(dest.as_posix())
+              target = output / dest
+              target.parent.mkdir(parents=True, exist_ok=True)
+              temp = target.with_name(target.stem + ".partial.opus")
+              jobs.append((index, source, target, temp))
+
+          def encode(job):
+              index, source, target, temp = job
+              cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source), "-map", "0:a:0", "-vn", "-map_metadata", "0", "-c:a", "libopus", "-b:a", bitrate, "-ac", "1", "-ar", "48000", "-threads", "1", str(temp)]
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              if result.returncode or not temp.is_file() or temp.stat().st_size == 0:
+                  temp.unlink(missing_ok=True)
+                  raise RuntimeError(f"فشل ترميز {source}: {result.stderr[-600:]}")
+              temp.replace(target)
+              return source.relative_to(root).as_posix(), target.relative_to(output).as_posix(), target.stat().st_size
+
+          workers = min(10, os.cpu_count() or 1, len(jobs))
+          print(f"Encoding {len(jobs)} audio files in parallel; workers={workers}; bitrate={bitrate}", flush=True)
+          with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+              futures = [pool.submit(encode, job) for job in jobs]
+              results = [f.result() for f in concurrent.futures.as_completed(futures)]
+          result_map = {source: dest for source, dest, _ in results}
+          if len(result_map) != len(audio):
+              sys.exit("بعض الملفات الصوتية لم تُعالج")
+          zip_path = Path("audio_compressed.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for item in sorted(output.rglob("*")):
+                  rel = item.relative_to(output).as_posix()
+                  if item.is_dir():
+                      archive.writestr(rel.rstrip("/") + "/", "")
+                  elif item.is_file():
+                      method = zipfile.ZIP_STORED if item.suffix.lower() in {".opus", ".mp3", ".m4a", ".aac", ".ogg", ".flac"} else zipfile.ZIP_DEFLATED
+                      archive.write(item, rel, compress_type=method)
+          if zip_path.stat().st_size == 0:
+              sys.exit("الأرشيف الناتج فارغ")
+          print(f"Repacked ZIP: {len(audio)} audio files processed, {len(files)-len(audio)} other files preserved; {zip_path.stat().st_size} bytes")
+          PY
+            test -s audio_compressed.zip
+            exit 0
+          fi
+
           HAS_AUDIO=$("$FFPROBE" -v error -select_streams a:0 -show_entries stream=codec_name \
                -of csv=p=0 raw_input.mp4 | grep -c . || true)
 
           if [ "${HAS_AUDIO:-0}" -gt 0 ]; then
-            echo "Compressing audio..."
+            echo "Compressing audio (Opus 14k mono)..."
             "$FFMPEG" -hide_banner -nostdin -y -i raw_input.mp4 \
               -map 0:a:0 \
               -vn \
               -c:a libopus \
-              -b:a 16k \
+              -b:a 14k \
               -ac 1 \
               -ar 48000 \
               audio_compressed.opus
             echo "Audio size: $(stat -c%s audio_compressed.opus) bytes"
           else
+            if [ "$CODEC" = "audio" ]; then
+              echo 'Audio-only requested but source has no audio stream.' >&2
+              exit 1
+            fi
             echo "No audio in source"
             : > audio_compressed.opus
           fi
@@ -907,21 +1130,31 @@ jobs:
           if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$SRC_DUR" ]; then
             SAMPLE_DUR=$(( SRC_DUR - SAMPLE_START ))
           fi
-          echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
-          "$FFMPEG" -hide_banner -nostdin -y \
-            -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
-            -i raw_input.mp4 \
-            -map 0:v:0 -c:v copy \
-            source_sample.mkv
-          test -s source_sample.mkv
-          echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
+          HAS_VIDEO=$($FFPROBE -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 raw_input.mp4 | grep -c . || true)
+          if [ "${HAS_VIDEO:-0}" -gt 0 ] && [ "$SAMPLE_DUR" -gt 0 ]; then
+            echo "Source sample: from ${SAMPLE_START}s duration ${SAMPLE_DUR}s"
+            "$FFMPEG" -hide_banner -nostdin -y \
+              -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
+              -i raw_input.mp4 \
+              -map 0:v:0 -c:v copy \
+              source_sample.mkv
+            test -s source_sample.mkv
+            echo "Sample size: $(stat -c%s source_sample.mkv) bytes"
+          else
+            echo "No usable video sample; continuing without source_sample.mkv"
+          fi
 
       - name: تقسيم المصدر إلى أجزاء
-        if: steps.classify_source.outputs.input_kind == 'video'
         id: segment
         run: |
           set -euo pipefail
           mkdir -p chunks_raw
+
+          if [ "${{ github.event.inputs.codec }}" = "audio" ]; then
+            echo 'chunks=["000"]' >> "$GITHUB_OUTPUT"
+            echo 'chunk_specs={}' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
             FFMPEG="$HOME/codec-build/bin/ffmpeg"
@@ -931,9 +1164,10 @@ jobs:
             FFMPEG=ffmpeg; FFPROBE=ffprobe
           fi
 
-          DURATION=$("$FFPROBE" -v error -show_entries format=duration \
-            -of csv=p=0 raw_input.mp4 | cut -d. -f1)
-          test -n "$DURATION"
+          DURATION_FULL=$("$FFPROBE" -v error -show_entries format=duration \
+            -of csv=p=0 raw_input.mp4)
+          [[ "$DURATION_FULL" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo 'Invalid source duration' >&2; exit 1; }
+          DURATION=${DURATION_FULL%%.*}
           echo "Duration: $DURATION seconds"
 
           SPLIT_THRESHOLD=300
@@ -950,21 +1184,14 @@ jobs:
             SEGMENT_TIME=$(( (DURATION + N - 1) / N ))
             echo "Splitting into ~${N} chunks, ${SEGMENT_TIME}s each"
 
-            KF_EXPR=$(python3 -c "
-          n=$N; t=$SEGMENT_TIME; dur=$DURATION
-          pts=[i*t for i in range(1,n) if i*t < dur]
-          print(','.join(str(p) for p in pts))
-            ")
-            echo "Keyframe points: $KF_EXPR"
+            echo "Splitting on existing keyframes; stream-copy cannot force new keyframes"
 
             "$FFMPEG" -hide_banner -nostdin -y \
               -i raw_input.mp4 \
               -map 0:v:0 \
               -c:v copy \
-              -force_key_frames "$KF_EXPR" \
               -f segment \
               -segment_time "$SEGMENT_TIME" \
-              -segment_atclocktime 0 \
               -break_non_keyframes 0 \
               -reset_timestamps 1 \
               -avoid_negative_ts make_zero \
@@ -978,39 +1205,14 @@ jobs:
               chunks_raw/chunk_000.mkv
           fi
 
-          python3 - "$FFPROBE" raw_input.mp4 <<'PY'
-          import glob, subprocess, sys
-          from decimal import Decimal, InvalidOperation
-
-          ffprobe, source = sys.argv[1:3]
-          chunks = sorted(glob.glob("chunks_raw/chunk_*.mkv"))
-          if not chunks:
-              raise SystemExit("No split chunks were created")
-
-          def duration(path):
-              result = subprocess.run(
-                  [ffprobe, "-v", "error", "-show_entries", "format=duration",
-                   "-of", "default=noprint_wrappers=1:nokey=1", path],
-                  check=True, capture_output=True, text=True,
-              )
-              try:
-                  value = Decimal(result.stdout.strip())
-              except InvalidOperation as exc:
-                  raise SystemExit(f"Invalid ffprobe duration for {path}: {result.stdout!r}") from exc
-              if not value.is_finite() or value <= 0:
-                  raise SystemExit(f"Invalid non-positive duration for {path}: {value}")
-              return value
-
-          source_duration = duration(source)
-          chunk_total = sum((duration(path) for path in chunks), Decimal("0"))
-          difference = abs(chunk_total - source_duration)
-          print(
-              f"Chunks check: count={len(chunks)} total={chunk_total:.6f}s "
-              f"source={source_duration:.6f}s diff={difference:.6f}s"
-          )
-          if difference > Decimal("5"):
-              raise SystemExit("Duration mismatch after split")
-          PY
+          TOTAL_CHUNK_DUR=$(for f in chunks_raw/chunk_*.mkv; do
+            "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$f"
+          done | awk '{sum += $1} END {printf "%.3f", sum}')
+          DIFF=$(awk -v total="$TOTAL_CHUNK_DUR" -v source="$DURATION_FULL" 'BEGIN {d=total-source; if(d<0)d=-d; printf "%.3f",d}')
+          echo "Chunks check: total=${TOTAL_CHUNK_DUR}s source=${DURATION_FULL}s diff=${DIFF}s"
+          if awk -v d="$DIFF" 'BEGIN {exit !(d > 5)}'; then
+            echo 'Duration mismatch after split' >&2; exit 1
+          fi
 
           find chunks_raw -maxdepth 1 -type f -name 'chunk_*.mkv' -size +0c | sort > /tmp/chunks.txt
           test -s /tmp/chunks.txt
@@ -1018,23 +1220,13 @@ jobs:
           echo "chunks=$CHUNKS_JSON" >> "$GITHUB_OUTPUT"
 
       - name: رفع الأجزاء الخام والصوت وعيّنة المصدر
-        if: steps.classify_source.outputs.input_kind == 'video'
         uses: actions/upload-artifact@v4
         with:
           name: raw-chunks
           path: |
             chunks_raw/
-            audio_compressed.opus
+            audio_compressed.*
             source_sample.mkv
-          retention-days: 1
-          if-no-files-found: error
-
-      - name: رفع المصدر الصوتي/الأرشيف
-        if: steps.classify_source.outputs.input_kind == 'audio_archive' || steps.classify_source.outputs.input_kind == 'audio_single'
-        uses: actions/upload-artifact@v4
-        with:
-          name: audio-input
-          path: raw_input.mp4
           retention-days: 1
           if-no-files-found: error
 
@@ -1044,7 +1236,7 @@ jobs:
   encode-chunks:
     name: ضغط الأجزاء
     needs: [prepare-codec-build, split-video]
-    if: needs.split-video.outputs.input_kind == 'video'
+    if: github.event.inputs.codec != 'audio'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
@@ -1053,6 +1245,9 @@ jobs:
       matrix:
         chunk: ${{ fromJSON(needs.split-video.outputs.chunks) }}
     steps:
+      - name: تنزيل كود المستودع
+        uses: actions/checkout@v4
+
       - name: تنزيل الأجزاء الخام
         uses: actions/download-artifact@v4
         with:
@@ -1069,21 +1264,52 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: تجهيز الاعتماديات
+      - name: استعادة بيئة المطابقة المكانية
+        if: >-
+          github.event.inputs.codec != 'audio' &&
+          github.event.inputs.encode_mode == 'filters' &&
+          (github.event.inputs.filter_preset == 'modern-anime' || github.event.inputs.filter_preset == 'old-anime')
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/spatial
+          key: spatial-match-opencv-ubuntu-24.04-python312-v1
+
+      - name: تجهيز أدوات الترميز المطلوبة فقط
         env:
           CODEC: ${{ github.event.inputs.codec }}
+          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
+          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libdav1d-dev libopus0
+          if [ "$CODEC" = "audio" ]; then
+            sudo apt-get install -y ffmpeg
+          else
+            sudo apt-get install -y libdav1d7 libopus0
+            if [ "$ENCODE_MODE" = "filters" ] && { [ "$FILTER_PRESET" = "modern-anime" ] || [ "$FILTER_PRESET" = "old-anime" ]; }; then
+              "$HOME/.venvs/spatial/bin/python" -c 'import cv2, numpy; assert hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "jointBilateralFilter")'
+            fi
+          fi
           if [ "$CODEC" != "audio" ]; then
+            echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
+            echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
             export PATH="$HOME/codec-build/bin:$PATH"
             export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-
             echo "=== Tools check ==="
             echo "ffmpeg: $("$HOME/codec-build/bin/ffmpeg" -version 2>/dev/null | head -1)"
             echo "SvtAv1EncApp: $("$HOME/codec-build/bin/SvtAv1EncApp" --version 2>/dev/null | head -1 || echo 'unavailable')"
           fi
+
+      - name: استعادة حزم Homebrew لـ Av1an عند الحاجة فقط
+        if: github.event.inputs.codec != 'audio' && github.event.inputs.encode_method == 'auto'
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/linuxbrew/.linuxbrew/Cellar/av1an
+            /home/linuxbrew/.linuxbrew/opt/av1an
+            /home/linuxbrew/.linuxbrew/bin/av1an
+            ~/.cache/Homebrew
+          key: av1an-homebrew-ubuntu-24.04-v1
 
       - name: تثبيت av1an عند الحاجة فقط
         if: >-
@@ -1093,7 +1319,7 @@ jobs:
           set -euo pipefail
           export HOMEBREW_NO_AUTO_UPDATE=1
           eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-          brew install av1an
+          if ! av1an --version >/dev/null 2>&1; then brew install av1an; fi
           echo "av1an: $(av1an --version 2>/dev/null | head -1)"
 
       - name: ترميز الجزء
@@ -1105,9 +1331,10 @@ jobs:
           TARGET_VALUE: ${{ github.event.inputs.target_value }}
           RESOLUTION: ${{ github.event.inputs.resolution }}
           FRAME_RATE: ${{ github.event.inputs.frame_rate }}
-          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
+          CHUNK_SPECS: ${{ needs.split-video.outputs.chunk_specs }}
           CHUNK_ID: ${{ matrix.chunk }}
           SOURCE_INFO: ${{ needs.split-video.outputs.source_info }}
+          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
         run: |
           set -euo pipefail
           IN="chunks_raw/chunk_${CHUNK_ID}.mkv"
@@ -1130,26 +1357,6 @@ jobs:
             fi
           fi
 
-          eval "$(echo "$SOURCE_INFO" | python3 -c "
-          import json, sys
-          try:
-              d = json.load(sys.stdin)
-          except Exception:
-              d = {}
-          print('IS_BT2020='    + str(d.get('is_bt2020','false')).lower())
-          print('IS_HDR='       + str(d.get('is_hdr','false')).lower())
-          print('IS_HLG='       + str(d.get('is_hlg','false')).lower())
-          print('NOISE_CLASS='  + d.get('noise_class','medium'))
-          print('SRC_PRIMARIES='+ d.get('color_primaries','bt709'))
-          print('SRC_TRANSFER=' + d.get('color_transfer','bt709'))
-          print('SRC_COLORSPACE='+ d.get('color_space','bt709'))
-          print('SRC_RANGE='    + d.get('color_range','tv'))
-          ")"
-
-          echo "=== Source info ==="
-          echo "BT.2020=$IS_BT2020 | HDR=$IS_HDR | HLG=$IS_HLG | noise=$NOISE_CLASS"
-          echo "Color: $SRC_PRIMARIES / $SRC_TRANSFER / $SRC_COLORSPACE | range: $SRC_RANGE"
-
           case "$CODEC" in av1|audio) ;; *) echo "Unsupported codec" >&2; exit 1 ;; esac
           if [ "$RESOLUTION" != "auto" ]; then
             [[ "$RESOLUTION" =~ ^[0-9]{3,4}$ ]] || { echo 'Invalid resolution' >&2; exit 1; }
@@ -1167,47 +1374,69 @@ jobs:
           fi
 
           if [ "$CODEC" = "audio" ]; then
-            [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,2}[kK]?$ ]] || { echo 'Invalid audio bitrate; enter e.g. 14k' >&2; exit 1; }
-            TARGET_VALUE="${TARGET_VALUE/%K/k}"
-            [[ "$TARGET_VALUE" == *k ]] || TARGET_VALUE="${TARGET_VALUE}k"
-            AUDIO_KBIT=${TARGET_VALUE%k}
-            [ "$AUDIO_KBIT" -ge 6 ] && [ "$AUDIO_KBIT" -le 510 ] || { echo 'Opus bitrate must be between 6k and 510k' >&2; exit 1; }
-            echo "Audio-only requested Opus bitrate: $TARGET_VALUE"
+            [[ "$TARGET_VALUE" =~ ^[1-9][0-9]{0,5}([kKmM])?$ ]] || { echo 'Invalid bitrate' >&2; exit 1; }
+            TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
             "$FFMPEG" -hide_banner -nostdin -y -i "$IN" \
-              -map 0:a:0? -vn -sn -dn -map_metadata 0 -c:a libopus -b:a "$TARGET_VALUE" -vbr on -compression_level 10 -ar 48000 "$OUT_FILE"
+              -map 0:a:0? -vn -c:a libopus -b:a "$TARGET_VALUE" -ac 1 "$OUT_FILE"
             exit 0
           fi
 
-          echo "Detecting black bars..."
-          CROPDETECT=$("$FFMPEG" -hide_banner -nostdin -t 120 -i "$IN" \
-            -vf "cropdetect=24:16:0" -f null - 2>&1 | \
-            grep -oP 'crop=\d+:\d+:\d+:\d+' | tail -5 | \
-            sort | uniq -c | sort -rn | head -1 | awk '{print $2}' || true)
-
-          CROP_FILTER=""
-          if [ -n "${CROPDETECT:-}" ] && [ "$CROPDETECT" != "crop=0:0:0:0" ]; then
-            CROP_W=$(printf '%s' "$CROPDETECT" | cut -d: -f1 | sed 's/^crop=//')
-            CROP_H=$(printf '%s' "$CROPDETECT" | cut -d: -f2)
-            SRC_WW=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width  -of csv=p=0 "$IN" | head -1)
-            SRC_HH=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN" | head -1)
-            CROP_W=${CROP_W:-0}; CROP_H=${CROP_H:-0}
-            SRC_WW=${SRC_WW:-0}; SRC_HH=${SRC_HH:-0}
-            DIFF_W=$(( SRC_WW - CROP_W ))
-            DIFF_H=$(( SRC_HH - CROP_H ))
-            if [ "$DIFF_W" -gt 4 ] || [ "$DIFF_H" -gt 4 ]; then
-              CROP_FILTER="${CROPDETECT},"
-              echo "Cropping: ${CROPDETECT} saved ${DIFF_W}x${DIFF_H} px"
-            else
-              echo "No black bars"
-            fi
+          if [ "$ENCODE_MODE" = "filters" ]; then
+            case "$FILTER_PRESET" in
+              modern-anime|old-anime|realistic) ;;
+              *) echo 'مع filters اختر modern-anime أو old-anime أو realistic' >&2; exit 1 ;;
+            esac
+          elif [ "$ENCODE_MODE" = "nofilters" ]; then
+            [ "$FILTER_PRESET" = "off" ] || { echo 'مع nofilters يجب اختيار filter_preset=off' >&2; exit 1; }
           else
-            echo "No black bars"
+            echo "قيمة encode_mode غير مدعومة للفيديو: $ENCODE_MODE" >&2; exit 1
           fi
 
-          INPUT_CODEC=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=codec_name -of csv=p=0 "$IN")
-          DECODER_ARGS=()
-          [ "$INPUT_CODEC" = "av1" ] && DECODER_ARGS=(-c:v libdav1d)
+          # ============================================================
+          # المسار العام: بدون فلاتر أو hqdn3d للمحتوى الواقعي
+          # ============================================================
+          echo "Detecting source info..."
+          eval "$(echo "$SOURCE_INFO" | python3 -c "
+          import json, sys
+          try:
+              d = json.load(sys.stdin)
+          except Exception:
+              d = {}
+          print('IS_BT2020='    + str(d.get('is_bt2020','false')).lower())
+          print('IS_HDR='       + str(d.get('is_hdr','false')).lower())
+          print('IS_HLG='       + str(d.get('is_hlg','false')).lower())
+          print('SRC_PRIMARIES='+ d.get('color_primaries','bt709'))
+          print('SRC_TRANSFER=' + d.get('color_transfer','bt709'))
+          print('SRC_COLORSPACE='+ d.get('color_space','bt709'))
+          print('SRC_RANGE='    + d.get('color_range','tv'))
+          ")"
+
+          FILTERS=("setpts=PTS-STARTPTS")
+          if [ "$ENCODE_MODE" = "filters" ] && [ "$FILTER_PRESET" = "realistic" ]; then
+            FILTERS+=("hqdn3d=1.5:1.5:3:3")
+            echo "المسار الواقعي: تطبيق hqdn3d"
+          elif [ "$ENCODE_MODE" = "nofilters" ]; then
+            echo "المسار دون فلاتر"
+          fi
+
+          if [ "$RESOLUTION" != "auto" ]; then
+            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
+          fi
+
+          COLOR_ARGS=()
+          OUT_PIX_FMT="yuv420p10le"
+
+          if [ "$IS_HDR" = "true" ] && [ "$IS_HLG" = "true" ]; then
+            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc arib-std-b67)
+          elif [ "$IS_HDR" = "true" ]; then
+            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc smpte2084)
+          elif [ "$IS_BT2020" = "true" ]; then
+            COLOR_ARGS=(-colorspace bt2020nc -color_primaries bt2020 -color_trc "$SRC_TRANSFER")
+          fi
+
+          FILTERS+=("format=${OUT_PIX_FMT}")
+          VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
+          echo "Filter chain: $VF_CHAIN"
 
           SRC_FPS_RAW=$("$FFPROBE" -v error -select_streams v:0 \
             -show_entries stream=avg_frame_rate -of csv=p=0 "$IN")
@@ -1240,125 +1469,42 @@ jobs:
             fi
           fi
 
-          # ============================================================
-          # سلسلة الفلاتر: تنظيف محافظ ثم منحنى SDR، تصغير، وإبراز حواف محدود
-          # ============================================================
-          FILTERS=("setpts=PTS-STARTPTS")
-          [ -n "$CROP_FILTER" ] && FILTERS+=("${CROP_FILTER%,}")
-          FILTERS_EXTRA=()
-          EDGE_FILTER=""
-
-          if [ "$ENCODE_MODE" = "filters" ]; then
-            case "$FILTER_PRESET" in
-              off)
-                echo "Preset: off (no enhancement filters)"
-                ;;
-              modern-anime)
-                echo "Preset: modern-anime (smooth flat areas, restrained SDR lift, protected edge definition)"
-                # Spatial cleanup is stronger than temporal cleanup to avoid motion trails.
-                FILTERS_EXTRA+=("hqdn3d=1.35:1.05:0.75:0.60")
-                FILTERS_EXTRA+=("deband=1thr=0.012:2thr=0.012:3thr=0.012:range=12:blur=false")
-                FILTERS_EXTRA+=("gradfun=strength=0.55:radius=16")
-                if [ "$IS_HDR" != "true" ]; then
-                  FILTERS_EXTRA+=("curves=all='0/0 0.08/0.10 0.20/0.24 0.50/0.54 0.82/0.84 1/1'")
-                fi
-                EDGE_FILTER="cas=0.10"
-                ;;
-              old-anime)
-                echo "Preset: old-anime (gentle warm tonal curve and spatial cleanup; no external LUT required)"
-                FILTERS_EXTRA+=("hqdn3d=1.65:1.25:0.95:0.75")
-                FILTERS_EXTRA+=("deband=1thr=0.016:2thr=0.016:3thr=0.016:range=14:blur=false")
-                FILTERS_EXTRA+=("gradfun=strength=0.60:radius=16")
-                if [ "$IS_HDR" != "true" ]; then
-                  FILTERS_EXTRA+=("curves=all='0/0 0.08/0.10 0.20/0.24 0.50/0.55 0.82/0.85 1/1'")
-                  FILTERS_EXTRA+=("colorbalance=rs=0.012:gs=0.004:bs=-0.010")
-                fi
-                EDGE_FILTER="cas=0.10"
-                ;;
-              realistic)
-                echo "Preset: realistic (light denoise; preserve natural texture)"
-                FILTERS_EXTRA+=("hqdn3d=0.55:0.42:0.70:0.55")
-                FILTERS_EXTRA+=("deband=1thr=0.008:2thr=0.008:3thr=0.008:range=10:blur=false")
-                EDGE_FILTER="cas=0.06"
-                ;;
-              *)
-                echo "Unknown filter_preset: $FILTER_PRESET" >&2
-                exit 1
-                ;;
-            esac
-            for f in "${FILTERS_EXTRA[@]}"; do FILTERS+=("$f"); done
-          fi
-
-          # Resize only after cleanup; a small edge-adaptive sharpening pass follows the resize.
-          if [ "$RESOLUTION" != "auto" ]; then
-            FILTERS+=("scale=-2:'min(ih,${RESOLUTION})':flags=lanczos+accurate_rnd+full_chroma_int")
-          fi
-          [ -n "$EDGE_FILTER" ] && FILTERS+=("$EDGE_FILTER")
-
-          # ============================================================
-          # معالجة الألوان
-          # ============================================================
-          COLOR_ARGS=()
-          OUT_PIX_FMT="yuv420p10le"
-
-          if [ "$IS_HDR" = "true" ] && [ "$IS_HLG" = "true" ]; then
-            echo "HLG source: keeping full range"
-            COLOR_ARGS=(
-              -colorspace bt2020nc
-              -color_primaries bt2020
-              -color_trc arib-std-b67
-            )
-          elif [ "$IS_HDR" = "true" ]; then
-            echo "HDR PQ source: keeping full range"
-            COLOR_ARGS=(
-              -colorspace bt2020nc
-              -color_primaries bt2020
-              -color_trc smpte2084
-            )
-          elif [ "$IS_BT2020" = "true" ]; then
-            echo "BT.2020 SDR source: keeping wide gamut"
-            COLOR_ARGS=(
-              -colorspace bt2020nc
-              -color_primaries bt2020
-              -color_trc "$SRC_TRANSFER"
-            )
-          else
-            echo "SDR BT.709 source"
-            SRC_WW=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=width -of csv=p=0 "$IN" | head -1)
-            SRC_HH=$("$FFPROBE" -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$IN" | head -1)
-            SRC_WW=${SRC_WW:-0}; SRC_HH=${SRC_HH:-0}
-            if { [ "$SRC_WW" -ge 1280 ] || [ "$SRC_HH" -gt 576 ]; } && \
-               { [ -z "$SRC_PRIMARIES" ] || [ "$SRC_PRIMARIES" = "unknown" ]; }; then
-              COLOR_ARGS=(
-                -colorspace bt709
-                -color_primaries bt709
-                -color_trc bt709
-              )
+          if [ "$ENCODE_MODE" = "filters" ] && { [ "$FILTER_PRESET" = "modern-anime" ] || [ "$FILTER_PRESET" = "old-anime" ]; }; then
+            [ "$ENCODE_METHOD" = "crf" ] || { echo 'مسارا الأنمي الحديث والقديم يدعمان CRF فقط حالياً' >&2; exit 1; }
+            [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || { echo 'CRF مطلوب بين 0 و63' >&2; exit 1; }
+            [ "$IS_HDR" != "true" ] || { echo 'مسار المطابقة بدليل 240px مخصص لمصدر SDR؛ اختر الواقعي أو بدون فلاتر لمصدر HDR' >&2; exit 1; }
+            SPATIAL_PY="$HOME/.venvs/spatial/bin/python"
+            PROFILE=modern
+            GUIDE_HEIGHT=240
+            LUT_ARGS=()
+            if [ "$FILTER_PRESET" = "old-anime" ]; then
+              PROFILE=old
+              test -s grade_blend_warm_start16.cube || { echo 'ملف grade_blend_warm_start16.cube غير موجود في جذر المستودع' >&2; exit 1; }
+              LUT_ARGS=(--lut3d grade_blend_warm_start16.cube)
+              echo 'مسار الأنمي القديم: تصحيح الأصل بـLUT ثم المطابقة بدليل مكبّر ارتفاعه 240px'
+            else
+              echo 'مسار الأنمي الحديث: دليل مكبّر ارتفاعه 240px ثم المطابقة مع الأصل دون LUT'
             fi
+            RES_ARGS=()
+            [ "$RESOLUTION" = "auto" ] || RES_ARGS=(--height "$RESOLUTION")
+            COLOR_INFO_ARGS=(--color-space "$SRC_COLORSPACE" --color-primaries "$SRC_PRIMARIES" --color-trc "$SRC_TRANSFER" --color-range "$SRC_RANGE")
+            "$SPATIAL_PY" spatial_match_stream.py "$IN" "$OUT_FILE" \
+              --profile "$PROFILE" --crf "$TARGET_VALUE" --preset "${PRESET_INPUT/none/4}" \
+              --fps "$OUT_FPS" --guide-height "$GUIDE_HEIGHT" "${RES_ARGS[@]}" "${LUT_ARGS[@]}" "${COLOR_INFO_ARGS[@]}"
+            test -s "$OUT_FILE" || { echo 'ملف ناتج المطابقة المكانية فارغ' >&2; exit 1; }
+            echo "تمت معالجة الجزء $CHUNK_ID؛ الحجم $(stat -c%s "$OUT_FILE") بايت"
+            exit 0
           fi
-
-          FILTERS+=("format=${OUT_PIX_FMT}")
-
-          VF_CHAIN=$(IFS=,; printf '%s' "${FILTERS[*]}")
-          echo "Filter chain: $VF_CHAIN"
 
           NPROC=$(nproc)
-          # Av1an استخدم كل الأنوية في النسخة الأقدم؛ SVT-AV1 يُترك على التوازي التلقائي.
-          WORKERS="$NPROC"
-          # لا نضيف حبيبات اصطناعية؛ هدف المعالجة صورة ناعمة ونظيفة.
-          SVT_BASE="tune=0:enable-qm=1:qm-min=0"
-          SVT_PARAMS="-svtav1-params ${SVT_BASE}"
-
-          echo "SVT params: $SVT_PARAMS"
-          echo "Av1an workers: $WORKERS; SVT parallelism: automatic"
+          SVT_PARAMS="-svtav1-params tune=0:enable-qm=1:qm-min=0"
+          echo "Workers: $NPROC | SVT params: $SVT_PARAMS"
 
           case "$ENCODE_METHOD" in
             crf)
               [[ "$TARGET_VALUE" =~ ^([0-9]|[1-5][0-9]|6[0-3])$ ]] || \
                 { echo 'Invalid CRF range 0-63' >&2; exit 1; }
-
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
-                "${DECODER_ARGS[@]}" -y -i "$IN" \
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v libsvtav1 \
@@ -1378,8 +1524,7 @@ jobs:
               TARGET_VALUE="${TARGET_VALUE/%m/M}"; TARGET_VALUE="${TARGET_VALUE/%K/k}"
               PASSLOG="${OUT_DIR}/passlog_${CHUNK_ID}"
 
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
-                "${DECODER_ARGS[@]}" -y -i "$IN" \
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v libsvtav1 \
@@ -1391,8 +1536,7 @@ jobs:
                 -pass 1 -passlogfile "$PASSLOG" \
                 -an -f null /dev/null
 
-              "$FFMPEG" -hide_banner -nostdin -hwaccel none \
-                "${DECODER_ARGS[@]}" -y -i "$IN" \
+              "$FFMPEG" -hide_banner -nostdin -hwaccel none -y -i "$IN" \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v libsvtav1 \
@@ -1412,9 +1556,6 @@ jobs:
                 { echo 'VMAF target must be 50-99' >&2; exit 1; }
               VMAF_TARGET="$TARGET_VALUE"
 
-              SVT_FOR_AV1AN=$(printf '%s' "$SVT_BASE" | \
-                tr ':' '\n' | sed 's/=/ /; s/^/--/' | paste -sd' ' -)
-
               FREE_GB=$(df -BG . | awk 'NR==2{gsub("G",""); print $4}')
               echo "Free space: ${FREE_GB}GB"
               if [ "$FREE_GB" -lt 5 ]; then
@@ -1425,30 +1566,27 @@ jobs:
 
               PRE_FILE="${OUT_DIR}/pre_${CHUNK_ID}.mkv"
               "$FFMPEG" -hide_banner -nostdin -y \
-                "${DECODER_ARGS[@]}" -i "$IN" \
+                -i "$IN" \
                 -map 0:v:0 \
                 -vf "$VF_CHAIN" \
                 -r "$OUT_FPS" -fps_mode cfr \
                 -c:v ffv1 \
                 "$PRE_FILE"
               test -s "$PRE_FILE"
-              PRE_SIZE=$(du -sh "$PRE_FILE" | cut -f1)
-              echo "ffv1 intermediate size: $PRE_SIZE"
 
               RAM_MB=$(awk '/MemAvailable/{print int($2/1024*0.8)}' /proc/meminfo)
-              echo "Av1an RAM limit: ${RAM_MB}MB"
 
               av1an \
                 -i "$PRE_FILE" \
                 -o "$OUT_FILE" \
                 -e svt-av1 \
-                -v "${AV1AN_PRESET_ARGS[*]} --crf 30 ${SVT_FOR_AV1AN}" \
+                -v "${AV1AN_PRESET_ARGS[*]} --crf 30 --tune 0 --enable-qm 1" \
                 --target-quality "$VMAF_TARGET" \
                 --probes 4 \
                 --probing-rate 4 \
                 --min-q 20 \
                 --max-q 60 \
-                -w "$WORKERS" \
+                -w "$NPROC" \
                 --sc-method standard \
                 --min-scene-len 24 \
                 --extra-split 240 \
@@ -1458,7 +1596,6 @@ jobs:
                 --ffmpeg-location "$HOME/codec-build/bin"
 
               rm -f "$PRE_FILE"
-              echo "Removed ffv1 intermediate"
               CRF_USED="Av1an-VMAF${VMAF_TARGET}"
               ;;
           esac
@@ -1471,37 +1608,7 @@ jobs:
 
           IN_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$IN")
           OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUT_FILE")
-          echo "Duration: in=$IN_DUR out=$OUT_DUR"
-
-          (
-            set +e
-            Q_W=$("$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=width -of csv=p=0 "$OUT_FILE" | head -1)
-            Q_H=$("$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=height -of csv=p=0 "$OUT_FILE" | head -1)
-            Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
-          [1:v]setpts=PTS-STARTPTS,fps=${OUT_FPS},\
-          scale=${Q_W}:${Q_H}:flags=lanczos+accurate_rnd+full_chroma_int,\
-          format=yuv420p10le[r]"
-            SSIM=$("$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
-              -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | \
-              grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2)
-            VMAF_SCORE=""
-            if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
-              "$FFMPEG" -hide_banner -nostdin -i "$OUT_FILE" -i "$IN" \
-                -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:\
-          log_path=${OUT_DIR}/vmaf_${CHUNK_ID}.json:n_threads=$(nproc):n_subsample=6" \
-                -f null - >/dev/null 2>&1
-              VMAF_SCORE=$(python3 -c "
-          import json,sys
-          d=json.load(open(sys.argv[1]))
-          print(round(d['pooled_metrics']['vmaf']['mean'],2))
-          " "${OUT_DIR}/vmaf_${CHUNK_ID}.json" 2>/dev/null)
-            fi
-            echo "frames=NA ssim=${SSIM:-NA} vmaf=${VMAF_SCORE:-NA} crf=${CRF_USED:-NA}" \
-              > "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt"
-            echo "Quality: $(cat "${OUT_DIR}/encoded_${CHUNK_ID}.quality.txt")"
-          ) || true
+          echo "Duration: in=$IN_DUR out=$OUT_DUR | crf=${CRF_USED:-NA}"
 
       - name: رفع الجزء المضغوط
         uses: actions/upload-artifact@v4
@@ -1517,7 +1624,9 @@ jobs:
   merge-and-send:
     name: دمج الناتج وإرساله
     needs: [prepare-codec-build, split-video, encode-chunks]
-    if: needs.split-video.outputs.input_kind == 'video'
+    if: >-
+      ${{ always() && (needs.prepare-codec-build.result == 'success' || (github.event.inputs.codec == 'audio' && needs.prepare-codec-build.result == 'skipped')) && needs.split-video.result == 'success' &&
+          (needs.encode-chunks.result == 'success' || (github.event.inputs.codec == 'audio' && needs.encode-chunks.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
@@ -1531,14 +1640,31 @@ jobs:
             ~/.rustup
           key: codec-universal-av1-av1an-ffmpeg-ubuntu-24.04-v10
 
-      - name: تجهيز أدوات الدمج
+      - name: استعادة بيئة Telegram Python
+        uses: actions/cache@v4
+        with:
+          path: ~/.venvs/telegram
+          key: telegram-telethon-ubuntu-24.04-python312-v1
+
+      - name: تجهيز أدوات الدمج المطلوبة فقط
+        env:
+          CODEC: ${{ github.event.inputs.codec }}
         run: |
           set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libdav1d-dev libopus0
-          python3 -m pip install --user telethon
+          if [ "$CODEC" = "audio" ]; then
+            sudo apt-get install -y ffmpeg
+          else
+            sudo apt-get install -y libdav1d7 libopus0
+            echo "$HOME/codec-build/bin" >> "$GITHUB_PATH"
+            echo "LD_LIBRARY_PATH=$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          fi
+          if [ ! -x "$HOME/.venvs/telegram/bin/python" ]; then python3 -m venv "$HOME/.venvs/telegram"; fi
+          "$HOME/.venvs/telegram/bin/python" -c 'import telethon' 2>/dev/null || \
+            "$HOME/.venvs/telegram/bin/python" -m pip install telethon
 
       - name: تنزيل الأجزاء المضغوطة
+        if: github.event.inputs.codec != 'audio'
         uses: actions/download-artifact@v4
         with:
           pattern: encoded-*
@@ -1551,225 +1677,147 @@ jobs:
           name: raw-chunks
           path: audio_dl
 
-      - name: دمج الفيديو مع الصوت
+      - name: إنشاء الناتج النهائي (فيديو أو صوت أو أرشيف صوتي)
         env:
           CODEC: ${{ github.event.inputs.codec }}
+          IS_ARCHIVE: ${{ needs.split-video.outputs.is_archive }}
         run: |
           set -euo pipefail
           if [ "$CODEC" = "audio" ]; then
-            FFMPEG=ffmpeg; FFPROBE=ffprobe
+            if [ "$IS_ARCHIVE" = "true" ]; then
+              AUDIO_FILE="audio_dl/audio_compressed.zip"
+              [ -s "$AUDIO_FILE" ] || { echo 'Compressed audio archive is missing or empty' >&2; exit 1; }
+              cp "$AUDIO_FILE" output.zip
+              OUTPUT_FILE=output.zip
+            else
+              AUDIO_FILE="audio_dl/audio_compressed.opus"
+              [ -s "$AUDIO_FILE" ] || { echo 'Compressed audio file is missing or empty' >&2; exit 1; }
+              cp "$AUDIO_FILE" output.opus
+              OUTPUT_FILE=output.opus
+            fi
+            FFPROBE=ffprobe
           else
+            export PATH="$HOME/codec-build/bin:$PATH"
+            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
             FFMPEG="$HOME/codec-build/bin/ffmpeg"
             FFPROBE="$HOME/codec-build/bin/ffprobe"
-            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          fi
-
-          cd all_encoded
-          find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
-          test -s /tmp/encoded_files.txt
-          sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
-
-          "$FFMPEG" -hide_banner -nostdin -y \
-            -f concat -safe 0 -i concat_list.txt \
-            -map 0:v \
-            -c:v copy \
-            "../video_only.mkv"
-          test -s "../video_only.mkv"
-
-          cd ..
-
-          AUDIO_FILE="audio_dl/audio_compressed.opus"
-          if [ -s "$AUDIO_FILE" ]; then
+            cd all_encoded
+            find . -maxdepth 1 -type f -name "encoded_*.mkv" | sort > /tmp/encoded_files.txt
+            test -s /tmp/encoded_files.txt
+            sed "s#^./#file '#; s#\$#'#" /tmp/encoded_files.txt > concat_list.txt
             "$FFMPEG" -hide_banner -nostdin -y \
-              -i video_only.mkv \
-              -i "$AUDIO_FILE" \
-              -map 0:v \
-              -map 1:a \
-              -c:v copy \
-              -c:a copy \
-              output.mkv
-          else
-            echo "No audio, video-only output"
-            cp video_only.mkv output.mkv
-          fi
-
-          test -s "output.mkv"
-
-          if [ "$CODEC" != "audio" ]; then
+              -f concat -safe 0 -i concat_list.txt \
+              -map 0:v -c:v copy "../video_only.mkv"
+            test -s "../video_only.mkv"
+            cd ..
+            AUDIO_FILE="audio_dl/audio_compressed.opus"
+            if [ -s "$AUDIO_FILE" ]; then
+              "$FFMPEG" -hide_banner -nostdin -y \
+                -i video_only.mkv -i "$AUDIO_FILE" \
+                -map 0:v -map 1:a -c:v copy -c:a copy output.mkv
+            else
+              echo "No audio, video-only output"
+              cp video_only.mkv output.mkv
+            fi
+            OUTPUT_FILE=output.mkv
             "$FFPROBE" -v error -select_streams v:0 \
-              -show_entries stream=codec_name -of csv=p=0 "output.mkv" | \
+              -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" | \
               grep -Eq '^av1$' || { echo 'Merge lost AV1 video' >&2; exit 1; }
           fi
-
-          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 output.mkv | cut -d. -f1)
+          test -s "$OUTPUT_FILE"
+          echo "OUTPUT_FILE=$OUTPUT_FILE" >> "$GITHUB_ENV"
+          OUT_DUR=$("$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$OUTPUT_FILE" | cut -d. -f1)
           echo "Final duration: ${OUT_DUR}s"
-
-      - name: قياس الجودة على الناتج الكامل
-        env:
-          CODEC: ${{ github.event.inputs.codec }}
-        run: |
-          set -euo pipefail
-          if [ "$CODEC" = "audio" ]; then
-            echo "Audio mode: skip quality measurement"; exit 0
-          fi
-
-          if [ -x "$HOME/codec-build/bin/ffmpeg" ]; then
-            FFMPEG="$HOME/codec-build/bin/ffmpeg"
-            FFPROBE="$HOME/codec-build/bin/ffprobe"
-            export LD_LIBRARY_PATH="$HOME/codec-build/lib:${LD_LIBRARY_PATH:-}"
-          else
-            FFMPEG=ffmpeg; FFPROBE=ffprobe
-          fi
-
-          TOTAL_DUR=$("$FFPROBE" -v error -show_entries format=duration \
-            -of csv=p=0 output.mkv | cut -d. -f1)
-          SAMPLE_START=$(( TOTAL_DUR / 2 - 45 ))
-          [ "$SAMPLE_START" -lt 0 ] && SAMPLE_START=0
-          SAMPLE_DUR=90
-          if [ "$(( SAMPLE_START + SAMPLE_DUR ))" -gt "$TOTAL_DUR" ]; then
-            SAMPLE_DUR=$(( TOTAL_DUR - SAMPLE_START ))
-          fi
-
-          echo "Quality measurement: start=${SAMPLE_START}s duration=${SAMPLE_DUR}s"
-
-          Q_W=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=width -of csv=p=0 output.mkv | head -1)
-          Q_H=$("$FFPROBE" -v error -select_streams v:0 \
-            -show_entries stream=height -of csv=p=0 output.mkv | head -1)
-
-          "$FFMPEG" -hide_banner -nostdin -y \
-            -ss "$SAMPLE_START" -t "$SAMPLE_DUR" \
-            -i output.mkv \
-            -map 0:v:0 -c:v copy sample_out.mkv
-
-          SRC_FILE="audio_dl/source_sample.mkv"
-          if [ ! -s "$SRC_FILE" ]; then
-            echo "Source sample not available, skipping quality"
-            exit 0
-          fi
-
-          Q_GRAPH="[0:v]setpts=PTS-STARTPTS,format=yuv420p10le[d];\
-          [1:v]setpts=PTS-STARTPTS,\
-          scale=${Q_W}:${Q_H}:flags=lanczos+accurate_rnd+full_chroma_int,\
-          format=yuv420p10le[r]"
-
-          SSIM=$("$FFMPEG" -hide_banner -nostdin \
-            -i sample_out.mkv -i "$SRC_FILE" \
-            -lavfi "${Q_GRAPH};[d][r]ssim" -f null - 2>&1 | \
-            grep -o 'All:[0-9.]*' | tail -1 | cut -d: -f2 || echo "NA")
-
-          VMAF_SCORE="NA"
-          if "$FFMPEG" -hide_banner -filters 2>/dev/null | grep -q ' libvmaf '; then
-            "$FFMPEG" -hide_banner -nostdin \
-              -i sample_out.mkv -i "$SRC_FILE" \
-              -lavfi "${Q_GRAPH};[d][r]libvmaf=log_fmt=json:\
-          log_path=vmaf_final.json:n_threads=$(nproc):n_subsample=6" \
-              -f null - >/dev/null 2>&1 || true
-            VMAF_SCORE=$(python3 -c "
-          import json, sys
-          try:
-              d = json.load(open('vmaf_final.json'))
-              print(round(d['pooled_metrics']['vmaf']['mean'], 2))
-          except:
-              print('NA')
-          " 2>/dev/null)
-          fi
-
-          echo "Full output quality: SSIM=${SSIM} VMAF=${VMAF_SCORE}"
-          echo "SSIM=${SSIM} VMAF=${VMAF_SCORE}" > final_quality.txt
-          rm -f sample_out.mkv
 
       - name: استخراج معلومات الناتج
         id: videoinfo
         env:
           CODEC: ${{ github.event.inputs.codec }}
+          IS_ARCHIVE: ${{ needs.split-video.outputs.is_archive }}
         run: |
           set -euo pipefail
+          if [ "$CODEC" = "audio" ] && [ "$IS_ARCHIVE" = "true" ]; then
+            echo 'duration_fmt=أرشيف متعدد الملفات' >> "$GITHUB_OUTPUT"
+            echo 'actual_res=صوتيات داخل أرشيف ZIP' >> "$GITHUB_OUTPUT"
+            echo 'video_info=archive ZIP' >> "$GITHUB_OUTPUT"
+            echo 'actual_abr=Opus لكل ملف صوتي' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           DURATION_SEC=$(ffprobe -v error -show_entries format=duration \
-            -of csv=p=0 "output.mkv" | cut -d. -f1)
+            -of csv=p=0 "$OUTPUT_FILE" | cut -d. -f1)
           H=$((DURATION_SEC/3600)); M=$(((DURATION_SEC%3600)/60)); S=$((DURATION_SEC%60))
           echo "duration_fmt=$(printf '%02d:%02d:%02d' $H $M $S)" >> "$GITHUB_OUTPUT"
 
           if [ "$CODEC" = "audio" ]; then
             echo 'actual_res=audio only' >> "$GITHUB_OUTPUT"
+            echo 'video_info=audio' >> "$GITHUB_OUTPUT"
           else
             ACTUAL_RES=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=width,height -of csv=s=x:p=0 "output.mkv")
+              -show_entries stream=width,height -of csv=s=x:p=0 "$OUTPUT_FILE")
             echo "actual_res=$ACTUAL_RES" >> "$GITHUB_OUTPUT"
 
             V_CODEC=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=codec_name -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" | head -1)
             V_PIX=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=pix_fmt -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=pix_fmt -of csv=p=0 "$OUTPUT_FILE" | head -1)
             V_FPS=$(ffprobe -v error -select_streams v:0 \
-              -show_entries stream=avg_frame_rate -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=avg_frame_rate -of csv=p=0 "$OUTPUT_FILE" | head -1)
             echo "video_info=${V_CODEC} ${V_PIX} ${V_FPS}" >> "$GITHUB_OUTPUT"
           fi
 
           A_CODEC=$(ffprobe -v error -select_streams a:0 \
-            -show_entries stream=codec_name -of csv=p=0 "output.mkv" 2>/dev/null | head -1 || true)
+            -show_entries stream=codec_name -of csv=p=0 "$OUTPUT_FILE" 2>/dev/null | head -1 || true)
           if [ -z "$A_CODEC" ]; then
             echo "actual_abr=no audio" >> "$GITHUB_OUTPUT"
           else
             A_CH=$(ffprobe -v error -select_streams a:0 \
-              -show_entries stream=channels -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=channels -of csv=p=0 "$OUTPUT_FILE" | head -1)
             A_BR=$(ffprobe -v error -select_streams a:0 \
-              -show_entries stream=bit_rate -of csv=p=0 "output.mkv" | head -1)
+              -show_entries stream=bit_rate -of csv=p=0 "$OUTPUT_FILE" | head -1)
             A_LABEL="$A_CODEC"
             if [ "$A_CH" = "1" ]; then
               A_LABEL="$A_LABEL mono"
             else
               A_LABEL="$A_LABEL stereo"
             fi
-            [[ "$A_BR" =~ ^[0-9]+$ ]] && A_LABEL="$A_LABEL ~$((A_BR/1000))k"
+            if [[ "$A_BR" =~ ^[0-9]+$ ]]; then
+              A_LABEL="$A_LABEL ~$((A_BR/1000))k"
+            elif [ "$A_CH" = "1" ] && [ -s "audio_dl/audio_compressed.opus" ]; then
+              A_LABEL="$A_LABEL ~14k"
+            fi
             echo "actual_abr=$A_LABEL" >> "$GITHUB_OUTPUT"
           fi
-
-          Q_LINE="NA"
-          if [ -f final_quality.txt ]; then
-            Q_LINE=$(cat final_quality.txt)
-            echo "Full output quality: $Q_LINE"
-          elif ls all_encoded/encoded_*.quality.txt >/dev/null 2>&1; then
-            Q_LINE=$(cat all_encoded/encoded_*.quality.txt | awk '
-              function add(x){out=(out=="")?x:out" - "x}
-              {s="";v="";c=""
-               for(i=1;i<=NF;i++){split($i,kv,"=");
-                 if(kv[1]=="ssim")s=kv[2];
-                 else if(kv[1]=="vmaf")v=kv[2];
-                 else if(kv[1]=="crf")c=kv[2]}
-               if(s~/^[0-9.]+/){ss+=s;ns++}
-               if(v~/^[0-9.]+/){vv+=v;nv++;if(mv==""||v+0<mv+0)mv=v}
-               if(c!="NA"&&c!=""){cc=c}}
-              END{out="";
-                if(ns>0)add(sprintf("SSIM %.4f",ss/ns));
-                if(nv>0)add(sprintf("VMAF %.1f min %.1f",vv/nv,mv));
-                if(cc!="")add("CRF "cc);
-                if(out=="")out="NA";print out}')
-          fi
-          echo "quality=$Q_LINE" >> "$GITHUB_OUTPUT"
 
       - name: إعداد الاسم المخصص الحقيقي للملف
         id: naming
         env:
           FILENAME: ${{ github.event.inputs.filename }}
+          CODEC: ${{ github.event.inputs.codec }}
+          IS_ARCHIVE: ${{ needs.split-video.outputs.is_archive }}
         run: |
           set -euo pipefail
-          RAW="${FILENAME:-}"
           SAFE_NAME=$(python3 -c '
           import os, unicodedata, re
-          s = os.environ.get("RAW", "")
+          s = os.environ.get("FILENAME", "")
           s = unicodedata.normalize("NFC", s)
           s = re.sub(r"[\\/*?\"<>|:]", "_", s)
           s = " ".join(s.split())
+          s = re.sub(r"\.(?:tar\.(?:gz|bz2|xz|zst)|zip|rar|7z|tar|tgz|gz|bz2|xz|zst|mp4|mkv|avi|mov|webm|flv|ts|m4a|mp3|aac|ogg|opus|wav|flac)$", "", s, flags=re.I)
           print(s[:80])
           ')
 
           if [ -z "$SAFE_NAME" ]; then
-            SAFE_NAME="anime-compressed"
+            echo "يجب إدخال اسم الملف النهائي." >&2
+            exit 1
           fi
 
-          echo "final_file_name=${SAFE_NAME}.mkv" >> "$GITHUB_OUTPUT"
-          echo "Display Name: $SAFE_NAME"
+          EXT=mkv
+          if [ "$CODEC" = "audio" ]; then
+            EXT=opus
+            [ "$IS_ARCHIVE" = "true" ] && EXT=zip
+          fi
+          echo "final_file_name=${SAFE_NAME}.${EXT}" >> "$GITHUB_OUTPUT"
+          echo "Display Name: ${SAFE_NAME}.${EXT}"
 
       - name: رفع الناتج وإشعار المستخدم بالاسم الحقيقي
         env:
@@ -1784,473 +1832,86 @@ jobs:
           ACTUAL_RES: ${{ steps.videoinfo.outputs.actual_res }}
           ACTUAL_ABR: ${{ steps.videoinfo.outputs.actual_abr }}
           VIDEO_INFO: ${{ steps.videoinfo.outputs.video_info }}
-          QUALITY: ${{ steps.videoinfo.outputs.quality }}
+          ENCODE_MODE: ${{ github.event.inputs.encode_mode }}
           CODEC: ${{ github.event.inputs.codec }}
-          FILTER_PRESET: ${{ github.event.inputs.filter_preset }}
-          NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
+          FRAME_WARNING: ${{ env.FRAME_WARNING }}
           IS_BT2020: ${{ fromJSON(needs.split-video.outputs.source_info).is_bt2020 }}
+          NOISE_CLASS: ${{ fromJSON(needs.split-video.outputs.source_info).noise_class }}
         run: |
           set -euo pipefail
-          mv "output.mkv" "$FINAL_FILE_NAME"
+          mv "$OUTPUT_FILE" "$FINAL_FILE_NAME"
           FILE_SIZE=$(stat -c%s "$FINAL_FILE_NAME")
           SIZE_MB=$(awk -v s="$FILE_SIZE" 'BEGIN{printf "%.1f",s/1048576}')
 
           COLOR_TAG=""
           [ "$IS_BT2020" = "true" ] && COLOR_TAG=" | 🎨 BT.2020"
 
-          FILTERS_TAG="preset=${FILTER_PRESET}"
-
-          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
+          CAPTION=$(printf '🎬 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s\n🎞️ %s\n⚙️ %s | ضجيج: %s%s' \
             "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" \
-            "$QUALITY" "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
-            "$FILTERS_TAG" "$NOISE_CLASS" "$COLOR_TAG")
+            "$DURATION_FMT" "${VIDEO_INFO:-$CODEC}" \
+            "$ENCODE_MODE" "$NOISE_CLASS" "$COLOR_TAG")
+          if [ -n "$FRAME_WARNING" ]; then
+            CAPTION="${CAPTION}"$'\n'"${FRAME_WARNING}"
+          fi
           export FINAL_FILE_NAME CAPTION
 
-          python3 <<'PYEOF'
-          import asyncio, os
+          "$HOME/.venvs/telegram/bin/python" <<'PYEOF'
+          import asyncio, os, sys
           from telethon import TelegramClient
           from telethon.sessions import StringSession
+
           async def main():
+              channel = os.environ.get("TG_CHANNEL_ID", "").strip()
+              if not channel:
+                  print("TG_CHANNEL_ID غير مضبوط في الأسرار", file=sys.stderr)
+                  return 1
               client = TelegramClient(
                   StringSession(os.environ["TG_SESSION"]),
                   int(os.environ["TG_API_ID"]),
                   os.environ["TG_API_HASH"])
-              await client.start()
-              async with client:
-                  await client.send_file(
-                      int(os.environ["TG_CHANNEL_ID"]),
-                      os.environ["FINAL_FILE_NAME"],
-                      caption=os.environ["CAPTION"],
-                      force_document=True)
-          asyncio.run(main())
+              await client.connect()
+              try:
+                  if not await client.is_user_authorized():
+                      print("TG_SESSION غير صالحة أو منتهية، أعد توليدها", file=sys.stderr)
+                      return 1
+                  path = os.environ["FINAL_FILE_NAME"]
+                  size = os.path.getsize(path)
+                  if size > 2 * 1024 ** 3:
+                      print(f"الملف أكبر من حد تيليجرام: {size} bytes", file=sys.stderr)
+                      return 1
+                  await client.send_file(int(channel), path,
+                                         caption=os.environ["CAPTION"],
+                                         force_document=True)
+                  print("sent to channel")
+                  return 0
+              finally:
+                  await client.disconnect()
+
+          sys.exit(asyncio.run(main()))
           PYEOF
 
-          MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n📊 %s\n⏱️ %s' \
-            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$QUALITY" "$DURATION_FMT")
+          MESSAGE=$(printf '✅ تم الضغط وإرسال الملف باسمه الحقيقي بنجاح!\n\n📁 %s\n📦 %s ميجابايت\n📐 %s\n🔊 %s\n⏱️ %s' \
+            "$FINAL_FILE_NAME" "$SIZE_MB" "$ACTUAL_RES" "$ACTUAL_ABR" "$DURATION_FMT")
+          if [ -n "$FRAME_WARNING" ]; then
+            MESSAGE="${MESSAGE}"$'\n'"${FRAME_WARNING}"
+          fi
           curl --fail --silent --show-error \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
             --data-urlencode "text=${MESSAGE}"
 
   # ============================================================
-  # 4. الصوت فقط: معالجة الملفات بالتوازي ثم تجميع الأرشيف بعد نجاحها كلها
-  # ============================================================
-  process-audio-input:
-    name: ضغط الصوت/أرشيف الصوت بالتوازي
-    needs: [split-video]
-    # يتجاوز skipped الموروث من prepare-codec-build، مع اشتراط نجاح تنزيل/تصنيف المصدر.
-    if: ${{ always() && github.event.inputs.codec == 'audio' && needs.split-video.result == 'success' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    steps:
-      - name: تجهيز FFmpeg وأدوات الأرشيف
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y ffmpeg libarchive-tools zip unzip zstd python3 python3-venv
-          python3 -m venv audio-venv
-          audio-venv/bin/pip install --disable-pip-version-check telethon
-          ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libopus || { echo 'FFmpeg libopus encoder unavailable' >&2; exit 1; }
-          bsdtar --version | head -1
-
-      - name: تنزيل ملف الصوت أو الأرشيف
-        uses: actions/download-artifact@v4
-        with:
-          name: audio-input
-          path: input_dl
-
-      - name: فك/ضغط بالتوازي ثم إعادة إنشاء الأرشيف
-        env:
-          INPUT_KIND: ${{ needs.split-video.outputs.input_kind }}
-          SOURCE_NAME: ${{ github.event.inputs.filename }}
-          TARGET_VALUE: ${{ github.event.inputs.target_value }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-          TG_SESSION: ${{ secrets.TG_SESSION }}
-          TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        run: |
-          set -euo pipefail
-          cat > process_audio_batch.py <<'PY'
-          import bz2, concurrent.futures, gzip, json, lzma, os, shutil, stat, subprocess, sys, tarfile, zipfile
-          from pathlib import Path, PurePosixPath
-
-          INPUT = Path("input_dl/raw_input.mp4")
-          KIND = os.environ.get("INPUT_KIND", "").strip()
-          SOURCE_NAME = os.environ.get("SOURCE_NAME", "").strip() or "audio"
-          BITRATE = os.environ.get("TARGET_VALUE", "").strip()
-          CHAT_ID = os.environ["CHAT_ID"]
-          TG_API_ID = int(os.environ["TG_API_ID"])
-          TG_API_HASH = os.environ["TG_API_HASH"]
-          TG_SESSION = os.environ["TG_SESSION"]
-          TG_CHANNEL_ID = int(os.environ["TG_CHANNEL_ID"])
-          BOT_TOKEN = os.environ["BOT_TOKEN"]
-          MAX_FILES = 1000
-          MAX_EXPANDED = 8 * 1024**3
-
-          if not INPUT.is_file() or INPUT.stat().st_size == 0:
-              raise SystemExit("Downloaded audio/archive is missing or empty")
-          source_lower = SOURCE_NAME.lower()
-          signature = INPUT.open("rb").read(16)
-          archive_exts = (".zip", ".rar", ".7z", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".gz", ".bz2", ".xz", ".zst", ".iso")
-          looks_archive = (
-              zipfile.is_zipfile(INPUT) or tarfile.is_tarfile(INPUT)
-              or signature.startswith((b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07", b"\x1f\x8b", b"BZh", b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd"))
-              or source_lower.endswith(archive_exts)
-          )
-          if looks_archive:
-              KIND = "audio_archive"
-          elif KIND not in ("audio_archive", "audio_single"):
-              KIND = "audio_single"
-          print(f"Resolved input kind: {KIND} (job output was {os.environ.get('INPUT_KIND', '')!r})")
-          if not __import__("re").fullmatch(r"[1-9][0-9]{0,2}k?", BITRATE):
-              raise SystemExit(f"Invalid Opus target bitrate: {BITRATE!r}")
-          amount = int(BITRATE[:-1] if BITRATE.endswith("k") else BITRATE)
-          if not 6 <= amount <= 510:
-              raise SystemExit("Opus bitrate must be between 6k and 510k")
-          BITRATE = f"{amount}k"
-          print(f"Using requested Opus bitrate: {BITRATE}")
-
-          ROOT = Path("audio_sources")
-          WORK = Path("audio_work")
-          ROOT.mkdir(exist_ok=True)
-          WORK.mkdir(exist_ok=True)
-
-          def safe_rel(raw):
-              raw = str(raw).replace("\\", "/")
-              p = PurePosixPath(raw)
-              if p.is_absolute() or any(x == ".." for x in p.parts):
-                  raise RuntimeError(f"Unsafe archive path rejected: {raw!r}")
-              parts = [x for x in p.parts if x not in ("", ".")]
-              if not parts:
-                  return None
-              return Path(*parts)
-
-          def copy_limited(src, dst, remaining):
-              dst.parent.mkdir(parents=True, exist_ok=True)
-              total = 0
-              with open(dst, "wb") as out:
-                  while True:
-                      block = src.read(1024 * 1024)
-                      if not block:
-                          break
-                      total += len(block)
-                      if total > remaining[0] or total > MAX_EXPANDED:
-                          raise RuntimeError("Archive expansion exceeds the configured safety limit")
-                      remaining[0] -= len(block)
-                      out.write(block)
-              return total
-
-          def extract_zip(path):
-              remaining = [MAX_EXPANDED]
-              with zipfile.ZipFile(path) as zf:
-                  infos = zf.infolist()
-                  if len(infos) > MAX_FILES * 4:
-                      raise RuntimeError("Archive contains too many entries")
-                  for info in infos:
-                      rel = safe_rel(info.filename)
-                      if rel is None:
-                          continue
-                      mode = (info.external_attr >> 16) & 0o170000
-                      if stat.S_ISLNK(mode):
-                          raise RuntimeError(f"Symbolic link in archive is not accepted: {info.filename}")
-                      target = ROOT / rel
-                      if info.is_dir():
-                          target.mkdir(parents=True, exist_ok=True)
-                          continue
-                      if info.flag_bits & 1:
-                          raise RuntimeError("Encrypted ZIP entries are not supported")
-                      if info.file_size > remaining[0]:
-                          raise RuntimeError("Archive expansion exceeds the configured safety limit")
-                      with zf.open(info, "r") as f:
-                          copy_limited(f, target, remaining)
-
-          def extract_tar(path):
-              remaining = [MAX_EXPANDED]
-              with tarfile.open(path, mode="r:*") as tf:
-                  members = tf.getmembers()
-                  if len(members) > MAX_FILES * 4:
-                      raise RuntimeError("Archive contains too many entries")
-                  for member in members:
-                      rel = safe_rel(member.name)
-                      if rel is None:
-                          continue
-                      target = ROOT / rel
-                      if member.isdir():
-                          target.mkdir(parents=True, exist_ok=True)
-                          continue
-                      if not member.isfile():
-                          raise RuntimeError(f"Links or special files are not accepted in archives: {member.name}")
-                      if member.size > remaining[0]:
-                          raise RuntimeError("Archive expansion exceeds the configured safety limit")
-                      stream = tf.extractfile(member)
-                      if stream is None:
-                          raise RuntimeError(f"Unable to read archive member: {member.name}")
-                      with stream:
-                          copy_limited(stream, target, remaining)
-
-          def is_tar(path):
-              try:
-                  return tarfile.is_tarfile(path)
-              except Exception:
-                  return False
-
-          def decompress_zstd(path, target):
-              target.parent.mkdir(parents=True, exist_ok=True)
-              proc = subprocess.Popen(["zstd", "-dc", str(path.resolve())], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-              total = 0
-              try:
-                  with open(target, "wb") as out:
-                      while True:
-                          block = proc.stdout.read(1024 * 1024)
-                          if not block:
-                              break
-                          total += len(block)
-                          if total > MAX_EXPANDED:
-                              proc.kill()
-                              raise RuntimeError("Zstandard expansion exceeds the configured safety limit")
-                          out.write(block)
-                  stderr = proc.stderr.read().decode("utf-8", "replace")
-                  code = proc.wait()
-                  if code != 0:
-                      raise RuntimeError("zstd decompression failed: " + stderr[-1000:])
-              except Exception:
-                  if proc.poll() is None:
-                      proc.kill()
-                  proc.wait()
-                  target.unlink(missing_ok=True)
-                  raise
-
-          def extract_archive(path):
-              if zipfile.is_zipfile(path):
-                  extract_zip(path)
-              elif is_tar(path):
-                  extract_tar(path)
-              else:
-                  # libarchive handles 7z/RAR and compressed tar variants; it extracts into an isolated directory.
-                  cmd = ["bsdtar", "-xf", str(path.resolve()), "-C", str(ROOT.resolve()), "--no-same-owner", "--no-same-permissions"]
-                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-                  if r.returncode != 0:
-                      raise RuntimeError("Archive could not be extracted by libarchive: " + (r.stderr[-1200:] or r.stdout[-1200:]))
-                  count = 0
-                  total = 0
-                  for p in ROOT.rglob("*"):
-                      if p.is_symlink():
-                          raise RuntimeError(f"Symbolic link in archive is not accepted: {p.relative_to(ROOT)}")
-                      if p.is_file():
-                          count += 1
-                          total += p.stat().st_size
-                          if count > MAX_FILES or total > MAX_EXPANDED:
-                              raise RuntimeError("Extracted archive exceeds file-count or expanded-size safety limits")
-
-          if KIND == "audio_archive":
-              # A standalone gzip/bzip2/xz audio file is accepted as one compressed input too.
-              lower = SOURCE_NAME.lower()
-              if not zipfile.is_zipfile(INPUT) and not is_tar(INPUT) and lower.endswith((".gz", ".bz2", ".xz")):
-                  suffix = ".gz" if lower.endswith(".gz") else (".bz2" if lower.endswith(".bz2") else ".xz")
-                  output_name = SOURCE_NAME[:-len(suffix)] or "audio"
-                  rel = safe_rel(output_name)
-                  opener = gzip.open if suffix == ".gz" else (bz2.open if suffix == ".bz2" else lzma.open)
-                  with opener(INPUT, "rb") as f:
-                      copy_limited(f, ROOT / rel, [MAX_EXPANDED])
-              elif not zipfile.is_zipfile(INPUT) and not is_tar(INPUT) and lower.endswith(".zst") and not lower.endswith(".tar.zst"):
-                  rel = safe_rel(SOURCE_NAME[:-4] or "audio")
-                  decompress_zstd(INPUT, ROOT / rel)
-              else:
-                  extract_archive(INPUT)
-          elif KIND == "audio_single":
-              safe_name = Path(SOURCE_NAME).name or "audio-source"
-              rel = safe_rel(safe_name)
-              if rel is None:
-                  rel = Path("audio-source")
-              shutil.copy2(INPUT, ROOT / rel)
-          else:
-              raise SystemExit(f"Unexpected input kind: {KIND}")
-
-          # Refuse archive path escapes/symlinks and identify actual audio streams, not extensions alone.
-          all_files = []
-          expanded = 0
-          for p in ROOT.rglob("*"):
-              if p.is_symlink():
-                  raise RuntimeError(f"Symbolic link in archive is not accepted: {p.relative_to(ROOT)}")
-              if p.is_file():
-                  rel = p.relative_to(ROOT).as_posix()
-                  safe_rel(rel)
-                  expanded += p.stat().st_size
-                  if expanded > MAX_EXPANDED:
-                      raise RuntimeError("Extracted input exceeds the configured expanded-size safety limit")
-                  all_files.append((rel, p))
-          if len(all_files) > MAX_FILES:
-              raise RuntimeError(f"Archive has more than {MAX_FILES} regular files")
-          if KIND == "audio_single":
-              candidates = all_files
-          else:
-              candidates = all_files
-
-          def has_audio(path):
-              try:
-                  r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=20)
-                  return r.returncode == 0 and bool(r.stdout.strip())
-              except subprocess.TimeoutExpired:
-                  return False
-
-          audio = [(rel, p) for rel, p in candidates if has_audio(p)]
-          if not audio:
-              raise RuntimeError("No readable audio streams were found in the source/archive")
-          if len(audio) > MAX_FILES:
-              raise RuntimeError("Too many audio files in archive")
-          print(f"Found {len(audio)} audio file(s); preserving all non-audio files and directories")
-
-          # Plan collision-free names: retain relative folders and original base names; use .opus as the truthful codec extension.
-          all_rel_cf = {rel.casefold() for rel, _ in all_files}
-          inputs = {rel for rel, _ in audio}
-          proposed = {}
-          for rel, _ in audio:
-              src = Path(rel)
-              candidate = (src.with_suffix(".opus").as_posix() if src.suffix else (rel + ".opus"))
-              proposed.setdefault(candidate.casefold(), []).append(rel)
-          reserved = {rel.casefold() for rel, _ in all_files if rel not in inputs}
-          outputs = {}
-          used = set(reserved)
-          for rel, _ in audio:
-              src = Path(rel)
-              candidate = src.with_suffix(".opus").as_posix() if src.suffix else rel + ".opus"
-              if len(proposed[candidate.casefold()]) > 1 or candidate.casefold() in reserved:
-                  candidate = rel + ".opus"
-              root, ext = os.path.splitext(candidate)
-              n = 2
-              while candidate.casefold() in used:
-                  candidate = f"{root}__{n}{ext}"
-                  n += 1
-              used.add(candidate.casefold())
-              outputs[rel] = candidate
-
-          encoded = Path("audio_outputs")
-          encoded.mkdir(exist_ok=True)
-          tasks = [(rel, path, outputs[rel]) for rel, path in audio]
-          def encode_one(task):
-              rel, src, out_rel = task
-              dst = encoded / out_rel
-              dst.parent.mkdir(parents=True, exist_ok=True)
-              cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-y", "-i", str(src), "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "0", "-c:a", "libopus", "-b:a", BITRATE, "-vbr", "on", "-compression_level", "10", "-ar", "48000", "-threads", "1", "-f", "opus", str(dst)]
-              r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-              if r.returncode != 0 or not dst.is_file() or dst.stat().st_size == 0:
-                  dst.unlink(missing_ok=True)
-                  raise RuntimeError(f"{rel}: FFmpeg failed: {(r.stderr or r.stdout)[-1000:]}")
-              probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(dst)], capture_output=True, text=True)
-              if probe.returncode != 0 or probe.stdout.strip() != "opus":
-                  raise RuntimeError(f"{rel}: output validation failed; expected Opus")
-              print(f"OK {rel} -> {out_rel} ({dst.stat().st_size} bytes @ target {BITRATE})")
-              return rel, out_rel
-
-          errors = []
-          workers = min(4, len(tasks))
-          print(f"Encoding {len(tasks)} file(s) concurrently with {workers} worker(s)")
-          with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-              futures = [pool.submit(encode_one, t) for t in tasks]
-              for future in concurrent.futures.as_completed(futures):
-                  try:
-                      future.result()
-                  except Exception as e:
-                      errors.append(str(e))
-          if errors:
-              print("One or more audio encodes failed; archive will NOT be created:", file=sys.stderr)
-              for error in errors:
-                  print(" - " + error, file=sys.stderr)
-              raise SystemExit(1)
-
-          def safe_output_base(raw):
-              base = Path(raw).name
-              for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".zip", ".rar", ".7z", ".tgz", ".tar", ".gz", ".bz2", ".xz", ".zst"):
-                  if base.lower().endswith(suffix):
-                      base = base[:-len(suffix)]
-                      break
-              base = " ".join(base.replace("\\", "_").replace("/", "_").split())
-              base = "".join(c for c in base if c.isalnum() or c in " ._-()[]")[:90].strip(" .")
-              return base or "audio-compressed"
-
-          if KIND == "audio_archive":
-              payload = Path("archive_payload")
-              shutil.copytree(ROOT, payload, dirs_exist_ok=True, symlinks=False)
-              for rel, _ in audio:
-                  (payload / rel).unlink(missing_ok=True)
-              for rel, out_rel in outputs.items():
-                  src = encoded / out_rel
-                  dst = payload / out_rel
-                  dst.parent.mkdir(parents=True, exist_ok=True)
-                  shutil.copy2(src, dst)
-              final_name = safe_output_base(SOURCE_NAME) + "-opus.zip"
-              final_path = Path(final_name)
-              already_compressed = {".opus", ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".flac", ".wma", ".ac3", ".dts", ".mp4", ".mkv", ".jpg", ".jpeg", ".png", ".webp", ".zip", ".7z", ".rar"}
-              with zipfile.ZipFile(final_path, "w", allowZip64=True) as zf:
-                  for path in sorted(payload.rglob("*"), key=lambda q: q.relative_to(payload).as_posix().casefold()):
-                      rel = path.relative_to(payload).as_posix()
-                      if path.is_dir():
-                          info = zipfile.ZipInfo(rel.rstrip("/") + "/")
-                          info.external_attr = (0o40755 << 16) | 0x10
-                          zf.writestr(info, b"")
-                      elif path.is_file():
-                          comp = zipfile.ZIP_STORED if path.suffix.lower() in already_compressed else zipfile.ZIP_DEFLATED
-                          zf.write(path, rel, compress_type=comp, compresslevel=6 if comp == zipfile.ZIP_DEFLATED else None)
-              with zipfile.ZipFile(final_path) as zf:
-                  bad = zf.testzip()
-                  if bad:
-                      raise RuntimeError(f"Repacked ZIP validation failed at {bad}")
-                  names = set(zf.namelist())
-                  for out_rel in outputs.values():
-                      if out_rel not in names:
-                          raise RuntimeError(f"Compressed member missing from final archive: {out_rel}")
-              output_kind = "archive"
-              print(f"Validated final archive {final_name}; audio entries={len(audio)}, retained other entries")
-          else:
-              single_base = SOURCE_NAME.replace("\\", "/").rsplit("/", 1)[-1]
-              single_base = os.path.splitext(single_base)[0]
-              final_name = safe_output_base(single_base) + ".opus"
-              single_out = encoded / outputs[audio[0][0]]
-              shutil.copy2(single_out, final_name)
-              output_kind = "single"
-              print(f"Validated standalone audio output {final_name}")
-
-          file_size = Path(final_name).stat().st_size
-          size_mib = file_size / (1024 * 1024)
-          caption = f"🎵 Opus {BITRATE}\n📁 ملفات صوتية: {len(audio)}\n📦 {size_mib:.2f} MiB\n🗂️ {'أرشيف مع الحفاظ على المسارات' if output_kind == 'archive' else 'ملف صوتي'}"
-          Path("audio_result.json").write_text(json.dumps({"name": final_name, "caption": caption}, ensure_ascii=False), encoding="utf-8")
-          PY
-
-          python3 process_audio_batch.py
-          export FINAL_AUDIO_NAME="$(python3 -c 'import json; print(json.load(open("audio_result.json"))["name"], end="")')"
-          export FINAL_AUDIO_CAPTION="$(python3 -c 'import json; print(json.load(open("audio_result.json"))["caption"], end="")')"
-
-          audio-venv/bin/python - <<'PY'
-          import asyncio, os
-          from telethon import TelegramClient
-          from telethon.sessions import StringSession
-          async def main():
-              client = TelegramClient(StringSession(os.environ["TG_SESSION"]), int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
-              await client.start()
-              async with client:
-                  await client.send_file(int(os.environ["TG_CHANNEL_ID"]), os.environ["FINAL_AUDIO_NAME"], caption=os.environ["FINAL_AUDIO_CAPTION"], force_document=True)
-          asyncio.run(main())
-          PY
-
-          curl --fail --silent --show-error -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=✅ اكتمل ضغط الصوت بالمعدل المدخل ${TARGET_VALUE}. أُنشئ الناتج بعد نجاح كل عمليات الترميز المتوازية."
-
-  # ============================================================
   # 5. إشعار الفشل
   # ============================================================
   notify-failure:
     name: إشعار فشل العملية
-    needs: [prepare-codec-build, split-video, encode-chunks, merge-and-send, process-audio-input]
+    needs: [prepare-codec-build, split-video, encode-chunks, merge-and-send]
     if: >-
       ${{ always() && (
         needs.prepare-codec-build.result == 'failure' ||
         needs.split-video.result == 'failure' ||
         needs.encode-chunks.result == 'failure' ||
-        needs.merge-and-send.result == 'failure' ||
-        needs.process-audio-input.result == 'failure'
+        needs.merge-and-send.result == 'failure'
       ) }}
     runs-on: ubuntu-24.04
     steps:
